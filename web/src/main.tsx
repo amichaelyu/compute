@@ -8,6 +8,24 @@ import { Lanes } from "./Lanes";
 import { SignIn } from "./SignIn";
 import { useNow, usePoll, useRoute, who } from "./util";
 
+/** Reloads the page when the daemon serves a newer dashboard build, so an open tab never runs
+ * old code against a new API. */
+function watchForNewBuild() {
+  const current = document.querySelector<HTMLScriptElement>('script[type="module"][src]')?.src;
+  if (!current) return;
+  setInterval(async () => {
+    if (document.hidden) return;
+    try {
+      const html = await (await fetch("/", { cache: "no-store" })).text();
+      const src = /<script[^>]+type="module"[^>]+src="([^"]+)"/.exec(html)?.[1];
+      if (src && new URL(src, location.href).href !== current) location.reload();
+    } catch {
+      // offline: try again next time
+    }
+  }, 60_000);
+}
+watchForNewBuild();
+
 function App() {
   const route = useRoute();
   const now = useNow(15_000);

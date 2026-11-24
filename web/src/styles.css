@@ -388,7 +388,7 @@ input[type="search"] {
 
 .row {
   display: grid;
-  grid-template-columns: 4rem minmax(0, 1fr) 6.5rem 9rem 17rem;
+  grid-template-columns: 4rem minmax(0, 1fr) 10rem 9rem 17rem;
   gap: 1rem;
   align-items: baseline;
   width: 100%;
@@ -444,6 +444,7 @@ input[type="search"] {
 .state {
   font-size: 0.8125rem;
   font-weight: 600;
+  white-space: nowrap;
 }
 
 .state::before {
