@@ -9,6 +9,7 @@ use std::time::Duration;
 #[derive(Serialize, Deserialize, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum JobState {
+    Waiting,
     Queued,
     Staging,
     Pending,
@@ -18,10 +19,12 @@ pub enum JobState {
     Cancelled,
     Timeout,
     Lost,
+    DependencyFailed,
 }
 
 impl JobState {
-    pub const ALL: [JobState; 9] = [
+    pub const ALL: [JobState; 11] = [
+        JobState::Waiting,
         JobState::Queued,
         JobState::Staging,
         JobState::Pending,
@@ -31,9 +34,11 @@ impl JobState {
         JobState::Cancelled,
         JobState::Timeout,
         JobState::Lost,
+        JobState::DependencyFailed,
     ];
     pub fn as_str(self) -> &'static str {
         match self {
+            JobState::Waiting => "waiting",
             JobState::Queued => "queued",
             JobState::Staging => "staging",
             JobState::Pending => "pending",
@@ -43,6 +48,7 @@ impl JobState {
             JobState::Cancelled => "cancelled",
             JobState::Timeout => "timeout",
             JobState::Lost => "lost",
+            JobState::DependencyFailed => "dependency_failed",
         }
     }
     pub fn parse(s: &str) -> Option<JobState> {
@@ -56,6 +62,7 @@ impl JobState {
                 | JobState::Cancelled
                 | JobState::Timeout
                 | JobState::Lost
+                | JobState::DependencyFailed
         )
     }
 }
@@ -89,8 +96,48 @@ pub struct ArrayReq {
     pub count: u32,
 }
 
-/// The body of `POST /v1/jobs`. Fields for later milestones are accepted by the parser so the
-/// daemon can reject them with a clear message rather than a generic "unknown field".
+/// A dependency: a job id, or `{"array": <array id>}` for every task of an array.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Eq, Hash)]
+#[serde(untagged)]
+pub enum DepRef {
+    Job(i64),
+    Array { array: i64 },
+}
+
+impl std::fmt::Display for DepRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DepRef::Job(id) => write!(f, "job {id}"),
+            DepRef::Array { array } => write!(f, "array {array}"),
+        }
+    }
+}
+
+/// Another job's outputs copied in as this job's inputs, under `$JOB_INPUT_DIR/<as>`.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+#[serde(deny_unknown_fields)]
+pub struct InputSpec {
+    pub from_job: i64,
+    #[serde(default)]
+    pub glob: Option<String>,
+    #[serde(rename = "as")]
+    pub as_: String,
+}
+
+/// `container` in a request: a registry image, or a Dockerfile in the snapshot to build.
+#[derive(Deserialize, Clone, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub struct ContainerReq {
+    #[serde(default)]
+    pub image: Option<String>,
+    #[serde(default)]
+    pub build: Option<String>,
+    /// Build context, relative to the repo root. Default: the Dockerfile's directory.
+    #[serde(default)]
+    pub context: Option<String>,
+}
+
+/// The body of `POST /v1/jobs`.
 #[derive(Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct JobRequest {
@@ -104,15 +151,15 @@ pub struct JobRequest {
     #[serde(default)]
     pub os: Option<String>,
     #[serde(default)]
-    pub container: Option<serde_json::Value>,
+    pub container: Option<ContainerReq>,
     #[serde(default)]
-    pub datasets: Option<serde_json::Value>,
+    pub datasets: Vec<String>,
     #[serde(default)]
-    pub inputs: Option<serde_json::Value>,
+    pub inputs: Vec<InputSpec>,
     #[serde(default)]
-    pub after_ok: Option<serde_json::Value>,
+    pub after_ok: Vec<DepRef>,
     #[serde(default)]
-    pub after_any: Option<serde_json::Value>,
+    pub after_any: Vec<DepRef>,
     #[serde(default)]
     pub array: Option<ArrayReq>,
     #[serde(default)]
@@ -133,6 +180,86 @@ pub struct JobRequest {
     pub idempotency_key: Option<String>,
     #[serde(default)]
     pub dry_run: bool,
+}
+
+/// A dataset version a job uses, resolved at submit time.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct DatasetUse {
+    pub name: String,
+    pub version: String,
+}
+
+/// An image build: a Dockerfile and its context inside the snapshot.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct BuildSpec {
+    pub dockerfile: String,
+    pub context: String,
+}
+
+/// The image a job runs in. For builds, `image` is the tag the build pushes.
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct ContainerSpec {
+    pub image: String,
+    #[serde(default)]
+    pub build: Option<BuildSpec>,
+}
+
+/// Everything about a job beyond M1's columns, stored as one JSON column.
+#[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
+pub struct JobSpec {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after_ok: Vec<DepRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub after_any: Vec<DepRef>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub inputs: Vec<InputSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub datasets: Vec<DatasetUse>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub container: Option<ContainerSpec>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_cost_usd: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub keep_outputs: Option<String>,
+}
+
+impl JobSpec {
+    pub fn has_deps(&self) -> bool {
+        !self.after_ok.is_empty() || !self.after_any.is_empty()
+    }
+}
+
+/// Paths in globs and names: letters, digits and `_ . * ? / - [ ]`, relative, no `..`.
+pub fn valid_glob(g: &str) -> bool {
+    !g.is_empty()
+        && !g.contains("..")
+        && !g.starts_with('/')
+        && g.chars().all(|c| c.is_ascii_alphanumeric() || "_.*?/-[]".contains(c))
+}
+
+/// Names used as directory names (input `as`, dataset names).
+pub fn valid_dir_name(n: &str) -> bool {
+    !n.is_empty()
+        && n.len() <= 64
+        && n != "."
+        && n != ".."
+        && n.chars().all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c))
+}
+
+/// A path inside the snapshot (Dockerfile, build context).
+pub fn valid_rel_path(p: &str) -> bool {
+    !p.is_empty()
+        && !p.starts_with('/')
+        && !p.split('/').any(|seg| seg == "..")
+        && p.chars().all(|c| c.is_ascii_alphanumeric() || "_.-/".contains(c))
+}
+
+/// Container image references: registry/name:tag or @digest, conservative character set.
+pub fn valid_image_ref(r: &str) -> bool {
+    !r.is_empty()
+        && r.len() <= 300
+        && !r.starts_with('-')
+        && r.chars().all(|c| c.is_ascii_alphanumeric() || "_.-/:@".contains(c))
 }
 
 /// Validated, normalised resources stored with each job.
@@ -194,27 +321,6 @@ pub fn is_snapshot_id(s: &str) -> bool {
 impl JobRequest {
     /// Checks everything that doesn't need the store or the backends.
     pub fn validate(&self) -> Result<Resources, ApiError> {
-        let later = |field: &str, m: &str| {
-            Err(ApiError::bad_request(
-                format!("`{field}` is not available yet"),
-                format!("it arrives in milestone {m}; remove the field for now"),
-            ))
-        };
-        if self.container.is_some() {
-            return later("container", "M4");
-        }
-        if self.datasets.is_some() {
-            return later("datasets", "M3");
-        }
-        if self.inputs.is_some() {
-            return later("inputs", "M2");
-        }
-        if self.after_ok.is_some() || self.after_any.is_some() {
-            return later("after_ok/after_any", "M2");
-        }
-        if self.max_cost_usd.is_some() || self.quote_id.is_some() || self.keep_outputs.is_some() {
-            return later("max_cost_usd/quote_id/keep_outputs (cloud)", "M5");
-        }
         let title_len = self.title.chars().count();
         if title_len == 0 || title_len > 80 {
             return Err(ApiError::bad_request(
@@ -239,11 +345,61 @@ impl JobRequest {
             ));
         }
         let r = &self.resources;
-        if r.nodes != 1 {
-            return Err(ApiError::bad_request(
-                "multi-node jobs (`resources.nodes` > 1) are not available yet",
-                "they arrive in milestone M6; use nodes = 1",
-            ));
+        if r.nodes == 0 || r.nodes > 64 {
+            return Err(ApiError::bad_request("`resources.nodes` must be 1-64", "most jobs use 1"));
+        }
+        if r.nodes > 1 {
+            if self.container.is_none() {
+                return Err(ApiError::bad_request(
+                    "multi-node jobs must be container jobs",
+                    "set `container` so every node runs the same environment",
+                ));
+            }
+            if self.array.is_some() {
+                return Err(ApiError::bad_request("multi-node jobs can't be arrays", "submit one job per run"));
+            }
+        }
+        if let Some(c) = &self.container {
+            match (&c.image, &c.build) {
+                (Some(_), Some(_)) | (None, None) => {
+                    return Err(ApiError::bad_request(
+                        "`container` needs exactly one of `image` or `build`",
+                        "e.g. {\"image\": \"python:3.12-slim\"} or {\"build\": \"docker/train.Dockerfile\"}",
+                    ));
+                }
+                (Some(i), None) if !valid_image_ref(i) => {
+                    return Err(ApiError::bad_request(format!("image {i:?} is not a valid reference"), "e.g. ghcr.io/org/name:tag"));
+                }
+                (None, Some(b)) if !valid_rel_path(b) => {
+                    return Err(ApiError::bad_request(format!("build path {b:?} is not a relative path in the repo"), "e.g. docker/train.Dockerfile"));
+                }
+                _ => {}
+            }
+            if c.context.as_deref().is_some_and(|x| !valid_rel_path(x) && x != ".") {
+                return Err(ApiError::bad_request("`container.context` must be a relative path in the repo", "e.g. docker or ."));
+            }
+            if self.os.as_deref() == Some("mac") {
+                return Err(ApiError::bad_request("container jobs run Linux images; `os: mac` can't be a container job", "drop `container` or `os`"));
+            }
+        }
+        for inp in &self.inputs {
+            if !valid_dir_name(&inp.as_) {
+                return Err(ApiError::bad_request(format!("input name {:?} is invalid", inp.as_), "use letters, digits, _ . and -"));
+            }
+            if inp.glob.as_deref().is_some_and(|g| !valid_glob(g)) {
+                return Err(ApiError::bad_request("input glob has characters that aren't allowed", "use letters, digits and _ . * ? / - [ ] only"));
+            }
+        }
+        if let Some(g) = &self.keep_outputs
+            && !valid_glob(g) {
+                return Err(ApiError::bad_request("`keep_outputs` has characters that aren't allowed", "e.g. \"checkpoints/final/**\""));
+            }
+        if let Some(m) = self.max_cost_usd
+            && !(m > 0.0 && m.is_finite()) {
+                return Err(ApiError::bad_request("`max_cost_usd` must be positive", "e.g. 5"));
+            }
+        if self.quote_id.is_some() && self.max_cost_usd.is_none() {
+            return Err(ApiError::bad_request("`quote_id` without `max_cost_usd`", "quotes are only for jobs that may run on paid backends"));
         }
         if r.cpus == 0 {
             return Err(ApiError::bad_request("`resources.cpus` must be at least 1", "set cpus >= 1"));
@@ -284,7 +440,7 @@ impl JobRequest {
                 return Err(ApiError::bad_request("`idempotency_key` must be 1-200 characters", ""));
             }
         Ok(Resources {
-            nodes: 1,
+            nodes: r.nodes,
             cpus: r.cpus,
             mem_mb: (r.mem_gb * 1024.0).ceil() as u64,
             gpus: r.gpus,
@@ -325,6 +481,7 @@ pub struct Job {
     pub started_at: Option<DateTime<Utc>>,
     pub ended_at: Option<DateTime<Utc>>,
     pub last_seen: Option<DateTime<Utc>>,
+    pub spec: JobSpec,
 }
 
 /// Fields for inserting a new job.
@@ -345,11 +502,12 @@ pub struct NewJob {
     pub priority: i64,
     pub idempotency_key: Option<String>,
     pub key_fingerprint: String,
+    pub spec: JobSpec,
 }
 
 impl Job {
     /// A transient job built from a request, used for dry runs and submit-time checks.
-    pub fn preview(req: &JobRequest, res: Resources) -> Job {
+    pub fn preview(req: &JobRequest, res: Resources, spec: JobSpec) -> Job {
         Job {
             id: 0,
             array_id: None,
@@ -379,7 +537,12 @@ impl Job {
             started_at: None,
             ended_at: None,
             last_seen: None,
+            spec,
         }
+    }
+
+    pub fn is_container(&self) -> bool {
+        self.spec.container.is_some()
     }
 
     /// The key used to group array tasks that can share one quote and one Slurm array.

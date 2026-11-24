@@ -1,0 +1,83 @@
+# Backends the compute daemon may place jobs on: the one place to add or change nodes.
+# Copy this file to hosts.toml (gitignored), edit it, then push it to the coordinator and restart
+# with `deploy/install.sh config` (running jobs survive a restart). The coordinator itself is
+# not a backend unless you list it.
+#
+# Adding a node takes a name, a kind and a way to reach it:
+#
+#   [[backend]]
+#   name = "studio"
+#   kind = "local"              # local = run jobs directly on the host; slurm = submit to Slurm
+#   transport = "ssh"           # "rex" (default for local) or "ssh" (default for slurm)
+#   ssh_host = "studio"         # for transport ssh: host, tailnet name or ~/.ssh/config alias
+#   # rex_label = "Studio"      # for transport rex: the label from `rex hosts`
+#
+# Everything else is optional:
+#   enabled         default true; POST /v1/backends/{name}/enable|disable overrides it
+#   root            where jobs live on the host (local default:
+#                   ${XDG_DATA_HOME:-$HOME/.local/share}/compute)
+#   cpus, mem_gb    the scheduler's share; default is detected total minus reserve_cpus (2)
+#                   and reserve_mem_gb (4)
+#   os, arch        detected when omitted
+#   ssh_user        transport rex: detected through Rex (`id -un` on the host) when omitted
+#   runtimes        native / docker / apptainer; detected when omitted
+#   data_cap_gb     space for dataset copies; least recently used copies are evicted past it
+#   ssh_port, tunnel_port (auto), gpus, gpu_type, max_nodes, restrictions = [...]
+#
+# Paid GPU clouds take only jobs that set max_cost_usd (after a dry-run quote), count against
+# [budget], and read their API key from the config dir (<kind>.key; Modal: modal.toml with
+# token_id and token_secret):
+#
+#   [[backend]]
+#   name = "runpod"
+#   kind = "runpod"             # runpod | lambda | modal
+#   max_nodes = 4               # RunPod: multi-node jobs run on an Instant Cluster
+#   [backend.cloud]             # all optional
+#   tier = "SECURE"             # RunPod: SECURE or COMMUNITY
+#   gpu_types = ["L40S", "H100"]
+#   default_image = "..."       # for jobs without `container`
+#   regions = []
+#   # Modal only (no price API): gpu_rates = {L40S = 1.95}, cpu_rate, mem_gb_rate, rates_date
+
+listen = "127.0.0.1:8765"   # COMPUTE_LISTEN overrides this (deploy sets the tailnet address)
+tz = "America/Los_Angeles"
+
+# Image builds (`container.build`) run on the builder with docker buildx and push to
+# <prefix>:<hash>. The prefix comes from COMPUTE_REGISTRY_PREFIX (computed.env) when not set
+# here. `secret` names a secret holding REGISTRY_USERNAME / REGISTRY_PASSWORD (push and pull).
+[registry]
+builder = "workstation"
+secret = "registry"
+
+# Cloud spend allowed per month; 0 means paid backends never run anything.
+[budget]
+monthly_usd = 0
+
+[[backend]]
+name = "workstation"
+kind = "local"
+rex_label = "Workstation"   # a CPU-only desktop reached through Rex
+restrictions = ["no schedulable GPU"]
+
+[[backend]]
+name = "cluster"
+kind = "slurm"
+transport = "ssh"
+ssh_host = "cluster"        # an ~/.ssh/config alias for the login node
+root = "/scratch/users/$USER/compute"
+gpus = 4                    # GPUs a user may hold at once
+gpu_type = "A100"
+# gpu_mem_gb = 80
+restrictions = [
+  "scratch files untouched for 90 days are purged",
+]
+
+[backend.slurm]             # all optional; these are the defaults
+gpu_partition = "gpu"
+cpu_partition = "normal"
+cpu_qos = "normal"
+mem_per_cpu_mb = 4000       # memory is requested as cpus x this
+max_gpus = 4
+node_cpus = 64              # a GPU node; a max_gpus job takes all of it
+node_mem_mb = 256000
+max_cpu_task_cpus = 128

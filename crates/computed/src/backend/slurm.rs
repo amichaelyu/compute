@@ -1,11 +1,11 @@
-//! FarmShare (Slurm) over `ssh farm`. Request sizing follows the FarmShare rules: memory is
-//! cpus x 4000 MB, a 4-GPU job takes the whole node, and 1-3 GPU jobs compare a few CPU/memory
-//! shapes with `sbatch --test-only` and take the earliest start.
+//! Slurm clusters, over ssh. Request sizing follows the `[backend.slurm]` limits: memory is
+//! cpus x `mem_per_cpu_mb`, a `max_gpus` job takes a whole node, and smaller GPU jobs compare a
+//! few CPU/memory shapes with `sbatch --test-only` and take the earliest start.
 
-use super::{Alloc, Backend, PollResult, Probe, Quote, Remote, Shape, job_env, parse_status, write_remote_file};
+use super::{Alloc, Backend, PollResult, Probe, Quote, Remote, Shape, StageFiles, parse_status, write_remote_file};
 use crate::config::{BackendConfig, SlurmConfig};
 use crate::model::{Job, JobState};
-use crate::transport::{Tunnels, shell_quote};
+use crate::transport::{Reader, Shell, Tunnels, shell_quote};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
@@ -62,12 +62,14 @@ impl SlurmBackend {
             gpus: r.gpus,
             partition: Some(part.to_string()),
             qos: qos.map(str::to_string),
+            nodes: 1,
+            ..Default::default()
         };
         if r.gpus == 0 {
             if cpus_min > s.max_cpu_task_cpus {
                 return Err(format!(
-                    "needs {cpus_min} CPUs (memory {} MB at {} MB/CPU); farm allows {} per CPU task",
-                    r.mem_mb, s.mem_per_cpu_mb, s.max_cpu_task_cpus
+                    "needs {cpus_min} CPUs (memory {} MB at {} MB/CPU); {} allows {} per CPU task",
+                    r.mem_mb, s.mem_per_cpu_mb, self.cfg().name, s.max_cpu_task_cpus
                 ));
             }
             return Ok(vec![shape(cpus_min, &s.cpu_partition, Some(&s.cpu_qos))]);
@@ -106,6 +108,10 @@ impl SlurmBackend {
         if shape.gpus > 0 {
             a.push(format!("--gres=gpu:{}", shape.gpus));
         }
+        if let Some(d) = &shape.dependency {
+            a.push(format!("--dependency={d}"));
+            a.push("--kill-on-invalid-dep=yes".into());
+        }
         a
     }
 
@@ -116,29 +122,37 @@ impl SlurmBackend {
     async fn compute_quote(&self, job: &Job) -> Quote {
         let c = self.cfg();
         let r = &job.resources;
+        if r.nodes > c.max_nodes {
+            return Quote::no(format!("nodes={}; {} runs single-node jobs", r.nodes, c.name), true);
+        }
+        if job.is_container() && !self.remote.runtimes().iter().any(|x| x == "apptainer" || x == "docker") {
+            return Quote::no(format!("container job; {} has no Apptainer or Docker", c.name), true);
+        }
         if r.gpus > self.scfg.max_gpus {
-            return Quote::no(format!("gpus={}; farm allows at most {} GPUs per user", r.gpus, self.scfg.max_gpus), true);
+            return Quote::no(format!("gpus={}; {} allows at most {} GPUs per user", r.gpus, c.name, self.scfg.max_gpus), true);
         }
         if job.os.as_deref() == Some("mac") {
-            return Quote::no("os=mac; farm is linux", true);
+            return Quote::no(format!("os=mac; {} is linux", c.name), true);
         }
         if let (Some(want), Some(have)) = (&r.gpu_type, &c.gpu_type)
             && r.gpus > 0 && !want.eq_ignore_ascii_case(have) {
-                return Quote::no(format!("gpu_type={want}; farm has {have}"), true);
+                return Quote::no(format!("gpu_type={want}; {} has {have}", c.name), true);
             }
         let shapes = match self.shapes(job) {
             Ok(s) => s,
             Err(e) => return Quote::no(e, true),
         };
-        let ssh = match self.remote.ssh().await {
+        let ssh = match self.remote.shell().await {
             Ok(s) => s,
             Err(e) => return Quote::no(format!("unreachable: {e:#}"), false),
         };
         let mut script = String::new();
         for (i, s) in shapes.iter().enumerate() {
+            let mut probe = s.clone();
+            probe.dependency = None;
             script.push_str(&format!(
                 "printf 'SHAPE {i} '; sbatch --test-only {} --wrap true 2>&1 | tr '\\n' ' '; echo\n",
-                Self::sbatch_opts(s, r.time_s)
+                Self::sbatch_opts(&probe, r.time_s)
             ));
         }
         let partition = shapes[0].partition.clone().unwrap_or_default();
@@ -184,7 +198,7 @@ impl SlurmBackend {
             } else {
                 describe(&shape)
             };
-            return Quote::Ok { start, source: "slurm".into(), reason, shape };
+            return Quote::Ok { start, source: "slurm".into(), reason, shape, cost: None };
         }
         if errors.iter().any(|e| e.contains("error")) {
             // Slurm refused every shape (e.g. a QOS or partition limit): not placeable here now.
@@ -198,6 +212,7 @@ impl SlurmBackend {
             source: "daemon".into(),
             reason: format!("{}; Slurm gave no start time, estimated from running jobs' time left", describe(&shape)),
             shape,
+            cost: None,
         }
     }
 
@@ -257,6 +272,9 @@ impl Backend for SlurmBackend {
     fn root(&self) -> Option<String> {
         self.remote.root()
     }
+    fn runtimes(&self) -> Vec<String> {
+        self.remote.runtimes()
+    }
 
     async fn probe(&self) -> Result<Probe> {
         let s = &self.scfg;
@@ -291,11 +309,12 @@ impl Backend for SlurmBackend {
                 s.gpu_partition.clone(): {
                     "groups": rows(gpu.trim_start_matches("GPU")),
                     "gpu_type": self.cfg().gpu_type,
-                    "gpu_mem_gb": 48,
+                    "gpu_mem_gb": self.cfg().gpu_mem_gb,
                     "arch": self.cfg().arch.clone().unwrap_or_else(|| "amd64".into()),
                 },
                 s.cpu_partition.clone(): {"groups": rows(cpu)},
             },
+            "runtimes": self.remote.runtimes(),
             "limits": {
                 "max_gpus_per_user": s.max_gpus,
                 "mem_per_cpu_mb": s.mem_per_cpu_mb,
@@ -318,23 +337,23 @@ impl Backend for SlurmBackend {
         q
     }
 
-    async fn stage(&self, job: &Job, snapshot: &Path, secrets_env: Option<String>) -> Result<()> {
+    async fn stage(&self, job: &Job, snapshot: &Path, files: &StageFiles) -> Result<()> {
         let root = self.remote.root_or_err()?;
         let cache = self.cache_env(&root);
         let prelude: String = cache
             .iter()
             .map(|(k, v)| format!("export {k}={}\n", shell_quote(v)))
             .collect();
-        self.remote.stage_snapshot(&job.snapshot, snapshot, &prelude).await?;
+        let mut files = files.clone();
+        files.env.extend(cache);
         // Slurm enforces --time, so the runner's own timeout is off (0).
-        let env = job_env(&root, job, 0, &cache);
-        self.remote.write_job_files(job.id, &env, &job.command, secrets_env.as_deref()).await
+        self.remote.stage_job(job, snapshot, &files, &prelude, 0).await
     }
 
     async fn launch(&self, jobs: &[Job], shape: &Shape) -> Result<Vec<serde_json::Value>> {
         let first = jobs.first().context("launch with no jobs")?;
         let root = self.remote.root_or_err()?;
-        let ssh = self.remote.ssh().await?;
+        let ssh = self.remote.shell().await?;
         let mut script = format!(
             "#!/bin/bash\n#SBATCH --job-name={}\n",
             title_for_slurm(first.id, &first.title)
@@ -351,7 +370,7 @@ impl Backend for SlurmBackend {
         } else {
             let tasks: String = jobs.iter().map(|j| format!("{}\n", Remote::jobdir(&root, j.id))).collect();
             let tasks_file = format!("{root}/runs/batch-{}.tasks", first.id);
-            write_remote_file(&ssh, &tasks_file, &tasks).await?;
+            write_remote_file(ssh.as_ref(), &tasks_file, &tasks).await?;
             script.push_str(&format!("#SBATCH --array=0-{}\n", jobs.len() - 1));
             script.push_str(&format!("#SBATCH --output={root}/runs/slurm-%A_%a.out\n"));
             script.push_str(&format!(
@@ -361,7 +380,7 @@ impl Backend for SlurmBackend {
             ));
             format!("{root}/runs/batch-{}.sbatch", first.id)
         };
-        write_remote_file(&ssh, &file, &script).await?;
+        write_remote_file(ssh.as_ref(), &file, &script).await?;
         let out = ssh.run(&format!("sbatch --parsable {}", shell_quote(&file))).await?.text();
         let slurm_id = out.trim().split(';').next().unwrap_or("").trim().to_string();
         if slurm_id.is_empty() || !slurm_id.chars().all(|c| c.is_ascii_digit()) {
@@ -394,7 +413,7 @@ impl Backend for SlurmBackend {
                 "squeue -h -r -j {list} -o '%i|%T|%S' 2>/dev/null\necho ACCT\n\
                  sacct -n -P -X -j {list} -o JobID,State,ExitCode 2>/dev/null"
             );
-            let out = self.remote.ssh().await?.run(&script).await?.text();
+            let out = self.remote.shell().await?.run(&script).await?.text();
             let (q, a) = out.split_once("ACCT").unwrap_or((&out, ""));
             for line in q.lines() {
                 let f: Vec<&str> = line.split('|').collect();
@@ -468,15 +487,19 @@ impl Backend for SlurmBackend {
         self.remote.logs(job.id, offset, max).await
     }
 
-    async fn fetch(&self, job: &Job, glob: Option<&str>) -> Result<tokio::process::Child> {
+    async fn fetch(&self, job: &Job, glob: Option<&str>) -> Result<Reader> {
         self.remote.fetch(job.id, glob).await
     }
 
     async fn cancel(&self, job: &Job) -> Result<()> {
         if let Some(key) = job.handle.as_ref().and_then(Self::slurm_key) {
-            self.remote.ssh().await?.run(&format!("scancel {}", shell_quote(&key))).await?;
+            self.remote.shell().await?.run(&format!("scancel {}", shell_quote(&key))).await?;
         }
         Ok(())
+    }
+
+    async fn shell_for(&self, _job: Option<&Job>) -> Result<(Arc<dyn Shell>, String)> {
+        Ok((self.remote.shell().await?, self.remote.root_or_err()?))
     }
 
     async fn availability(&self) -> Result<serde_json::Value> {
@@ -486,7 +509,7 @@ impl Backend for SlurmBackend {
              squeue -h --me -o '%T|%P'\necho LEFT\nsqueue -h -p {gp} -t R -o '%L'\n",
             gp = shell_quote(&s.gpu_partition)
         );
-        let out = self.remote.ssh().await?.run(&script).await?.text();
+        let out = self.remote.shell().await?.run(&script).await?.text();
         let (nodes, rest) = out.split_once("MINE").unwrap_or((&out, ""));
         let (mine, left) = rest.split_once("LEFT").unwrap_or((rest, ""));
         let mut free = 0;

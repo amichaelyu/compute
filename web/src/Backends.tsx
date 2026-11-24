@@ -56,6 +56,20 @@ function hardwareRows(b: BackendDetail): Rows | null {
     rows.push(["Jobs may use", `${sched.cpus} CPUs and ${sched.mem_gb} GB`]);
     return rows;
   }
+  if (b.kind !== "slurm") {
+    const types = Object.entries(obj(h.gpu_types))
+      .map(([t, v]) => [t, obj(v)] as const)
+      .filter(([, v]) => v.available)
+      .sort((a, b2) => num(a[1].usd_per_hour_per_gpu) - num(b2[1].usd_per_hour_per_gpu))
+      .slice(0, 6)
+      .map(([t, v]) => `${t} $${num(v.usd_per_hour_per_gpu).toFixed(2)}/h`);
+    if (!b.hardware) return null;
+    return [
+      ["GPUs in stock", types.length ? types.join(", ") : "none listed"],
+      ["Nodes per job", `up to ${h.max_nodes ?? 1}`],
+      ["Prices from", String(h.price_source ?? "provider")],
+    ];
+  }
   const rows: Rows = [];
   for (const [part, info] of Object.entries(obj(h.partitions))) {
     const p = obj(info);
@@ -82,6 +96,12 @@ function availabilityRows(b: BackendDetail): Rows | null {
       ["CPUs in use", `${a.cpus_in_use ?? 0}, ${a.cpus_free ?? "?"} free`],
       ["Memory in use", `${Math.round(num(a.mem_gb_in_use ?? 0) * 10) / 10} GB`],
       ["Load", String(a.load_average ?? "unknown")],
+    ];
+  }
+  if (b.kind !== "slurm") {
+    return [
+      ["Instances of yours", String(a.my_instances ?? 0)],
+      ["Boot time", `about ${Math.round(num(a.boot_estimate_s ?? 0) / 60)} min`],
     ];
   }
   const nodes = Object.entries(obj(a.nodes))
@@ -165,7 +185,11 @@ function Backend({ name }: { name: string }) {
         <h2>{b.name}</h2>
         <span className={`backend-status${b.enabled && b.reachable ? " ok" : ""}`}>{status}</span>
         <span className="muted">
-          {b.kind === "slurm" ? "Slurm cluster" : "machine"}, reached over {b.transport}
+          {b.kind === "slurm"
+            ? `Slurm cluster, reached over ${b.transport}`
+            : b.kind === "local"
+              ? `machine, reached over ${b.transport}`
+              : `${b.kind} cloud, paid per job`}
         </span>
       </header>
       <Toggle b={b} onChange={refresh} />

@@ -40,57 +40,11 @@ impl Snapshots {
 
     /// Streams an upload to disk while hashing it. Returns `(id, already_existed)`.
     pub async fn store(&self, body: Body) -> Result<(String, bool), ApiError> {
-        tokio::fs::create_dir_all(&self.dir).await.map_err(anyhow::Error::from)?;
-        let tmp = self.dir.join(format!(".upload-{}", hex::encode(rand::random::<[u8; 8]>())));
-        let result = self.write(body, &tmp).await;
-        let (hash, size) = match result {
-            Ok(v) => v,
-            Err(e) => {
-                let _ = tokio::fs::remove_file(&tmp).await;
-                return Err(e);
-            }
-        };
+        let (hash, size, existed) = store_blob_inner(&self.dir, body, MAX_BYTES, "snapshot is larger than 2 GiB",
+            "keep data out of the repo (gitignore it) and use datasets").await?;
         let id = format!("sha256:{hash}");
-        let dest = self.path(&id);
-        let existed = dest.is_file();
-        if existed {
-            let _ = tokio::fs::remove_file(&tmp).await;
-        } else {
-            tokio::fs::rename(&tmp, &dest).await.map_err(anyhow::Error::from)?;
-        }
         self.store.snapshot_seen(&id, size)?;
         Ok((id, existed))
-    }
-
-    async fn write(&self, body: Body, tmp: &PathBuf) -> Result<(String, u64), ApiError> {
-        let mut file = tokio::fs::File::create(tmp).await.map_err(anyhow::Error::from)?;
-        let mut hasher = Sha256::new();
-        let mut size: u64 = 0;
-        let mut head: Vec<u8> = Vec::with_capacity(4);
-        let mut stream = body.into_data_stream();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| ApiError::bad_request(format!("upload interrupted: {e}"), "retry the upload"))?;
-            size += chunk.len() as u64;
-            if size > MAX_BYTES {
-                return Err(ApiError::bad_request(
-                    "snapshot is larger than 2 GiB",
-                    "keep data out of the repo (gitignore it) and use $JOB_DATA_DIR",
-                ));
-            }
-            if head.len() < 4 {
-                head.extend(chunk.iter().take(4 - head.len()));
-            }
-            hasher.update(&chunk);
-            file.write_all(&chunk).await.map_err(anyhow::Error::from)?;
-        }
-        file.flush().await.map_err(anyhow::Error::from)?;
-        if head != ZSTD_MAGIC {
-            return Err(ApiError::bad_request(
-                "upload is not zstd-compressed",
-                "send a tar compressed with zstd: ... | tar -c ... | zstd | curl --data-binary @-",
-            ));
-        }
-        Ok((hex::encode(hasher.finalize()), size))
     }
 
     /// Deletes snapshots unused for 14 days that no unfinished job needs.
@@ -105,4 +59,64 @@ impl Snapshots {
         }
         Ok(stale.len())
     }
+}
+
+/// The path of a stored blob (`<dir>/<sha256 hex>.tar.zst`).
+pub fn blob_path(dir: &std::path::Path, sha: &str) -> PathBuf {
+    dir.join(format!("{}.tar.zst", sha.trim_start_matches("sha256:")))
+}
+
+/// Stores a zstd upload under `dir` named by its SHA-256. Returns `(hex, size)`.
+pub async fn store_blob(dir: &std::path::Path, body: Body, max: u64) -> Result<(String, u64), ApiError> {
+    let (hash, size, _) = store_blob_inner(dir, body, max, "upload is too large", "split it up").await?;
+    Ok((hash, size))
+}
+
+async fn store_blob_inner(dir: &std::path::Path, body: Body, max: u64, too_big: &str, hint: &str) -> Result<(String, u64, bool), ApiError> {
+    tokio::fs::create_dir_all(dir).await.map_err(anyhow::Error::from)?;
+    let tmp = dir.join(format!(".upload-{}", hex::encode(rand::random::<[u8; 8]>())));
+    let result = write_hashed(body, &tmp, max, too_big, hint).await;
+    let (hash, size) = match result {
+        Ok(v) => v,
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            return Err(e);
+        }
+    };
+    let dest = blob_path(dir, &hash);
+    let existed = dest.is_file();
+    if existed {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    } else {
+        tokio::fs::rename(&tmp, &dest).await.map_err(anyhow::Error::from)?;
+    }
+    Ok((hash, size, existed))
+}
+
+async fn write_hashed(body: Body, tmp: &std::path::Path, max: u64, too_big: &str, hint: &str) -> Result<(String, u64), ApiError> {
+    let mut file = tokio::fs::File::create(tmp).await.map_err(anyhow::Error::from)?;
+    let mut hasher = Sha256::new();
+    let mut size: u64 = 0;
+    let mut head: Vec<u8> = Vec::with_capacity(4);
+    let mut stream = body.into_data_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| ApiError::bad_request(format!("upload interrupted: {e}"), "retry the upload"))?;
+        size += chunk.len() as u64;
+        if size > max {
+            return Err(ApiError::bad_request(too_big, hint));
+        }
+        if head.len() < 4 {
+            head.extend(chunk.iter().take(4 - head.len()));
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk).await.map_err(anyhow::Error::from)?;
+    }
+    file.flush().await.map_err(anyhow::Error::from)?;
+    if head != ZSTD_MAGIC {
+        return Err(ApiError::bad_request(
+            "upload is not zstd-compressed",
+            "send a tar compressed with zstd: ... | tar -c ... | zstd | curl --data-binary @-",
+        ));
+    }
+    Ok((hex::encode(hasher.finalize()), size))
 }

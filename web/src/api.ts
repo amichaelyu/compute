@@ -2,6 +2,7 @@
 // request; on the tailnet, a pasted API session token (from ~/.config/compute/session) works too.
 
 export type JobState =
+  | "waiting"
   | "queued"
   | "staging"
   | "pending"
@@ -10,10 +11,11 @@ export type JobState =
   | "failed"
   | "cancelled"
   | "timeout"
-  | "lost";
+  | "lost"
+  | "dependency_failed";
 
-export const ACTIVE: JobState[] = ["queued", "staging", "pending", "running"];
-export const PROBLEM: JobState[] = ["failed", "timeout", "lost"];
+export const ACTIVE: JobState[] = ["waiting", "queued", "staging", "pending", "running"];
+export const PROBLEM: JobState[] = ["failed", "timeout", "lost", "dependency_failed"];
 
 export function isActive(s: JobState) {
   return ACTIVE.includes(s);
@@ -44,17 +46,27 @@ export interface Job extends Omit<JobRow, "time_s"> {
   retries_left: number;
   priority: number;
   submitted_by: string;
+  after_ok?: (number | { array: number })[];
+  after_any?: (number | { array: number })[];
+  inputs?: { from_job: number; glob?: string | null; as: string }[];
+  datasets?: string[];
+  image?: string | null;
+  max_cost_usd?: number | null;
+  cost_usd?: number | null;
+  usd_per_hour?: number;
 }
 
 export interface BackendSummary {
   name: string;
-  kind: "local" | "slurm";
+  kind: "local" | "slurm" | "runpod" | "lambda" | "modal";
   transport: "rex" | "ssh";
   enabled: boolean;
   enabled_until: string | null;
   reachable: boolean;
   hardware: string;
   active_jobs: number;
+  paid?: boolean;
+  runtimes?: string[];
 }
 
 export interface BackendDetail extends Omit<BackendSummary, "hardware" | "active_jobs"> {

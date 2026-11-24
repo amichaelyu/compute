@@ -74,7 +74,7 @@ Run this from the repo root. It packs tracked files plus new untracked files tha
 gitignored, and uploads them. Identical content is stored once.
 
 ```bash
-SNAP=$(git ls-files -co --exclude-standard -z | tar --null -T - -cf - | zstd -q -c \
+SNAP=$(git ls-files -co --exclude-standard -z | COPYFILE_DISABLE=1 tar --null -T - -cf - | zstd -q -c \
   | cx --data-binary @- -H 'Content-Type: application/zstd' "$COMPUTE_URL/v1/snapshots" | jq -r .id)
 ```
 
@@ -83,7 +83,8 @@ prints one path per line, so drop `-z`/`--null`). Data and checkpoints never go 
 keep them gitignored and read them from `$JOB_DATA_DIR`. Snapshots are capped at 2 GiB.
 
 If the repo has a `pyproject.toml`, `uv sync` (frozen when there is a `uv.lock`) runs once per
-backend when the snapshot is unpacked. Commands then use `uv run ...`.
+backend when the snapshot is unpacked for a native job. Commands then use `uv run ...`.
+(`COPYFILE_DISABLE=1` stops macOS tar from adding `._*` metadata files.)
 
 ## 3. Submit
 
@@ -99,7 +100,7 @@ cx --json @- "$COMPUTE_URL/v1/jobs" <<EOF
   "snapshot": "$SNAP",
   "resources": {"cpus": 8, "mem_gb": 32, "gpus": 1, "time": "2h"},
   "secrets": ["wandb"],
-  "env": {"WANDB_PROJECT": "umi"},
+  "env": {"WANDB_PROJECT": "evals"},
   "retries": 1,
   "idempotency_key": "eval-40k-2026-11-23",
   "dry_run": false
@@ -117,7 +118,7 @@ Fields:
   - `title` says *what* the job is. `description` says *why* it is being run and what it belongs
     to, so the user can tell jobs apart weeks later.
 - **Resources:** `cpus` (default 1), `mem_gb` (default 4), `gpus` (default 0), `gpu_type`
-  (a type a backend reports, or null for any), `nodes` (1 only for now).
+  (a type a backend reports, or null for any), `nodes` (default 1; see section 3e).
 - **Placement:** `backends` (an allowlist of backend names from `GET /v1/backends`), `os`
   (`"mac"` or `"linux"`),
   `priority` (higher starts first in the daemon's queue).
@@ -127,32 +128,133 @@ Fields:
   code is not retried.
 - `idempotency_key`: re-sending the same key returns the original job instead of submitting it
   again. Use one whenever a retry of your own call could duplicate a job.
+- Pipelines (`after_ok`, `after_any`, `inputs`), `datasets`, `container`, paid cloud
+  (`max_cost_usd`, `quote_id`, `keep_outputs`) and `nodes`: sections 3a-3e.
 
 Inside a job, the runner sets:
 
 | Variable | Meaning |
 |---|---|
 | `$JOB_ID` | the job's id |
-| `$JOB_OUTPUT_DIR` | the job's own output directory |
-| `$JOB_DATA_DIR` | the backend's shared data directory |
-| `$JOB_SNAPSHOT_DIR` | where the code is (also the working directory) |
+| `$JOB_OUTPUT_DIR` | the job's own output directory (`/out` in a container) |
+| `$JOB_INPUT_DIR` | other jobs' outputs, one subdirectory per input (`/in`) |
+| `$JOB_DATA_DIR` | one read-only subdirectory per dataset (`/data`) |
+| `$JOB_SNAPSHOT_DIR` | where the code is, also the working directory (`/work`) |
 | `$ARRAY_INDEX` | the task index in an array job |
 
 The working directory is shared by every job using that snapshot, so write results only to
 `$JOB_OUTPUT_DIR`.
 
-Not available yet (the API rejects them, saying which milestone adds them): `after_ok` /
-`after_any` / `inputs` (M2), `datasets` (M3), `container` (M4), `max_cost_usd` / `quote_id` /
-`keep_outputs` (cloud, M5) and `nodes > 1` (M6).
+### 3a. Pipelines
+
+Chain steps instead of waiting and resubmitting by hand. Submit them all at once:
+
+```json
+{"title": "Train on preprocessed shards", "...": "...",
+ "after_ok": [41],
+ "inputs": [{"from_job": 41, "glob": "shards/*", "as": "shards"}]}
+```
+
+- `after_ok: [ids]` starts only after every listed job succeeded; `after_any: [ids]` once they
+  have all ended, however they ended. `{"array": 7}` instead of an id means every task of array 7.
+- `inputs` copies a finished job's outputs (all of them, or the files matching `glob`) to
+  `$JOB_INPUT_DIR/<as>` before the job starts, from whichever backend that job ran on. A job
+  listed in `inputs` is added to `after_ok` automatically.
+- Until its dependencies finish, the job is `waiting`. If an `after_ok` parent fails, is
+  cancelled or is lost, the job ends as `dependency_failed` (and so do its own dependents).
+- When parent and child both run on a Slurm backend, the child is submitted to Slurm right
+  away with `--dependency`, so it ages in the queue while the parent runs.
+
+### 3b. Datasets
+
+Data the job reads goes in a dataset, not the snapshot. A dataset is named and versioned; a
+version never changes. The daemon copies it to whichever backend runs the job (counting the copy
+time in placement), keeps the copy for later jobs, and evicts least-recently-used copies when a
+backend's space runs low.
+
+```bash
+# from a directory on a backend, from a job's outputs, from Hugging Face, or from rclone:
+cx --json '{"name":"demos","description":"Teleop demos, v3","source":{"host_path":{"backend":"<name>","path":"/abs/path"}}}' "$COMPUTE_URL/v1/datasets"
+cx --json '{"name":"shards","source":{"job_outputs":{"job":41,"glob":"shards/*"}}}' "$COMPUTE_URL/v1/datasets"
+cx --json '{"name":"bench","source":{"hf":{"repo":"org/name","repo_type":"dataset","revision":"main"}}}' "$COMPUTE_URL/v1/datasets"
+cx --json '{"name":"raw","source":{"rclone":{"remote":"gdrive:datasets/raw"}}}' "$COMPUTE_URL/v1/datasets"
+# or upload a directory from here:
+(cd data/demos && COPYFILE_DISABLE=1 tar -cf - . | zstd -q -c) \
+  | cx -X PUT --data-binary @- -H 'Content-Type: application/zstd' "$COMPUTE_URL/v1/datasets/demos/upload?description=Teleop+demos+v3"
+cx "$COMPUTE_URL/v1/datasets"            # names, latest versions, where copies are
+cx "$COMPUTE_URL/v1/datasets/demos"      # every version and copy
+```
+
+Use them with `"datasets": ["demos", "bench@3f2a"]` (a bare name is the latest version). Each
+appears read-only at `$JOB_DATA_DIR/<name>`. Private Hugging Face repos take
+`"secret": "<name of a secret with HF_TOKEN>"`. Registering the same content again returns the
+existing version (`new_version: false`).
+
+### 3c. Containers
+
+`"container": {"image": "python:3.12-slim"}` runs the command in that image: Docker on machines
+that have it, Apptainer on Slurm clusters (with the GPUs passed through). Check `runtimes` in
+`GET /v1/backends`. Code still comes from the snapshot, mounted at `/work`, so changing code
+doesn't need a new image; put system libraries, CUDA and the Python environment in the image.
+Images are Linux images, so `os: "mac"` can't be combined with `container`.
+
+`"container": {"build": "docker/train.Dockerfile"}` builds the image from a Dockerfile in the
+snapshot (build context: the Dockerfile's directory, or `"context"`). The tag is a hash of the
+Dockerfile and its context, so an unchanged image is reused; the job waits in `queued` while a
+build runs. Builds only work when the daemon has a registry set up (`GET /v1/images` shows
+`registry`); otherwise use a prebuilt `image`.
+
+```bash
+cx "$COMPUTE_URL/v1/images"                       # builds: state, error
+cx "$COMPUTE_URL/v1/images/<key>/logs?offset=0"   # a build's log
+```
+
+A failed build ends the job as `failed` with a reason starting `build_failed:`.
+
+### 3d. Paid cloud backends
+
+Backends with `"paid": true` in `GET /v1/backends` cost money. They only take jobs that set
+`max_cost_usd`, run GPU jobs in a container (`container`, or the backend's default image), and
+count against a monthly budget (`GET /v1/budget`).
+
+1. Send the request with `"max_cost_usd": 5, "dry_run": true`. The response has `quote_id`,
+   `backend`, `estimated_cost_usd` (null when a free backend wins), `cheapest_paid_option` and
+   the budget.
+2. **Tell the user the backend and estimated cost and wait for their go-ahead.**
+3. Submit the same request (apart from `dry_run`) with `"quote_id": "q_..."` within 15 minutes.
+   A changed request gets `quote_mismatch`; an old quote gets `quote_expired`.
+
+The instance is deleted when the job ends. Before that, its log and the outputs matching
+`keep_outputs` (default: all of them) are copied to the coordinator and served from there, so
+set `keep_outputs` (for example `"checkpoints/final/**"`) when outputs are large.
+`GET /v1/jobs/<id>` shows `usd_per_hour` and, once it ends, `cost_usd`.
+
+### 3e. Multi-node jobs
+
+`"resources": {"nodes": 2, "gpus": 8, ...}` asks for 2 nodes with 8 GPUs each (cpus, mem_gb
+and gpus are per node). Only backends whose `max_nodes` allows it take these, all nodes run on
+one backend, and the job must use `container`. Every node gets `NNODES`, `NODE_RANK`,
+`GPUS_PER_NODE`, `MASTER_ADDR` and `MASTER_PORT`, so this works unchanged:
+
+```bash
+torchrun --nnodes=$NNODES --node_rank=$NODE_RANK --nproc_per_node=$GPUS_PER_NODE \
+  --master_addr=$MASTER_ADDR --master_port=$MASTER_PORT train.py
+```
+
+Node 0's log is the job's log; the others' are under `$JOB_OUTPUT_DIR/nodes/<rank>/log`. If any
+node fails, the whole job is stopped.
 
 ## 4. Report to the user
 
 The submit response has `backend`, `reason`, `estimated_start` (with `estimated_start_source`:
-`now`, `slurm` or `daemon`), `estimated_finish` and `per_backend` (why each backend would or
-wouldn't take it). Tell the user:
+`now`, `slurm`, `daemon`, `provider` or `dependencies`), `estimated_finish`,
+`estimated_cost_usd` (paid backends) and `per_backend` (why each backend would or wouldn't take
+it). For a `waiting` job these are a preview; placement is decided when its dependencies finish.
+Tell the user:
 
 - where the job runs and why
 - the estimated start and finish, and whether the start is Slurm's estimate or the daemon's
+- the estimated cost, for a paid backend
 - for jobs on a Slurm backend, where it stands in the queue: `GET /v1/backends/<name>` shows
   `my_pending` and `next_gpu_free_estimate`
 
@@ -166,7 +268,7 @@ cx "$COMPUTE_URL/v1/jobs/42/wait?until=done&timeout=900"      # returns early on
 cx "$COMPUTE_URL/v1/jobs/42/logs?offset=0"                     # {data, next_offset, eof}
 cx "$COMPUTE_URL/v1/jobs/42/logs?offset=<next_offset>"         # only the new output
 cx "$COMPUTE_URL/v1/jobs/42/outputs?glob=metrics/*.json" | zstd -dc | tar -x -C ./results/42
-cx "$COMPUTE_URL/v1/jobs?state=running,pending,queued"         # what's active
+cx "$COMPUTE_URL/v1/jobs?state=running,pending,queued,waiting" # what's active
 cx "$COMPUTE_URL/v1/jobs?q=eval"                               # search titles and descriptions
 cx "$COMPUTE_URL/v1/jobs?array=7"                              # tasks of array 7
 cx -X POST "$COMPUTE_URL/v1/jobs/42/cancel"                     # ?array=1 cancels a whole array
@@ -176,9 +278,10 @@ cx -X POST "$COMPUTE_URL/v1/jobs/42/cancel"                     # ?array=1 cance
 - When fetching outputs, use `glob` to skip big checkpoints you don't need. `*` also matches
   `/`. Allowed characters are letters, digits and `_ . * ? / - [ ]`.
 - Put fetched outputs inside the project (a gitignored dir), never loose in `~`.
-- End states are `succeeded`, `failed` (see `exit_code` and `reason`), `cancelled`, `timeout` and
-  `lost`. A reason starting `staging_failed:` means the code couldn't be unpacked or
-  `uv sync` failed; read the reason, fix it, and resubmit.
+- End states are `succeeded`, `failed` (see `exit_code` and `reason`), `cancelled`, `timeout`,
+  `lost` and `dependency_failed`. A reason starting `staging_failed:` means the code, datasets
+  or inputs couldn't be put on the backend, or `uv sync` failed; `build_failed:` means the image
+  build failed (see `GET /v1/images`). Read the reason, fix it, and resubmit.
 
 ## 6. Secrets
 
@@ -203,6 +306,12 @@ listed by `GET /v1/backends` run jobs.
 Every error is `{"error": {"code", "message", "hint"}}`. Follow the `hint`.
 
 - `unplaceable`: no backend can ever run the job as asked. Change the request; resubmitting
-  it unchanged fails again.
-- `bad_request`, `snapshot_missing`, `secret_missing`: fix the request as the hint says.
+  it unchanged fails again. Never add `max_cost_usd` just to get past this without asking the
+  user.
+- `over_budget`: only paid backends could run it and the monthly budget doesn't cover it. Tell
+  the user; don't work around it.
+- `quote_required`, `quote_expired`, `quote_mismatch`: get a (new) quote with a dry run and
+  submit exactly that request.
+- `bad_request`, `snapshot_missing`, `dataset_missing`, `secret_missing`: fix the request as
+  the hint says.
 - `unauthorized`: run `compute_login`.

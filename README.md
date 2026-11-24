@@ -7,10 +7,16 @@ places each job on whichever backend can start it soonest:
   with `sbatch --test-only`, so each job asks for what starts earliest.
 - **CPU-only machines**: macOS or Linux desktops and servers. Jobs run directly on the machine,
   and the daemon tracks its CPU and memory.
+- **Paid GPU clouds** (RunPod, Lambda, Modal): one instance per job, only for jobs that set a
+  cost cap and only after a price quote. Spending is capped per job and per month, and leftover
+  instances are swept. RunPod Instant Clusters run multi-node jobs.
 
 The daemon runs on a small always-on coordinator. It reaches backends over Rex or plain ssh,
-stages the code, runs each job, and serves its state, logs and outputs. A built-in web dashboard
-shows the schedule, the jobs and the backends.
+stages the code, runs each job, and serves its state, logs and outputs. Jobs can depend on other
+jobs and take their outputs as inputs, read versioned datasets that the daemon copies where
+they're needed, and run in container images (Docker, or Apptainer on Slurm), including images it
+builds from a Dockerfile. A built-in web dashboard shows the schedule, the jobs and the
+backends.
 
 Agents use it through `skills/compute/SKILL.md`. Symlink it into `~/.claude/skills/compute`.
 
@@ -19,11 +25,14 @@ Agents use it through `skills/compute/SKILL.md`. Symlink it into `~/.claude/skil
 ```
 crates/computed/    the daemon (Rust: axum, SQLite)
   src/api.rs          /v1/ HTTP API
-  src/scheduler.rs    probe, poll and place loop
-  src/backend/        Backend trait; local machines (Rex or ssh) and Slurm clusters
+  src/scheduler.rs    probe, dependency, poll and place loop
+  src/datasets.rs     dataset versions and copies
+  src/images.rs       container image builds
+  src/backend/        Backend trait; local machines (Rex or ssh), Slurm clusters, cloud GPUs
+crates/modal-client/ minimal gRPC client for Modal Sandboxes (vendored protos)
 web/                the dashboard (React + TypeScript, Vite), embedded in the daemon
 runner/compute-run  the per-job runner the daemon installs on each backend
-hosts.toml          backends (copied to ~/.config/compute/hosts.toml on the coordinator)
+hosts.example.toml  template for hosts.toml (gitignored), copied to ~/.config/compute/ on the coordinator
 skills/compute/     the skill file agents use
 deploy/             systemd unit and install script for the coordinator
 ```
@@ -32,18 +41,31 @@ deploy/             systemd unit and install script for the coordinator
 
 The daemon reads `$COMPUTE_CONFIG_DIR` (default `~/.config/compute`):
 
-- `hosts.toml`: the backends. Each one needs a name, a kind (`local` or `slurm`) and a way to
+- `hosts.toml`: the backends. Each one needs a name, a kind (`local`, `slurm`, or a cloud:
+  `runpod`, `lambda`, `modal`) and, for machines and clusters, a way to
   reach it (`transport = "rex"` with `rex_label`, or `"ssh"` with `ssh_host`). The comments at
-  the top of `hosts.toml` list the optional fields.
+  the top of `hosts.example.toml` list the optional fields. Copy it to `hosts.toml` in the
+  repo root (gitignored) and edit it; `deploy/install.sh config` pushes it.
 - `allowed_signers`: SSH public keys allowed to use the API, one per line, in
   `<principal> <keytype> <base64>` form.
-- `secrets/`: named job secrets (0600 files), managed through the API.
+- `secrets/`: named job secrets (0600 files), managed through the API. The daemon also reads
+  two kinds itself: the `[registry] secret` (`REGISTRY_USERNAME`, `REGISTRY_PASSWORD`) for
+  pushing builds and pulling private images, and secrets with `HF_TOKEN` named by Hugging Face
+  datasets.
+- Cloud API keys, one 0600 file each: `runpod.key`, `lambda.key`, and `modal.toml` (with
+  `token_id` and `token_secret`). Cloud instances authorize the coordinator's own
+  `~/.ssh/id_ed25519.pub`.
 - `computed.env`: environment for the service.
   - `COMPUTE_LISTEN` sets the address to listen on.
   - `COMPUTE_CF_TEAM_DOMAIN`, `COMPUTE_CF_AUD` and `COMPUTE_CF_EMAILS` turn on Cloudflare Access
     logins for the dashboard.
+  - `COMPUTE_REGISTRY_PREFIX` (e.g. `ghcr.io/<owner>/compute`) turns on image builds.
 
-State (SQLite and code snapshots) lives in `$COMPUTE_STATE_DIR` (default `~/.local/state/compute`).
+`hosts.toml` also has `[registry]` (builder backend, credentials secret, platforms) and
+`[budget]` (`monthly_usd`, 0 by default, so paid backends run nothing until it's raised).
+
+State (SQLite, code snapshots, uploaded datasets, build logs, and outputs copied off cloud
+instances) lives in `$COMPUTE_STATE_DIR` (default `~/.local/state/compute`).
 
 Clients (agents, and the dashboard's dev server) read `~/.config/compute/client.env`:
 
@@ -62,6 +84,9 @@ The coordinator needs:
 - **For Rex backends:** `rex` with a host label for each one, and key login to each host's sshd
   (the daemon reaches it through `rex forward`).
 - **For ssh backends:** non-interactive key login to each host (an `~/.ssh/config` alias works).
+- **For container jobs:** Docker on local machines, Apptainer (or an `apptainer` module) on
+  Slurm clusters. The probe detects both.
+- **For cloud backends:** `curl`, the API key file, and outbound internet.
 
 ## Deploying to a coordinator
 

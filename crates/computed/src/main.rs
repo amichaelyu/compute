@@ -5,7 +5,9 @@ mod api;
 mod auth;
 mod backend;
 mod config;
+mod datasets;
 mod error;
+mod images;
 mod model;
 mod scheduler;
 mod secrets;
@@ -16,6 +18,7 @@ mod ui;
 
 use anyhow::{Context, Result};
 use backend::Backend;
+use backend::cloud::{Cloud, CloudBackend};
 use backend::local::LocalBackend;
 use backend::slurm::SlurmBackend;
 use config::{BackendKind, Config, Paths};
@@ -44,7 +47,7 @@ async fn serve() -> Result<()> {
     let paths = Paths::from_env()?;
     let cfg_path = paths.hosts_toml();
     let cfg = Config::load(&cfg_path).with_context(|| {
-        format!("loading config; copy the repo's hosts.toml to {}", cfg_path.display())
+        format!("loading config; copy the repo's hosts.example.toml, edited, to {}", cfg_path.display())
     })?;
     let tz = cfg.tz()?;
     if !paths.allowed_signers().exists() {
@@ -56,20 +59,36 @@ async fn serve() -> Result<()> {
 
     let store = Arc::new(store::Store::open(&paths.db())?);
     let tunnels = Arc::new(transport::Tunnels::default());
-    let backends: Vec<Arc<dyn Backend>> = cfg
-        .backends
-        .iter()
-        .map(|b| -> Arc<dyn Backend> {
-            match b.kind {
-                BackendKind::Local => Arc::new(LocalBackend::new(b.clone(), tunnels.clone())),
-                BackendKind::Slurm => Arc::new(SlurmBackend::new(b.clone(), tz, tunnels.clone())),
-            }
-        })
-        .collect();
-    let snapshots = Arc::new(snapshots::Snapshots::new(paths.snapshots_dir(), store.clone()));
     let secrets = Arc::new(secrets::Secrets::new(paths.secrets_dir()));
+    let registry_creds = match (&cfg.registry.secret, cfg.registry.host()) {
+        (Some(s), Some(host)) => {
+            let user = secrets.value(s, "REGISTRY_USERNAME")?;
+            let pass = secrets.value(s, "REGISTRY_PASSWORD")?;
+            user.zip(pass).map(|(u, p)| (host, u, p))
+        }
+        _ => None,
+    };
+    let mut backends: Vec<Arc<dyn Backend>> = Vec::new();
+    for b in &cfg.backends {
+        backends.push(match b.kind {
+            BackendKind::Local => Arc::new(LocalBackend::new(b.clone(), tunnels.clone())),
+            BackendKind::Slurm => Arc::new(SlurmBackend::new(b.clone(), tz, tunnels.clone())),
+            _ => {
+                let cb = Arc::new(CloudBackend::new(b.clone(), &paths)?);
+                cb.set_registry(registry_creds.clone());
+                Arc::new(Cloud(cb))
+            }
+        });
+    }
+    let snapshots = Arc::new(snapshots::Snapshots::new(paths.snapshots_dir(), store.clone()));
     let auth = Arc::new(auth::Auth::new(paths.allowed_signers(), store.clone()));
-    let sched = scheduler::Scheduler::new(store, backends, snapshots, secrets);
+    let sched = scheduler::Scheduler::new(
+        store,
+        backends,
+        snapshots,
+        secrets,
+        scheduler::SchedulerConfig { paths: paths.clone(), registry: cfg.registry.clone(), budget: cfg.budget.clone(), tz },
+    );
     sched.reconcile()?;
     tokio::spawn(sched.clone().run());
 

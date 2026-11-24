@@ -4,16 +4,56 @@
 //! commands are never interpolated into them; they travel as file contents.
 
 use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
 use std::collections::HashMap;
+use std::pin::Pin;
 use std::process::Stdio;
+use std::task::Poll;
 use std::time::Duration;
-use tokio::io::AsyncWriteExt;
-use tokio::process::{Child, Command};
+use tokio::io::{AsyncRead, AsyncWriteExt, ReadBuf};
+use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::Mutex;
 
-/// PATH additions so `uv`, Homebrew tools and user binaries are found in non-interactive shells.
+/// PATH additions so `uv`, Homebrew tools, Docker (OrbStack) and user binaries are found in
+/// non-interactive shells.
 pub const PATH_PRELUDE: &str =
-    "export PATH=\"$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"";
+    "export PATH=\"$HOME/.local/bin:$HOME/.orbstack/bin:/opt/homebrew/bin:/usr/local/bin:$PATH\"";
+
+/// A byte stream (tar archives going to or coming from a host).
+pub type Reader = Box<dyn AsyncRead + Send + Unpin>;
+
+/// Somewhere scripts run: a host over ssh, or a cloud sandbox through its exec API.
+#[async_trait]
+pub trait Shell: Send + Sync {
+    /// Runs a bash script, optionally feeding `input` to stdin. Fails on a non-zero exit.
+    async fn run_input(&self, script: &str, input: Option<Vec<u8>>) -> Result<Output>;
+    async fn run(&self, script: &str) -> Result<Output> {
+        self.run_input(script, None).await
+    }
+    /// Runs a script with `data` streamed to its stdin (for `tar -x`).
+    async fn pipe_in(&self, script: &str, data: Reader) -> Result<()>;
+    /// Starts a script and returns its stdout as a stream (for `tar -c`).
+    async fn pipe_out(&self, script: &str) -> Result<Reader>;
+}
+
+/// A child process's stdout that keeps the child alive while it's being read.
+pub struct ChildReader {
+    _child: Child,
+    stdout: ChildStdout,
+}
+
+impl ChildReader {
+    pub fn new(mut child: Child) -> Result<ChildReader> {
+        let stdout = child.stdout.take().context("child has no stdout")?;
+        Ok(ChildReader { _child: child, stdout })
+    }
+}
+
+impl AsyncRead for ChildReader {
+    fn poll_read(mut self: Pin<&mut Self>, cx: &mut std::task::Context<'_>, buf: &mut ReadBuf<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stdout).poll_read(cx, buf)
+    }
+}
 
 /// Single-quotes a string for POSIX shells.
 pub fn shell_quote(s: &str) -> String {
@@ -29,6 +69,8 @@ pub struct Ssh {
     pub tunnel: bool,
     /// Backend name, used for `HostKeyAlias` on tunnels and in error messages.
     pub alias: String,
+    /// A throwaway cloud instance: don't record or check its host key.
+    pub ephemeral: bool,
 }
 
 pub struct Output {
@@ -58,6 +100,9 @@ impl Ssh {
             c.arg("-o").arg(format!("HostKeyAlias=compute-{}", self.alias));
             c.args(["-o", "StrictHostKeyChecking=accept-new"]);
         }
+        if self.ephemeral {
+            c.args(["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR"]);
+        }
         let dest = match &self.user {
             Some(u) => format!("{u}@{}", self.host),
             None => self.host.clone(),
@@ -68,12 +113,7 @@ impl Ssh {
         c
     }
 
-    /// Runs a script and returns stdout. Fails on a non-zero exit, with stderr in the error.
-    pub async fn run(&self, script: &str) -> Result<Output> {
-        self.run_input(script, None).await
-    }
-
-    pub async fn run_input(&self, script: &str, input: Option<Vec<u8>>) -> Result<Output> {
+    async fn run_input_impl(&self, script: &str, input: Option<Vec<u8>>) -> Result<Output> {
         let mut c = self.command(script);
         c.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
             .stdout(Stdio::piped())
@@ -103,6 +143,88 @@ impl Ssh {
         let mut c = self.command(script);
         c.stdin(stdin).stdout(stdout).stderr(Stdio::piped());
         c.spawn().context("spawning ssh")
+    }
+}
+
+#[async_trait]
+impl Shell for Ssh {
+    async fn run_input(&self, script: &str, input: Option<Vec<u8>>) -> Result<Output> {
+        self.run_input_impl(script, input).await
+    }
+
+    async fn pipe_in(&self, script: &str, mut data: Reader) -> Result<()> {
+        let mut child = self.spawn(script, Stdio::piped(), Stdio::null())?;
+        let mut stdin = child.stdin.take().context("ssh stdin")?;
+        let copy = tokio::io::copy(&mut data, &mut stdin).await;
+        drop(stdin);
+        let out = child.wait_with_output().await?;
+        if !out.status.success() {
+            bail!("ssh {} failed ({}): {}", self.alias, out.status, crate::backend::tail(&String::from_utf8_lossy(&out.stderr), 2000));
+        }
+        copy.context("streaming data")?;
+        Ok(())
+    }
+
+    async fn pipe_out(&self, script: &str) -> Result<Reader> {
+        let mut c = self.command(script);
+        c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::null());
+        let child = c.spawn().context("spawning ssh")?;
+        Ok(Box::new(ChildReader::new(child)?))
+    }
+}
+
+/// A shell on the coordinator itself, for outputs kept there after cloud jobs.
+pub struct LocalShell;
+
+#[async_trait]
+impl Shell for LocalShell {
+    async fn run_input(&self, script: &str, input: Option<Vec<u8>>) -> Result<Output> {
+        let mut c = Command::new("bash");
+        c.arg("-c").arg(script).kill_on_drop(true);
+        c.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = c.spawn().context("spawning bash")?;
+        if let Some(data) = input {
+            let mut stdin = child.stdin.take().context("stdin")?;
+            stdin.write_all(&data).await?;
+            drop(stdin);
+        }
+        let out = child.wait_with_output().await?;
+        if !out.status.success() {
+            bail!("local script failed ({}): {}", out.status, String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(Output { stdout: out.stdout })
+    }
+
+    async fn pipe_in(&self, script: &str, mut data: Reader) -> Result<()> {
+        let mut child = Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+        let mut stdin = child.stdin.take().context("stdin")?;
+        let copy = tokio::io::copy(&mut data, &mut stdin).await;
+        drop(stdin);
+        let out = child.wait_with_output().await?;
+        if !out.status.success() {
+            bail!("local script failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        copy?;
+        Ok(())
+    }
+
+    async fn pipe_out(&self, script: &str) -> Result<Reader> {
+        let child = Command::new("bash")
+            .arg("-c")
+            .arg(script)
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()?;
+        Ok(Box::new(ChildReader::new(child)?))
     }
 }
 

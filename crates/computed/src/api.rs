@@ -4,8 +4,8 @@ use crate::auth::Auth;
 use crate::backend::Quote;
 use crate::config::BackendKind;
 use crate::error::{ApiError, ApiResult};
-use crate::model::{Job, JobRequest, JobState, NewJob};
-use crate::scheduler::Scheduler;
+use crate::model::{DepRef, Job, JobRequest, JobSpec, JobState, NewJob};
+use crate::scheduler::{Best, Scheduler};
 use crate::store::JobFilter;
 use async_compression::tokio::bufread::ZstdEncoder;
 use axum::body::Body;
@@ -54,6 +54,13 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/backends/{name}/disable", post(disable_backend))
         .route("/v1/secrets", get(list_secrets))
         .route("/v1/secrets/{name}", put(put_secret).delete(delete_secret))
+        .route("/v1/datasets", post(register_dataset).get(list_datasets))
+        .route("/v1/datasets/{name}", get(get_dataset))
+        .route("/v1/datasets/{name}/upload", put(upload_dataset).layer(DefaultBodyLimit::disable()))
+        .route("/v1/datasets/{name}/copies/{backend}", axum::routing::delete(delete_dataset_copy))
+        .route("/v1/images", get(list_images))
+        .route("/v1/images/{key}/logs", get(image_logs))
+        .route("/v1/budget", get(budget))
         .route("/v1/whoami", get(whoami))
         .fallback(crate::ui::serve)
         .with_state(state)
@@ -183,9 +190,63 @@ fn quote_line(tz: &Tz, q: &Quote) -> String {
     }
 }
 
-async fn submit(State(s): State<AppState>, sess: Session, body: Result<Json<JobRequest>, JsonRejection>) -> ApiResult<Response> {
+/// The request minus `dry_run` and `quote_id`, hashed, so a quote matches only the same request.
+fn request_hash(raw: &Value) -> String {
+    let mut v = raw.clone();
+    if let Some(m) = v.as_object_mut() {
+        m.remove("dry_run");
+        m.remove("quote_id");
+    }
+    hex::encode(<sha2::Sha256 as sha2::Digest>::digest(v.to_string().as_bytes()))
+}
+
+/// Builds the stored spec: dependencies, inputs, datasets, container and cloud fields.
+async fn build_spec(s: &AppState, req: &JobRequest) -> ApiResult<JobSpec> {
+    let mut spec = JobSpec {
+        after_ok: req.after_ok.clone(),
+        after_any: req.after_any.clone(),
+        inputs: req.inputs.clone(),
+        max_cost_usd: req.max_cost_usd,
+        keep_outputs: req.keep_outputs.clone(),
+        ..Default::default()
+    };
+    for r in req.after_ok.iter().chain(&req.after_any) {
+        let exists = match r {
+            DepRef::Job(id) => s.sched.store.get_job(*id)?.is_some(),
+            DepRef::Array { array } => !s.sched.store.jobs_in_array(*array)?.is_empty(),
+        };
+        if !exists {
+            return Err(ApiError::bad_request(format!("dependency {r} does not exist"), "use ids from GET /v1/jobs (arrays as {\"array\": id})"));
+        }
+    }
+    for inp in &req.inputs {
+        if s.sched.store.get_job(inp.from_job)?.is_none() {
+            return Err(ApiError::bad_request(format!("input job {} does not exist", inp.from_job), "check the id"));
+        }
+        let r = DepRef::Job(inp.from_job);
+        if !spec.after_ok.contains(&r) && !spec.after_any.contains(&r) {
+            spec.after_ok.push(r);
+        }
+    }
+    let mut names = std::collections::HashSet::new();
+    for d in &req.datasets {
+        let u = s.sched.resolve_dataset(d)?;
+        if !names.insert(u.name.clone()) {
+            return Err(ApiError::bad_request(format!("dataset {} is listed twice", u.name), "use one version per name"));
+        }
+        spec.datasets.push(u);
+    }
+    if let Some(c) = &req.container {
+        spec.container = Some(s.sched.container_spec(&req.snapshot, c).await?);
+    }
+    Ok(spec)
+}
+
+async fn submit(State(s): State<AppState>, sess: Session, body: Result<Json<Value>, JsonRejection>) -> ApiResult<Response> {
     sess.require_full()?;
-    let Json(req) = body.map_err(json_err)?;
+    let Json(raw) = body.map_err(json_err)?;
+    let req: JobRequest = serde_json::from_value(raw.clone())
+        .map_err(|e| ApiError::bad_request(format!("invalid job request: {e}"), "check field names and types against the skill file"))?;
     let res = req.validate()?;
     if let Some(list) = &req.backends {
         for name in list {
@@ -218,7 +279,37 @@ async fn submit(State(s): State<AppState>, sess: Session, body: Result<Json<JobR
         }
     }
 
-    let preview = Job::preview(&req, res.clone());
+    let spec = build_spec(&s, &req).await?;
+    let hash = request_hash(&raw);
+    let quoted = if req.max_cost_usd.is_some() && !req.dry_run {
+        let Some(qid) = &req.quote_id else {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "quote_required",
+                "jobs that may run on paid backends need a quote first",
+                "send the same request with \"dry_run\": true, tell the user the backend and estimated cost, then submit with the returned quote_id",
+            ));
+        };
+        let Some((qhash, _, cost, expires)) = s.sched.store.quote(qid)? else {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "quote_expired", format!("quote {qid} is unknown"), "get a new quote with a dry run"));
+        };
+        if expires < Utc::now() {
+            return Err(ApiError::new(StatusCode::BAD_REQUEST, "quote_expired", format!("quote {qid} expired"), "quotes last 15 minutes; get a new one with a dry run"));
+        }
+        if qhash != hash {
+            return Err(ApiError::new(
+                StatusCode::BAD_REQUEST,
+                "quote_mismatch",
+                "the request changed since the quote",
+                "submit exactly the request you dry-ran (apart from dry_run and quote_id), or get a new quote",
+            ));
+        }
+        cost
+    } else {
+        None
+    };
+
+    let preview = Job::preview(&req, res.clone(), spec.clone());
     let plan = s.sched.plan(&preview).await?;
     let per_backend: BTreeMap<String, String> =
         plan.quotes.iter().map(|(n, q)| (n.clone(), quote_line(&s.tz, q))).collect();
@@ -232,19 +323,62 @@ async fn submit(State(s): State<AppState>, sess: Session, body: Result<Json<JobR
             reasons.join("; "),
         ));
     }
+    let over_budget = plan.best.is_none()
+        && plan.quotes.iter().any(|(_, q)| matches!(q, Quote::No { reason, .. } if reason.contains("monthly budget")))
+        && plan.quotes.iter().all(|(_, q)| matches!(q, Quote::No { permanent: true, .. }) || matches!(q, Quote::No { reason, .. } if reason.contains("monthly budget")));
+    if over_budget {
+        return Err(ApiError::new(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "over_budget",
+            "the only backends that can run this job would go over the monthly cloud budget",
+            "see GET /v1/budget; lower the time or GPUs, or ask the user to raise budget.monthly_usd",
+        ));
+    }
+    let best = plan.best.as_ref();
+    let estimate = |b: Option<&Best>| {
+        json!({
+            "backend": b.map(|b| b.backend.clone()),
+            "reason": b.map(|b| b.reason.clone()),
+            "estimated_start": b.map(|b| fmt(&s.tz, b.start)),
+            "estimated_start_source": b.map(|b| b.source.clone()),
+            "estimated_finish": b.map(|b| fmt(&s.tz, b.start + chrono::Duration::seconds(res.time_s as i64))),
+            "estimated_cost_usd": b.and_then(|b| b.cost),
+        })
+    };
+    let waiting = spec.has_deps();
     if req.dry_run {
-        let best = plan.best.as_ref();
-        return Ok(Json(json!({
-            "would_place": best.is_some(),
-            "backend": best.map(|b| b.0.clone()),
-            "reason": best.map(|b| b.3.clone()),
-            "estimated_start": best.map(|b| fmt(&s.tz, b.1)),
-            "estimated_start_source": best.map(|b| b.2.clone()),
-            "estimated_finish": best.map(|b| fmt(&s.tz, b.1 + chrono::Duration::seconds(res.time_s as i64))),
-            "shape": best.map(|b| serde_json::to_value(&b.4).unwrap_or_default()),
-            "per_backend": per_backend,
-        }))
-        .into_response());
+        let mut v = estimate(best);
+        v["would_place"] = best.is_some().into();
+        v["shape"] = best.map(|b| serde_json::to_value(&b.shape).unwrap_or_default()).unwrap_or(Value::Null);
+        v["per_backend"] = serde_json::to_value(&per_backend).unwrap_or_default();
+        if let Some(c) = &spec.container {
+            v["image"] = c.image.clone().into();
+        }
+        if waiting {
+            v["note"] = "the job will wait for its dependencies first; placement is decided when they finish".into();
+        }
+        if req.max_cost_usd.is_some() {
+            // The cheapest paid option, so the user sees what the cloud would cost even when a
+            // free backend wins right now.
+            let paid = plan
+                .quotes
+                .iter()
+                .filter_map(|(n, q)| match q {
+                    Quote::Ok { cost: Some(c), .. } => Some((n.clone(), *c)),
+                    _ => None,
+                })
+                .min_by(|a, b| a.1.total_cmp(&b.1));
+            let qid = format!("q_{}", hex::encode(rand::random::<[u8; 8]>()));
+            let expires = Utc::now() + chrono::Duration::minutes(15);
+            let cost = best.and_then(|b| b.cost).or(paid.as_ref().map(|p| p.1));
+            s.sched.store.put_quote(&qid, &hash, best.map(|b| b.backend.as_str()), cost, expires)?;
+            v["quote_id"] = qid.into();
+            v["quote_expires_at"] = fmt(&s.tz, expires).into();
+            v["cheapest_paid_option"] = paid.map(|(n, c)| json!({"backend": n, "estimated_cost_usd": c})).unwrap_or(Value::Null);
+            let (spent, committed) = s.sched.spend()?;
+            v["budget"] = json!({"monthly_usd": s.sched.budget.monthly_usd, "spent_usd": round2(spent), "committed_usd": round2(committed)});
+        }
+        return Ok(Json(v).into_response());
     }
 
     let count = req.array.as_ref().map(|a| a.count).unwrap_or(1);
@@ -266,26 +400,45 @@ async fn submit(State(s): State<AppState>, sess: Session, body: Result<Json<JobR
             priority: req.priority,
             idempotency_key: req.idempotency_key.clone(),
             key_fingerprint: sess.fingerprint.clone(),
+            spec: spec.clone(),
         })
         .collect();
     let ids = s.sched.store.insert_jobs(&jobs)?;
     s.sched.snapshots.touch(&req.snapshot)?;
     s.sched.kick();
 
-    let best = plan.best.as_ref();
-    let estimate = json!({
-        "backend": best.map(|b| b.0.clone()),
-        "reason": best.map(|b| b.3.clone()).unwrap_or_else(|| "waiting: no backend can start it yet".into()),
-        "estimated_start": best.map(|b| fmt(&s.tz, b.1)),
-        "estimated_start_source": best.map(|b| b.2.clone()),
-        "estimated_finish": best.map(|b| fmt(&s.tz, b.1 + chrono::Duration::seconds(res.time_s as i64))),
-    });
+    let mut estimate = estimate(best);
+    if best.is_none() {
+        estimate["reason"] = "waiting: no backend can start it yet".into();
+    }
+    if waiting {
+        estimate["note"] = "waiting for dependencies; placement is decided when they finish".into();
+    }
+    if let Some(q) = quoted {
+        estimate["quoted_cost_usd"] = q.into();
+    }
+    if let Some(c) = &spec.container {
+        estimate["image"] = c.image.clone().into();
+    }
+    if req.max_cost_usd.is_some() {
+        let used = s.sched.outputs_used();
+        let cap = s.sched.budget.outputs_cap_gb * 1024 * 1024 * 1024;
+        if used > cap {
+            estimate["warning"] = format!(
+                "the coordinator holds {} GB of cloud outputs, over outputs_cap_gb = {}; set keep_outputs to only what you need",
+                used >> 30,
+                s.sched.budget.outputs_cap_gb
+            )
+            .into();
+        }
+    }
+    let state = if waiting { "waiting" } else { "queued" };
     let body = if let Some(a) = array_id {
         json!({
             "array_id": a,
             "tasks": count,
             "job_ids": {"first": ids.first(), "last": ids.last()},
-            "state": "queued",
+            "state": state,
             "first_task_estimate": estimate,
             "per_backend": per_backend,
             "note": "each task is placed when it can start; see GET /v1/jobs?array=ID",
@@ -293,11 +446,15 @@ async fn submit(State(s): State<AppState>, sess: Session, body: Result<Json<JobR
     } else {
         let mut b = estimate;
         b["id"] = ids[0].into();
-        b["state"] = "queued".into();
+        b["state"] = state.into();
         b["per_backend"] = serde_json::to_value(&per_backend).unwrap_or_default();
         b
     };
     Ok((StatusCode::CREATED, Json(body)).into_response())
+}
+
+fn round2(x: f64) -> f64 {
+    (x * 100.0).round() / 100.0
 }
 
 fn submit_body(tz: &Tz, j: &Job, per_backend: Option<Value>) -> Value {
@@ -354,6 +511,12 @@ fn job_full(tz: &Tz, j: &Job, verbose: bool) -> Value {
             "gpu_type": j.resources.gpu_type, "time_s": j.resources.time_s,
         },
         "secrets": j.secrets,
+        "after_ok": j.spec.after_ok,
+        "after_any": j.spec.after_any,
+        "inputs": j.spec.inputs,
+        "datasets": j.spec.datasets.iter().map(|d| format!("{}@{}", d.name, d.version)).collect::<Vec<_>>(),
+        "image": j.spec.container.as_ref().map(|c| c.image.clone()),
+        "max_cost_usd": j.spec.max_cost_usd,
         "retries_left": j.retries_left,
         "priority": j.priority,
         "submitted_by": j.key_fingerprint,
@@ -387,7 +550,10 @@ async fn list_jobs(State(s): State<AppState>, _sess: Session, Query(q): Query<Li
     if let Some(st) = &q.state {
         for part in st.split(',').map(str::trim).filter(|p| !p.is_empty()) {
             states.push(JobState::parse(part).ok_or_else(|| {
-                ApiError::bad_request(format!("unknown state {part:?}"), "states: queued, staging, pending, running, succeeded, failed, cancelled, timeout, lost")
+                ApiError::bad_request(
+                    format!("unknown state {part:?}"),
+                    "states: waiting, queued, staging, pending, running, succeeded, failed, cancelled, timeout, lost, dependency_failed",
+                )
             })?);
         }
     }
@@ -411,7 +577,12 @@ fn load_job(s: &AppState, id: i64) -> ApiResult<Job> {
 
 async fn get_job(State(s): State<AppState>, _sess: Session, Path(id): Path<i64>, Query(q): Query<VerboseQuery>) -> ApiResult<Json<Value>> {
     let j = load_job(&s, id)?;
-    Ok(Json(job_full(&s.tz, &j, q.verbose.unwrap_or(0) > 0)))
+    let mut v = job_full(&s.tz, &j, q.verbose.unwrap_or(0) > 0);
+    if let Some((rate, cost)) = s.sched.store.cost_of(id)? {
+        v["usd_per_hour"] = rate.into();
+        v["cost_usd"] = cost.map(round2).into();
+    }
+    Ok(Json(v))
 }
 
 #[derive(Deserialize)]
@@ -482,12 +653,7 @@ struct OutputsQuery {
     glob: Option<String>,
 }
 
-fn valid_glob(g: &str) -> bool {
-    !g.is_empty()
-        && !g.contains("..")
-        && !g.starts_with('/')
-        && g.chars().all(|c| c.is_ascii_alphanumeric() || "_.*?/-[]".contains(c))
-}
+use crate::model::valid_glob;
 
 async fn job_outputs(State(s): State<AppState>, _sess: Session, Path(id): Path<i64>, Query(q): Query<OutputsQuery>) -> ApiResult<Response> {
     let j = load_job(&s, id)?;
@@ -504,11 +670,7 @@ async fn job_outputs(State(s): State<AppState>, _sess: Session, Path(id): Path<i
         .and_then(|n| s.sched.backend(n))
         .filter(|b| b.root().is_some())
         .ok_or_else(|| ApiError::bad_request(format!("job {id} has not run anywhere yet"), "wait until it is running or done"))?;
-    let mut child = backend.fetch(&j, q.glob.as_deref()).await?;
-    let stdout = child.stdout.take().ok_or_else(|| anyhow::anyhow!("no stdout from fetch"))?;
-    tokio::spawn(async move {
-        let _ = child.wait().await;
-    });
+    let stdout = backend.fetch(&j, q.glob.as_deref()).await?;
     let stream = ReaderStream::new(ZstdEncoder::new(BufReader::new(stdout)));
     Ok((
         [
@@ -570,6 +732,7 @@ async fn backend_summary(s: &AppState, name: &str) -> ApiResult<Value> {
             c.gpu_type.as_deref().unwrap_or("GPU"),
             c.slurm.as_ref().map(|s| s.cpu_partition.as_str()).unwrap_or("")
         ),
+        (k, _) => format!("{} GPU cloud (paid, per job), up to {} node(s)", k.as_str(), c.max_nodes),
     };
     Ok(json!({
         "name": name,
@@ -580,7 +743,9 @@ async fn backend_summary(s: &AppState, name: &str) -> ApiResult<Value> {
         "reachable": rt.reachable,
         "hardware": hardware,
         "active_jobs": queued,
-        "pricing": null,
+        "paid": b.is_paid(),
+        "runtimes": b.runtimes(),
+        "pricing": if b.is_paid() { b.pricing().map(|p| json!({"cheapest_per_gpu_hour": p.as_array().and_then(|a| a.iter().filter(|o| o["available"] == true).map(|o| o["usd_per_hour_per_gpu"].as_f64().unwrap_or(f64::INFINITY)).reduce(f64::min))})) } else { None },
     }))
 }
 
@@ -616,9 +781,26 @@ async fn get_backend(State(s): State<AppState>, _sess: Session, Path(name): Path
                 restrictions.push(format!("memory is requested as cpus x {} MB", sc.mem_per_cpu_mb));
             }
         }
+        _ => {
+            restrictions.push("paid: only for jobs that set max_cost_usd, after a dry-run quote".into());
+            restrictions.push("GPU jobs only; runs a container image (container.image or container.build)".into());
+            restrictions.push(format!("budget: ${:.2} per month across all cloud backends (GET /v1/budget)", s.sched.budget.monthly_usd));
+            restrictions.push("outputs matching keep_outputs (default all) are copied to the coordinator, then the instance is deleted".into());
+            if let Some(cc) = &c.cloud {
+                if !cc.gpu_types.is_empty() {
+                    restrictions.push(format!("GPU types allowed: {}", cc.gpu_types.join(", ")));
+                }
+                if c.kind == BackendKind::Modal {
+                    restrictions.push(format!("prices from the rate table in hosts.toml ({})", cc.rates_date.clone().unwrap_or_else(|| "undated".into())));
+                }
+            }
+        }
     }
     restrictions.push(format!("max_nodes = {}", c.max_nodes));
-    restrictions.push(format!("runtimes: {}", c.runtimes.join(", ")));
+    restrictions.push(format!("runtimes: {}", b.runtimes().join(", ")));
+    if let Some(cap) = c.data_cap_gb {
+        restrictions.push(format!("dataset copies capped at {cap} GB (least recently used are evicted)"));
+    }
     restrictions.extend(c.restrictions.iter().cloned());
     if !enabled {
         restrictions.push("currently disabled: takes no new jobs".into());
@@ -635,7 +817,7 @@ async fn get_backend(State(s): State<AppState>, _sess: Session, Path(name): Path
         "hardware": rt.hardware,
         "availability": availability,
         "restrictions": restrictions,
-        "pricing": null,
+        "pricing": b.pricing(),
         "refreshed_at": {
             "hardware": fmt_opt(&s.tz, rt.probed_at),
             "availability": fmt_opt(&s.tz, rt.availability_at),
@@ -725,4 +907,157 @@ async fn delete_secret(State(s): State<AppState>, sess: Session, Path(name): Pat
     } else {
         Err(ApiError::not_found(format!("secret {name} not found")))
     }
+}
+
+// ------------------------------------------------------------------ datasets
+
+fn dataset_json(tz: &Tz, d: &crate::store::DatasetRow) -> Value {
+    json!({
+        "name": d.name,
+        "version": d.version,
+        "source": d.source,
+        "size_bytes": d.size,
+        "files": d.files,
+        "description": d.description,
+        "created_at": fmt(tz, d.created_at),
+    })
+}
+
+async fn register_dataset(
+    State(s): State<AppState>,
+    sess: Session,
+    body: Result<Json<crate::datasets::RegisterReq>, JsonRejection>,
+) -> ApiResult<Response> {
+    sess.require_full()?;
+    let Json(req) = body.map_err(json_err)?;
+    let (row, new) = s.sched.register_dataset(req).await?;
+    let mut v = dataset_json(&s.tz, &row);
+    v["new_version"] = new.into();
+    Ok((if new { StatusCode::CREATED } else { StatusCode::OK }, Json(v)).into_response())
+}
+
+#[derive(Deserialize)]
+struct UploadQuery {
+    description: Option<String>,
+}
+
+async fn upload_dataset(
+    State(s): State<AppState>,
+    sess: Session,
+    Path(name): Path<String>,
+    Query(q): Query<UploadQuery>,
+    body: Body,
+) -> ApiResult<Response> {
+    sess.require_full()?;
+    let (row, new) = s.sched.upload_dataset(&name, q.description.unwrap_or_default(), body).await?;
+    let mut v = dataset_json(&s.tz, &row);
+    v["new_version"] = new.into();
+    Ok((if new { StatusCode::CREATED } else { StatusCode::OK }, Json(v)).into_response())
+}
+
+async fn list_datasets(State(s): State<AppState>, _sess: Session) -> ApiResult<Json<Value>> {
+    let versions = s.sched.store.dataset_versions(None)?;
+    let copies = s.sched.store.dataset_copies(None, None)?;
+    let mut out: Vec<Value> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for d in &versions {
+        if !seen.insert(d.name.clone()) {
+            continue; // versions are newest first; list each name once
+        }
+        let count = versions.iter().filter(|x| x.name == d.name).count();
+        let on: Vec<&str> = copies.iter().filter(|c| c.name == d.name && c.version == d.version).map(|c| c.backend.as_str()).collect();
+        out.push(json!({
+            "name": d.name,
+            "latest": d.version,
+            "versions": count,
+            "size_bytes": d.size,
+            "description": d.description,
+            "copies_of_latest": on,
+            "created_at": fmt(&s.tz, d.created_at),
+        }));
+    }
+    Ok(Json(json!({"datasets": out})))
+}
+
+async fn get_dataset(State(s): State<AppState>, _sess: Session, Path(name): Path<String>) -> ApiResult<Json<Value>> {
+    let versions = s.sched.store.dataset_versions(Some(&name))?;
+    if versions.is_empty() {
+        return Err(ApiError::not_found(format!("dataset {name} not found")));
+    }
+    let copies = s.sched.store.dataset_copies(None, Some(&name))?;
+    Ok(Json(json!({
+        "name": name,
+        "versions": versions.iter().map(|d| {
+            let mut v = dataset_json(&s.tz, d);
+            v["copies"] = copies.iter().filter(|c| c.version == d.version).map(|c| json!({
+                "backend": c.backend, "path": c.path, "size_bytes": c.size,
+                "managed": c.owned, "last_used": fmt(&s.tz, c.last_used),
+            })).collect::<Vec<_>>().into();
+            v
+        }).collect::<Vec<_>>(),
+    })))
+}
+
+async fn delete_dataset_copy(State(s): State<AppState>, sess: Session, Path((name, backend)): Path<(String, String)>) -> ApiResult<Json<Value>> {
+    sess.require_full()?;
+    let n = s.sched.delete_dataset_copy(&name, &backend).await?;
+    Ok(Json(json!({"deleted_copies": n, "backend": backend, "name": name})))
+}
+
+// ------------------------------------------------------------------ images
+
+async fn list_images(State(s): State<AppState>, _sess: Session) -> ApiResult<Json<Value>> {
+    let rows = s.sched.store.images(100)?;
+    Ok(Json(json!({
+        "registry": s.sched.registry.prefix(),
+        "images": rows.iter().map(|i| json!({
+            "tag": i.tag,
+            "key": i.tag.rsplit(':').next(),
+            "state": i.state,
+            "dockerfile": i.dockerfile,
+            "context": i.context,
+            "builder": i.builder,
+            "error": i.error,
+            "created_at": fmt(&s.tz, i.created_at),
+            "finished_at": fmt_opt(&s.tz, i.finished_at),
+        })).collect::<Vec<_>>(),
+    })))
+}
+
+async fn image_logs(State(s): State<AppState>, _sess: Session, Path(key): Path<String>, Query(q): Query<LogQuery>) -> ApiResult<Json<Value>> {
+    if !key.chars().all(|c| c.is_ascii_hexdigit()) || key.is_empty() {
+        return Err(ApiError::bad_request("bad image key", "use the `key` from GET /v1/images"));
+    }
+    let path = s.sched.paths.builds_dir().join(format!("{key}.log"));
+    let data = tokio::fs::read(&path).await.unwrap_or_default();
+    let offset = (q.offset.unwrap_or(0) as usize).min(data.len());
+    let max = q.max_bytes.unwrap_or(65_536).clamp(1, 1_048_576) as usize;
+    let end = (offset + max).min(data.len());
+    let state = s.sched.store.images(500)?.into_iter().find(|i| i.tag.ends_with(&format!(":{key}"))).map(|i| i.state);
+    Ok(Json(json!({
+        "data": String::from_utf8_lossy(&data[offset..end]),
+        "next_offset": end,
+        "size": data.len(),
+        "eof": state.as_deref() != Some("building") && end >= data.len(),
+        "state": state,
+    })))
+}
+
+// ------------------------------------------------------------------ budget
+
+async fn budget(State(s): State<AppState>, _sess: Session) -> ApiResult<Json<Value>> {
+    let (spent, committed) = s.sched.spend()?;
+    let monthly = s.sched.budget.monthly_usd;
+    let since = Utc::now() - chrono::Duration::days(40);
+    let rows = s.sched.store.costs_since(since)?;
+    Ok(Json(json!({
+        "monthly_usd": monthly,
+        "spent_usd": round2(spent),
+        "committed_usd": round2(committed),
+        "remaining_usd": round2(monthly - spent - committed),
+        "jobs": rows.iter().rev().take(50).map(|(id, b, rate, st, en, cost)| json!({
+            "job": id, "backend": b, "usd_per_hour": rate, "started_at": fmt(&s.tz, *st),
+            "ended_at": fmt_opt(&s.tz, *en), "cost_usd": cost.map(round2),
+        })).collect::<Vec<_>>(),
+    })))
 }

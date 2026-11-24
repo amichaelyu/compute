@@ -1,4 +1,6 @@
 target/
+# The real backend list; hosts.example.toml is the template.
+/hosts.toml
 .local/
 # Design notes stay local and are never committed.
 docs/

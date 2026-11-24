@@ -42,6 +42,18 @@ impl Paths {
     pub fn snapshots_dir(&self) -> PathBuf {
         self.state_dir.join("snapshots")
     }
+    /// Uploaded datasets (tar.zst), one file per version.
+    pub fn datasets_dir(&self) -> PathBuf {
+        self.state_dir.join("datasets")
+    }
+    /// Image build logs.
+    pub fn builds_dir(&self) -> PathBuf {
+        self.state_dir.join("builds")
+    }
+    /// Outputs and logs copied off cloud instances before teardown.
+    pub fn outputs_dir(&self) -> PathBuf {
+        self.state_dir.join("outputs")
+    }
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -55,6 +67,65 @@ pub struct Config {
     pub tz: String,
     #[serde(rename = "backend", default)]
     pub backends: Vec<BackendConfig>,
+    #[serde(default)]
+    pub registry: RegistryConfig,
+    #[serde(default)]
+    pub budget: BudgetConfig,
+}
+
+/// Where image builds are pushed, and who builds them.
+#[derive(Deserialize, Clone, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub struct RegistryConfig {
+    /// Image repository for builds, e.g. `ghcr.io/<owner>/compute`. Builds are tagged
+    /// `<prefix>:<hash>`. `COMPUTE_REGISTRY_PREFIX` overrides it.
+    #[serde(default)]
+    pub prefix: Option<String>,
+    /// The backend that runs `docker buildx` (a local backend with Docker).
+    #[serde(default)]
+    pub builder: Option<String>,
+    /// A named secret with `REGISTRY_USERNAME` and `REGISTRY_PASSWORD`, used to push builds and
+    /// to pull private images on backends.
+    #[serde(default)]
+    pub secret: Option<String>,
+    #[serde(default = "platforms")]
+    pub platforms: Vec<String>,
+}
+
+fn platforms() -> Vec<String> {
+    vec!["linux/amd64".into(), "linux/arm64".into()]
+}
+
+impl RegistryConfig {
+    pub fn prefix(&self) -> Option<String> {
+        std::env::var("COMPUTE_REGISTRY_PREFIX").ok().filter(|v| !v.is_empty()).or_else(|| self.prefix.clone())
+    }
+    /// The registry host of the prefix (`ghcr.io`).
+    pub fn host(&self) -> Option<String> {
+        self.prefix().and_then(|p| p.split('/').next().map(str::to_string))
+    }
+}
+
+/// Cloud spending limits.
+#[derive(Deserialize, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetConfig {
+    /// Total cloud spend allowed per calendar month (in the daemon's time zone).
+    #[serde(default)]
+    pub monthly_usd: f64,
+    /// Space on the coordinator for outputs copied off cloud instances.
+    #[serde(default = "outputs_cap")]
+    pub outputs_cap_gb: u64,
+}
+
+impl Default for BudgetConfig {
+    fn default() -> Self {
+        BudgetConfig { monthly_usd: 0.0, outputs_cap_gb: outputs_cap() }
+    }
+}
+
+fn outputs_cap() -> u64 {
+    20
 }
 
 fn default_listen() -> String {
@@ -69,6 +140,9 @@ fn default_tz() -> String {
 pub enum BackendKind {
     Local,
     Slurm,
+    Runpod,
+    Lambda,
+    Modal,
 }
 
 impl BackendKind {
@@ -76,7 +150,13 @@ impl BackendKind {
         match self {
             BackendKind::Local => "local",
             BackendKind::Slurm => "slurm",
+            BackendKind::Runpod => "runpod",
+            BackendKind::Lambda => "lambda",
+            BackendKind::Modal => "modal",
         }
+    }
+    pub fn is_cloud(self) -> bool {
+        matches!(self, BackendKind::Runpod | BackendKind::Lambda | BackendKind::Modal)
     }
 }
 
@@ -144,15 +224,23 @@ pub struct BackendConfig {
     pub gpus: u32,
     #[serde(default)]
     pub gpu_type: Option<String>,
+    #[serde(default)]
+    pub gpu_mem_gb: Option<u32>,
     /// `macos` or `linux` and `arm64`/`amd64`. Detected by the probe when omitted.
     #[serde(default)]
     pub os: Option<String>,
     #[serde(default)]
     pub arch: Option<String>,
-    #[serde(default = "native")]
-    pub runtimes: Vec<String>,
+    /// `native`, `docker`, `apptainer`. Detected by the probe when omitted.
+    #[serde(default)]
+    pub runtimes: Option<Vec<String>>,
     #[serde(default = "one")]
     pub max_nodes: u32,
+    /// Space the daemon may use for dataset copies on this backend.
+    #[serde(default)]
+    pub data_cap_gb: Option<u64>,
+    #[serde(default)]
+    pub cloud: Option<CloudConfig>,
     /// Readable restriction lines shown by `GET /v1/backends/{name}`.
     #[serde(default)]
     pub restrictions: Vec<String>,
@@ -174,7 +262,7 @@ impl BackendConfig {
     pub fn transport(&self) -> Transport {
         self.transport.unwrap_or(match self.kind {
             BackendKind::Local => Transport::Rex,
-            BackendKind::Slurm => Transport::Ssh,
+            _ => Transport::Ssh,
         })
     }
     pub fn root(&self) -> String {
@@ -184,8 +272,56 @@ impl BackendConfig {
 fn one() -> u32 {
     1
 }
-fn native() -> Vec<String> {
-    vec!["native".into()]
+
+/// Settings for RunPod, Lambda and Modal backends.
+#[derive(Deserialize, Clone, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub struct CloudConfig {
+    /// API key file, relative to the config dir. Default `<kind>.key` (Modal: `modal.toml`
+    /// with token_id / token_secret).
+    #[serde(default)]
+    pub key_file: Option<String>,
+    /// Image for jobs that don't set `container` (None: such jobs can't run here).
+    #[serde(default)]
+    pub default_image: Option<String>,
+    /// Only these GPU types (provider names, matched case-insensitively as substrings).
+    #[serde(default)]
+    pub gpu_types: Vec<String>,
+    /// RunPod: SECURE or COMMUNITY. Lambda/Modal: ignored.
+    #[serde(default)]
+    pub tier: Option<String>,
+    /// Preferred regions / data centers.
+    #[serde(default)]
+    pub regions: Vec<String>,
+    /// Minutes from launch to a usable instance, until measured.
+    #[serde(default = "boot_minutes")]
+    pub boot_minutes: u32,
+    /// Container disk in GB (RunPod).
+    #[serde(default = "disk_gb")]
+    pub disk_gb: u32,
+    /// Modal has no price API: USD per hour per GPU type (e.g. {L40S = 1.95}), plus per CPU core
+    /// and per GiB of memory.
+    #[serde(default)]
+    pub gpu_rates: std::collections::BTreeMap<String, f64>,
+    #[serde(default)]
+    pub cpu_rate: f64,
+    #[serde(default)]
+    pub mem_gb_rate: f64,
+    /// When the rate table was copied from the provider's pricing page.
+    #[serde(default)]
+    pub rates_date: Option<String>,
+    /// Modal environment and app name.
+    #[serde(default)]
+    pub environment: Option<String>,
+    #[serde(default)]
+    pub app: Option<String>,
+}
+
+fn boot_minutes() -> u32 {
+    4
+}
+fn disk_gb() -> u32 {
+    50
 }
 
 #[derive(Deserialize, Clone, Debug)]
@@ -246,6 +382,12 @@ impl Config {
         for b in &mut cfg.backends {
             if !seen.insert(b.name.clone()) {
                 bail!("backend {:?} is defined twice", b.name);
+            }
+            if b.kind.is_cloud() {
+                if b.cloud.is_none() {
+                    b.cloud = Some(CloudConfig { boot_minutes: boot_minutes(), disk_gb: disk_gb(), ..Default::default() });
+                }
+                continue;
             }
             match b.transport() {
                 Transport::Rex => {

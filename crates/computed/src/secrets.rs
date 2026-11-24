@@ -156,6 +156,14 @@ impl Secrets {
         Ok(Some(lines.join("\n")))
     }
 
+    /// One value of a secret (for the daemon's own use: registry logins, HF tokens).
+    pub fn value(&self, name: &str, key: &str) -> Result<Option<String>> {
+        if !valid_name(name) {
+            return Ok(None);
+        }
+        Ok(self.read(name)?.and_then(|f| f.env.get(key).cloned()))
+    }
+
     /// Secret values long enough to redact from logs.
     pub fn values(&self, names: &[String]) -> Vec<String> {
         names

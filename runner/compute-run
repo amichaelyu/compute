@@ -4,9 +4,14 @@
 #   compute-run <jobdir>             run the job in <jobdir>
 #   compute-run --tasks <tasksfile>  Slurm array task: pick line SLURM_ARRAY_TASK_ID+1 as <jobdir>
 #
-# <jobdir> holds job.env (exports), command (the shell command), and optionally .secrets.env and
-# cancel. The runner writes status.json, heartbeat and log there. Works with bash 3.2 (macOS) and
-# bash 5; needs no timeout, setsid or jq.
+# <jobdir> holds job.env (exports), command (the shell command), and optionally datasets
+# (name<TAB>path lines), inputs (srcdir<TAB>glob<TAB>name lines), .secrets.env, .registry.env and
+# cancel. The runner writes status.json, heartbeat and log there.
+#
+# With JOB_RUNTIME=docker or apptainer the command runs in JOB_IMAGE, with the snapshot at /work,
+# outputs at /out, inputs at /in and each dataset read-only at /data/<name>.
+#
+# Works with bash 3.2 (macOS) and bash 5; needs no timeout, setsid or jq.
 set -u
 
 if [ "${1:-}" = "--tasks" ]; then
@@ -20,6 +25,7 @@ pid=0
 started=$(date +%s)
 ended=null
 host=$(hostname)
+tab=$(printf '\t')
 
 write_status() { # <state> [exit_code]
   local tmp="$jobdir/status.json.tmp.$$"
@@ -27,33 +33,159 @@ write_status() { # <state> [exit_code]
     "$1" "$pid" "$started" "$ended" "${2:-null}" "$host" > "$tmp" && mv -f "$tmp" "$jobdir/status.json"
 }
 
+# The runner's own exit status is non-zero unless the job succeeded, so Slurm's afterok
+# dependencies hold back the jobs that need this one.
+fail() { # <message> [exit_code]
+  echo "compute: $1" >> "$jobdir/log"
+  ended=$(date +%s)
+  write_status failed "${2:-98}"
+  exit 1
+}
+
 # shellcheck disable=SC1091
 . "$jobdir/job.env"
+secret_names=""
 if [ -f "$jobdir/.secrets.env" ]; then
+  secret_names=$(sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$jobdir/.secrets.env")
   set -a
   # shellcheck disable=SC1091
   . "$jobdir/.secrets.env"
   set +a
   rm -f "$jobdir/.secrets.env"
 fi
-
-touch "$jobdir/heartbeat"
-if ! cd "$JOB_SNAPSHOT_DIR"; then
-  echo "compute: snapshot dir $JOB_SNAPSHOT_DIR is missing" >> "$jobdir/log"
-  ended=$(date +%s)
-  write_status failed 98
-  exit 0
+if [ -f "$jobdir/.registry.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . "$jobdir/.registry.env"
+  set +a
+  rm -f "$jobdir/.registry.env"
 fi
 
+touch "$jobdir/heartbeat"
+[ -d "$JOB_SNAPSHOT_DIR" ] || fail "snapshot dir $JOB_SNAPSHOT_DIR is missing"
+mkdir -p "$JOB_OUTPUT_DIR" "$JOB_INPUT_DIR" "$JOB_DATA_DIR"
+
+# Datasets: $JOB_DATA_DIR/<name> links to this host's copy.
+if [ -f "$jobdir/datasets" ]; then
+  while IFS="$tab" read -r name path; do
+    [ -n "$name" ] || continue
+    [ -d "$path" ] || fail "dataset $name is missing at $path"
+    ln -sfn "$path" "$JOB_DATA_DIR/$name"
+  done < "$jobdir/datasets"
+fi
+
+# Inputs from jobs that ran on this host: copy their outputs now that they exist.
+export COPYFILE_DISABLE=1
+if [ -f "$jobdir/inputs" ]; then
+  while IFS="$tab" read -r src glob name; do
+    [ -n "$name" ] || continue
+    [ -d "$src" ] || fail "outputs of the parent job are missing at $src"
+    mkdir -p "$JOB_INPUT_DIR/$name"
+    (cd "$src" && find . -type f -path "./$glob" -print0 | tar -c --null -T -) \
+      | tar -x -C "$JOB_INPUT_DIR/$name" || fail "copying inputs from $src failed"
+  done < "$jobdir/inputs"
+fi
+
+cd "$JOB_SNAPSHOT_DIR" || fail "cannot enter $JOB_SNAPSHOT_DIR"
+cmd=$(cat "$jobdir/command")
+runtime=${JOB_RUNTIME:-native}
+container_name="compute-$JOB_ID${NODE_RANK:+-$NODE_RANK}"
+
+# Variables passed into a container: the job's env, its secrets and the runner's own.
+pass_names() {
+  sed -n 's/^export \([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$jobdir/job.env" \
+    | grep -v -e '^JOB_RUNTIME$' -e '^JOB_IMAGE$' -e '^JOB_ROOT$'
+  [ -z "$secret_names" ] || printf '%s\n' $secret_names
+}
+# The same paths as seen inside the container.
+container_paths() {
+  export JOB_SNAPSHOT_DIR=/work JOB_OUTPUT_DIR=/out JOB_INPUT_DIR=/in JOB_DATA_DIR=/data
+}
+in_shell='if command -v bash >/dev/null 2>&1; then exec bash -lc "$0"; else exec sh -c "$0"; fi'
+
+start_docker() {
+  command -v docker >/dev/null 2>&1 || fail "docker not found on $host"
+  docker rm -f "$container_name" >/dev/null 2>&1
+  local args
+  args=(run --rm --init --name "$container_name" -w /work
+        -v "$JOB_SNAPSHOT_DIR:/work" -v "$jobdir/out:/out" -v "$JOB_INPUT_DIR:/in")
+  if [ -f "$jobdir/datasets" ]; then
+    while IFS="$tab" read -r name path; do
+      [ -n "$name" ] && args+=(-v "$path:/data/$name:ro")
+    done < "$jobdir/datasets"
+  fi
+  [ "${JOB_CPUS:-0}" -gt 0 ] && args+=(--cpus "$JOB_CPUS")
+  [ "${JOB_MEM_MB:-0}" -gt 0 ] && args+=(--memory "${JOB_MEM_MB}m")
+  [ "${JOB_GPUS:-0}" -gt 0 ] && args+=(--gpus all)
+  [ -n "${NODE_RANK:-}" ] && args+=(--network host --ipc host)
+  for n in $(pass_names); do args+=(-e "$n"); done
+  args+=("$JOB_IMAGE" sh -c "$in_shell" "$cmd")
+  set -m
+  (container_paths; exec docker "${args[@]}") >> "$jobdir/log" 2>&1 < /dev/null &
+  pid=$!
+  set +m
+}
+
+start_apptainer() {
+  if ! command -v apptainer >/dev/null 2>&1; then
+    # Inside a batch job the module function may be missing; load Lmod's init first.
+    if ! type module >/dev/null 2>&1; then
+      for f in /etc/profile.d/lmod.sh /usr/share/lmod/lmod/init/bash; do
+        # shellcheck disable=SC1090
+        [ -f "$f" ] && . "$f" && break
+      done
+    fi
+    type module >/dev/null 2>&1 && module load apptainer >/dev/null 2>&1
+  fi
+  command -v apptainer >/dev/null 2>&1 || fail "apptainer not found on $host"
+  export APPTAINER_CACHEDIR="$JOB_ROOT/cache/apptainer"
+  mkdir -p "$JOB_ROOT/cache/sif" "$APPTAINER_CACHEDIR"
+  local key sif
+  key=$(printf %s "$JOB_IMAGE" | { sha256sum 2>/dev/null || shasum -a 256; } | cut -c1-32)
+  sif="$JOB_ROOT/cache/sif/$key.sif"
+  if [ ! -f "$sif" ]; then
+    echo "compute: converting $JOB_IMAGE to $sif" >> "$jobdir/log"
+    (
+      flock 9
+      [ -f "$sif" ] || { apptainer pull --force "$sif.tmp.$$" "docker://$JOB_IMAGE" && mv -f "$sif.tmp.$$" "$sif"; }
+    ) 9> "$sif.lock" >> "$jobdir/log" 2>&1
+    [ -f "$sif" ] || fail "pulling $JOB_IMAGE failed"
+  fi
+  unset APPTAINER_DOCKER_USERNAME APPTAINER_DOCKER_PASSWORD
+  local binds="$JOB_SNAPSHOT_DIR:/work,$jobdir/out:/out,$JOB_INPUT_DIR:/in"
+  if [ -f "$jobdir/datasets" ]; then
+    while IFS="$tab" read -r name path; do
+      [ -n "$name" ] && binds="$binds,$path:/data/$name:ro"
+    done < "$jobdir/datasets"
+  fi
+  local nv=""
+  [ "${JOB_GPUS:-0}" -gt 0 ] && nv="--nv"
+  set -m
+  (
+    container_paths
+    for n in $(pass_names); do export "APPTAINERENV_$n=${!n}"; done
+    exec apptainer exec --cleanenv $nv --bind "$binds" --pwd /work "$sif" sh -c "$in_shell" "$cmd"
+  ) >> "$jobdir/log" 2>&1 < /dev/null &
+  pid=$!
+  set +m
+}
+
 prelude='export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"'
-set -m   # the job gets its own process group, so cancel/timeout can kill all of it
-bash -lc "$prelude
-$(cat "$jobdir/command")" >> "$jobdir/log" 2>&1 < /dev/null &
-pid=$!
-set +m
+case "$runtime" in
+  docker) start_docker ;;
+  apptainer) start_apptainer ;;
+  *)
+    set -m   # the job gets its own process group, so cancel/timeout can kill all of it
+    bash -lc "$prelude
+$cmd" >> "$jobdir/log" 2>&1 < /dev/null &
+    pid=$!
+    set +m
+    ;;
+esac
 write_status running
 
 kill_job() {
+  [ "$runtime" = docker ] && docker rm -f "$container_name" >/dev/null 2>&1
   kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
   for _ in 1 2 3 4 5; do
     kill -0 "$pid" 2>/dev/null || return 0
@@ -92,4 +224,5 @@ if [ -z "$final" ]; then
   if [ "$code" -eq 0 ]; then final=succeeded; else final=failed; fi
 fi
 write_status "$final" "$code"
-exit 0
+[ "$final" = succeeded ] && exit 0
+exit 1

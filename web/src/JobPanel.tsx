@@ -74,6 +74,16 @@ function Log({ id, active }: { id: number; active: boolean }) {
   );
 }
 
+/** "job 41 succeeds, array 7 ends" style summary of a job's dependencies. */
+function deps(job: Job): string | null {
+  const name = (d: number | { array: number }) => (typeof d === "number" ? `job ${d}` : `array ${d.array}`);
+  const parts = [
+    ...(job.after_ok ?? []).map((d) => `${name(d)} succeeds`),
+    ...(job.after_any ?? []).map((d) => `${name(d)} ends`),
+  ];
+  return parts.length ? parts.join(", ") : null;
+}
+
 function Facts({ job, now }: { job: Job; now: number }) {
   const r = job.resources;
   const started = ms(job.started_at);
@@ -104,6 +114,21 @@ function Facts({ job, now }: { job: Job; now: number }) {
       Number.isFinite(ended) ? clock(ended, now) : Number.isFinite(estEnd) ? `by ${clock(estEnd, now)}` : null,
     ],
     ["Exit code", job.exit_code === null ? null : String(job.exit_code)],
+    ["Runs after", deps(job)],
+    [
+      "Inputs",
+      job.inputs?.length ? job.inputs.map((i) => `${i.as} from job ${i.from_job}${i.glob ? ` (${i.glob})` : ""}`).join(", ") : null,
+    ],
+    ["Datasets", job.datasets?.length ? job.datasets.join(", ") : null],
+    ["Image", job.image ?? null],
+    [
+      "Cost",
+      job.cost_usd != null
+        ? `$${job.cost_usd.toFixed(2)}`
+        : job.usd_per_hour != null
+          ? `$${job.usd_per_hour.toFixed(2)}/h, capped at $${job.max_cost_usd ?? "?"}`
+          : null,
+    ],
     ["Secrets", job.secrets.length ? job.secrets.join(", ") : null],
     ["Retries left", job.retries_left ? String(job.retries_left) : null],
     ["Submitted by", who(job.submitted_by)],
@@ -194,7 +219,7 @@ export function JobPanel({ id, now }: { id: number; now: number }) {
           </div>
           <div className="actions">
             <CancelButton job={job} onDone={refresh} />
-            {job.backend && !["queued", "staging"].includes(job.state) && (
+            {job.backend && !["waiting", "queued", "staging"].includes(job.state) && (
               <a className="btn" href={outputsUrl(job.id)} download={`job-${job.id}-outputs.tar.zst`}>
                 Download outputs
               </a>

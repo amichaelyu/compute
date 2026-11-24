@@ -28,6 +28,7 @@ if [ -f "$deploy_config" ]; then
 fi
 
 mode="${1:-install}"
+[ -f hosts.toml ] || { echo "hosts.toml is missing: copy hosts.example.toml to hosts.toml and edit it" >&2; exit 1; }
 host="${COMPUTE_REX_HOST:?set COMPUTE_REX_HOST (Rex label of the coordinator) in $deploy_config}"
 user="${COMPUTE_SSH_USER:?set COMPUTE_SSH_USER (login user on the coordinator) in $deploy_config}"
 api_port="${COMPUTE_PORT:-8765}"

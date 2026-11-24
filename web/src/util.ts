@@ -40,6 +40,8 @@ export function when(j: Pick<JobRow, "state" | "started_at" | "ended_at" | "esti
       return Number.isFinite(started) ? `running for ${dur((now - started) / 1000)}` : "running";
     case "staging":
       return "copying code";
+    case "waiting":
+      return Number.isFinite(est) && est - now >= 60_000 ? `waiting on other jobs, around ${clock(est, now)}` : "waiting on other jobs";
     case "queued":
     case "pending":
       if (!Number.isFinite(est) || est - now < 60_000) return "starting soon";

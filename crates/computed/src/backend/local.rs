@@ -1,11 +1,11 @@
-//! Local hosts (the Mac Mini, any other Mac or Linux box): with transport `rex`, jobs start as Rex blocks
+//! Local hosts (any Mac or Linux machine): with transport `rex`, jobs start as Rex blocks
 //! in the host's `compute` session and files go over ssh through a `rex forward` tunnel; with
 //! transport `ssh`, everything goes over direct ssh and jobs start detached with nohup.
 
-use super::{Alloc, Backend, Capacity, PollResult, Probe, Quote, Remote, Shape, job_env, parse_status};
+use super::{Alloc, Backend, Capacity, PollResult, Probe, Quote, Remote, Shape, StageFiles, parse_status};
 use crate::config::{BackendConfig, Transport};
 use crate::model::Job;
-use crate::transport::{Tunnels, rex_run, shell_quote};
+use crate::transport::{Reader, Shell, Tunnels, rex_run, shell_quote};
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use chrono::Utc;
@@ -73,6 +73,9 @@ impl Backend for LocalBackend {
     fn capacity(&self) -> Option<Capacity> {
         self.capacity.read().unwrap_or_else(|e| e.into_inner()).clone()
     }
+    fn runtimes(&self) -> Vec<String> {
+        self.remote.runtimes()
+    }
 
     async fn probe(&self) -> Result<Probe> {
         let (root, out) = self.remote.probe_root(HARDWARE).await?;
@@ -88,6 +91,7 @@ impl Backend for LocalBackend {
             arch: c.arch.clone().unwrap_or_else(|| normalize_arch(hw.get("arch").and_then(|v| v.as_str()).unwrap_or("unknown"))),
         };
         hw.insert("schedulable".into(), json!({"cpus": cap.cpus, "mem_gb": cap.mem_gb, "gpus": 0}));
+        hw.insert("runtimes".into(), json!(self.remote.runtimes()));
         *self.capacity.write().unwrap_or_else(|e| e.into_inner()) = Some(cap);
         Ok(Probe { root, hardware: serde_json::Value::Object(hw) })
     }
@@ -98,8 +102,14 @@ impl Backend for LocalBackend {
             return Quote::no(format!("{} has not been probed yet", c.name), false);
         };
         let r = &job.resources;
+        if r.nodes > c.max_nodes {
+            return Quote::no(format!("nodes={}; {} runs single-node jobs", r.nodes, c.name), true);
+        }
         if r.gpus > 0 {
             return Quote::no(format!("gpus={}, {} has no schedulable GPU", r.gpus, c.name), true);
+        }
+        if job.is_container() && !self.remote.runtimes().iter().any(|x| x == "docker") {
+            return Quote::no(format!("container job; {} has no Docker", c.name), true);
         }
         match job.os.as_deref() {
             Some("linux") if cap.os != "linux" => return Quote::no(format!("os=linux, {} is {}", c.name, cap.os), true),
@@ -113,12 +123,12 @@ impl Backend for LocalBackend {
                 true,
             );
         }
-        let shape = Shape { cpus: r.cpus, mem_mb: r.mem_mb, gpus: 0, partition: None, qos: None };
+        let shape = Shape::simple(r.cpus, r.mem_mb, 0);
         let used_cpus: u32 = active.iter().map(|a| a.cpus).sum();
         let used_mem: u64 = active.iter().map(|a| a.mem_mb).sum();
         let now = Utc::now();
         if used_cpus + r.cpus <= cap.cpus && used_mem + r.mem_mb <= cap_mem {
-            return Quote::Ok { start: now, source: "now".into(), reason: format!("{} has room now", c.name), shape };
+            return Quote::Ok { start: now, source: "now".into(), reason: format!("{} has room now", c.name), shape, cost: None };
         }
         // Free running jobs in order of their expected end until this one fits.
         let mut ends: Vec<&Alloc> = active.iter().collect();
@@ -138,14 +148,12 @@ impl Backend for LocalBackend {
             source: "daemon".into(),
             reason: format!("{} is busy; room expected when running jobs reach their time limits", c.name),
             shape,
+            cost: None,
         }
     }
 
-    async fn stage(&self, job: &Job, snapshot: &Path, secrets_env: Option<String>) -> Result<()> {
-        let root = self.remote.root_or_err()?;
-        self.remote.stage_snapshot(&job.snapshot, snapshot, "").await?;
-        let env = job_env(&root, job, job.resources.time_s, &[]);
-        self.remote.write_job_files(job.id, &env, &job.command, secrets_env.as_deref()).await
+    async fn stage(&self, job: &Job, snapshot: &Path, files: &StageFiles) -> Result<()> {
+        self.remote.stage_job(job, snapshot, files, "", job.resources.time_s).await
     }
 
     async fn launch(&self, jobs: &[Job], _shape: &Shape) -> Result<Vec<serde_json::Value>> {
@@ -167,7 +175,7 @@ impl Backend for LocalBackend {
                         shell_quote(&runner),
                         shell_quote(&dir)
                     );
-                    let out = self.remote.ssh().await?.run(&script).await?.text();
+                    let out = self.remote.shell().await?.run(&script).await?.text();
                     handles.push(json!({"pid": out.trim().parse::<i64>().ok()}));
                 }
             }
@@ -191,7 +199,7 @@ impl Backend for LocalBackend {
         self.remote.logs(job.id, offset, max).await
     }
 
-    async fn fetch(&self, job: &Job, glob: Option<&str>) -> Result<tokio::process::Child> {
+    async fn fetch(&self, job: &Job, glob: Option<&str>) -> Result<Reader> {
         self.remote.fetch(job.id, glob).await
     }
 
@@ -202,11 +210,20 @@ impl Backend for LocalBackend {
     async fn availability(&self) -> Result<serde_json::Value> {
         let out = self
             .remote
-            .ssh()
+            .shell()
             .await?
             .run("uptime | sed 's/.*load average[s]*: //'")
             .await?
             .text();
         Ok(json!({"load_average": out.trim()}))
+    }
+
+    async fn unpack_snapshot(&self, snapshot: &str, path: &Path) -> Result<String> {
+        self.remote.stage_snapshot(snapshot, path, "", false).await?;
+        Ok(Remote::snapshot_dir(&self.remote.root_or_err()?, snapshot))
+    }
+
+    async fn shell_for(&self, _job: Option<&Job>) -> Result<(Arc<dyn Shell>, String)> {
+        Ok((self.remote.shell().await?, self.remote.root_or_err()?))
     }
 }

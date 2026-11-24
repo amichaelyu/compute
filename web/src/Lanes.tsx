@@ -32,6 +32,7 @@ function barFor(j: JobRow, now: number): Bar | null {
       const from = Number.isFinite(start) ? start : now;
       return { job: j, from, to: Math.max(now + 60_000, from + len), split: now, kind: "running" };
     }
+    case "waiting":
     case "queued":
     case "staging":
     case "pending": {
@@ -41,7 +42,7 @@ function barFor(j: JobRow, now: number): Bar | null {
     }
     default: {
       if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
-      const failed = j.state === "failed" || j.state === "timeout" || j.state === "lost";
+      const failed = j.state === "failed" || j.state === "timeout" || j.state === "lost" || j.state === "dependency_failed";
       return { job: j, from: start, to: Math.max(end, start + 30_000), kind: failed ? "failed" : "done" };
     }
   }
