@@ -386,5 +386,8 @@ Every error is `{"error": {"code", "message", "hint"}}`. Follow the `hint`.
 - `bad_request`, `snapshot_missing`, `dataset_missing`, `secret_missing`: fix the request as
   the hint says.
 - `unauthorized`: run `compute_login`.
-- `rate_limited` (HTTP 429), or a Cloudflare 429 page on login: too many logins in progress.
-  Wait a minute and retry.
+- A Cloudflare 429 page on login: too many logins from here. Wait a minute and retry.
+- `guest_sandbox`, `not_yours`, `forbidden` (HTTP 403): the key is a guest key and the
+  request goes past what guests may do (see `GET /v1/whoami` and the guest rules). Don't
+  retry; tell the user.
+- `disk_full` (HTTP 507): the coordinator is short of disk; upload less or ask the owner.

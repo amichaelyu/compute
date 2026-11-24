@@ -39,8 +39,8 @@ impl Snapshots {
     }
 
     /// Streams an upload to disk while hashing it. Returns `(id, already_existed)`.
-    pub async fn store(&self, body: Body) -> Result<(String, bool), ApiError> {
-        let (hash, size, existed) = store_blob_inner(&self.dir, body, MAX_BYTES, "snapshot is larger than 2 GiB",
+    pub async fn store(&self, body: Body, expected: Option<u64>) -> Result<(String, bool), ApiError> {
+        let (hash, size, existed) = store_blob_inner(&self.dir, body, MAX_BYTES, expected, "snapshot is larger than 2 GiB",
             "keep data out of the repo (gitignore it) and use datasets").await?;
         let id = format!("sha256:{hash}");
         self.store.snapshot_seen(&id, size)?;
@@ -67,13 +67,41 @@ pub fn blob_path(dir: &std::path::Path, sha: &str) -> PathBuf {
 }
 
 /// Stores a zstd upload under `dir` named by its SHA-256. Returns `(hex, size)`.
-pub async fn store_blob(dir: &std::path::Path, body: Body, max: u64) -> Result<(String, u64), ApiError> {
-    let (hash, size, _) = store_blob_inner(dir, body, max, "upload is too large", "split it up").await?;
+pub async fn store_blob(dir: &std::path::Path, body: Body, max: u64, expected: Option<u64>) -> Result<(String, u64), ApiError> {
+    let (hash, size, _) = store_blob_inner(dir, body, max, expected, "upload is too large", "split it up").await?;
     Ok((hash, size))
 }
 
-async fn store_blob_inner(dir: &std::path::Path, body: Body, max: u64, too_big: &str, hint: &str) -> Result<(String, u64, bool), ApiError> {
+/// Disk an upload must leave free on the coordinator, which also holds the database.
+const MIN_FREE: u64 = 10 * 1024 * 1024 * 1024;
+/// How often (bytes written) free space is checked again during an upload.
+const RECHECK: u64 = 256 * 1024 * 1024;
+
+/// Free bytes on the filesystem holding `dir` (None if `df` can't tell).
+async fn free_bytes(dir: &std::path::Path) -> Option<u64> {
+    let out = tokio::process::Command::new("df").arg("-Pk").arg(dir).output().await.ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    let kb: u64 = text.lines().nth(1)?.split_whitespace().nth(3)?.parse().ok()?;
+    Some(kb * 1024)
+}
+
+fn disk_full(free: u64, need: u64) -> ApiError {
+    ApiError::new(
+        axum::http::StatusCode::INSUFFICIENT_STORAGE,
+        "disk_full",
+        format!("the coordinator has {} GB free; this upload needs {} GB plus {} GB kept free", free >> 30, need.div_ceil(1 << 30), MIN_FREE >> 30),
+        "upload less (register data from Hugging Face instead), or ask the network's owner to free space",
+    )
+}
+
+async fn store_blob_inner(dir: &std::path::Path, body: Body, max: u64, expected: Option<u64>, too_big: &str, hint: &str) -> Result<(String, u64, bool), ApiError> {
     tokio::fs::create_dir_all(dir).await.map_err(anyhow::Error::from)?;
+    if let Some(free) = free_bytes(dir).await {
+        let need = expected.unwrap_or(0);
+        if free < need.saturating_add(MIN_FREE) {
+            return Err(disk_full(free, need));
+        }
+    }
     let tmp = dir.join(format!(".upload-{}", hex::encode(rand::random::<[u8; 8]>())));
     let result = write_hashed(body, &tmp, max, too_big, hint).await;
     let (hash, size) = match result {
@@ -98,12 +126,22 @@ async fn write_hashed(body: Body, tmp: &std::path::Path, max: u64, too_big: &str
     let mut hasher = Sha256::new();
     let mut size: u64 = 0;
     let mut head: Vec<u8> = Vec::with_capacity(4);
+    let mut next_check = RECHECK;
+    let dir = tmp.parent().unwrap_or(std::path::Path::new("."));
     let mut stream = body.into_data_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(|e| ApiError::bad_request(format!("upload interrupted: {e}"), "retry the upload"))?;
         size += chunk.len() as u64;
         if size > max {
             return Err(ApiError::bad_request(too_big, hint));
+        }
+        if size >= next_check {
+            next_check = size + RECHECK;
+            if let Some(free) = free_bytes(dir).await
+                && free < MIN_FREE
+            {
+                return Err(disk_full(free, size));
+            }
         }
         if head.len() < 4 {
             head.extend(chunk.iter().take(4 - head.len()));

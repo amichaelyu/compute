@@ -78,6 +78,10 @@ impl Secrets {
         Ok(())
     }
 
+    pub fn exists(&self, name: &str) -> bool {
+        valid_name(name) && self.path(name).exists()
+    }
+
     fn read(&self, name: &str) -> Result<Option<SecretFile>> {
         let p = self.path(name);
         if !p.exists() {

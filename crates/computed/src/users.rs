@@ -3,6 +3,7 @@
 
 use crate::error::ApiError;
 use anyhow::{Context, Result};
+use chrono::{DateTime, TimeZone, Utc};
 use axum::http::{HeaderMap, StatusCode, header};
 use serde::Serialize;
 use ssh_key::{HashAlg, PublicKey};
@@ -23,10 +24,123 @@ pub struct User {
     pub fingerprint: String,
     pub key_type: String,
     pub comment: String,
+    /// Why this line can't log in (an option the daemon doesn't support, or a validity window
+    /// that excludes now), when that's the case.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
-/// Parses one `allowed_signers` line: `principal [options] keytype base64 [comment]`.
-fn parse_line(line: &str) -> Option<(User, PublicKey)> {
+/// What an `allowed_signers` line's options allow: `namespaces`, `valid-after` and
+/// `valid-before` are honoured; any other option (`cert-authority` above all) makes the line
+/// unusable, since the daemon would otherwise trust more than the line says.
+#[derive(Clone, Debug, Default)]
+pub struct Limits {
+    pub valid_after: Option<DateTime<Utc>>,
+    pub valid_before: Option<DateTime<Utc>>,
+    /// Set when the options exclude this daemon outright.
+    pub refused: Option<String>,
+}
+
+impl Limits {
+    /// None when the key may log in at `now`, else why not.
+    pub fn check(&self, now: DateTime<Utc>) -> Option<String> {
+        if let Some(r) = &self.refused {
+            return Some(r.clone());
+        }
+        if self.valid_after.is_some_and(|t| now < t) {
+            return Some("not valid yet (valid-after)".into());
+        }
+        if self.valid_before.is_some_and(|t| now >= t) {
+            return Some("expired (valid-before)".into());
+        }
+        None
+    }
+}
+
+/// Splits `a,b="x,y",c` on commas outside double quotes.
+fn split_options(s: &str) -> Vec<String> {
+    let (mut out, mut cur, mut quoted) = (Vec::new(), String::new(), false);
+    for c in s.chars() {
+        match c {
+            '"' => {
+                quoted = !quoted;
+                cur.push(c);
+            }
+            ',' if !quoted => out.push(std::mem::take(&mut cur)),
+            _ => cur.push(c),
+        }
+    }
+    if !cur.is_empty() {
+        out.push(cur);
+    }
+    out
+}
+
+/// OpenSSH pattern match with `*` and `?`.
+fn pattern_match(pat: &str, s: &str) -> bool {
+    fn go(p: &[u8], s: &[u8]) -> bool {
+        match (p.first(), s.first()) {
+            (None, None) => true,
+            (Some(b'*'), _) => go(&p[1..], s) || (!s.is_empty() && go(p, &s[1..])),
+            (Some(b'?'), Some(_)) => go(&p[1..], &s[1..]),
+            (Some(a), Some(b)) if a == b => go(&p[1..], &s[1..]),
+            _ => false,
+        }
+    }
+    go(pat.as_bytes(), s.as_bytes())
+}
+
+/// `YYYYMMDD[Z]` or `YYYYMMDDHHMM[SS][Z]` (ssh-keygen's ALLOWED SIGNERS format); without `Z`
+/// it is the system's local time.
+fn parse_ssh_time(v: &str) -> Option<DateTime<Utc>> {
+    let (digits, utc) = match v.strip_suffix(['Z', 'z']) {
+        Some(d) => (d, true),
+        None => (v, false),
+    };
+    let padded = match digits.len() {
+        8 => format!("{digits}000000"),
+        12 => format!("{digits}00"),
+        14 => digits.to_string(),
+        _ => return None,
+    };
+    let naive = chrono::NaiveDateTime::parse_from_str(&padded, "%Y%m%d%H%M%S").ok()?;
+    if utc {
+        Some(naive.and_utc())
+    } else {
+        chrono::Local.from_local_datetime(&naive).earliest().map(|t| t.with_timezone(&Utc))
+    }
+}
+
+fn parse_limits(opts: &str) -> Limits {
+    let mut l = Limits::default();
+    for opt in split_options(opts) {
+        let (k, v) = match opt.split_once('=') {
+            Some((k, v)) => (k.to_ascii_lowercase(), Some(v.trim_matches('"').to_string())),
+            None => (opt.to_ascii_lowercase(), None),
+        };
+        match (k.as_str(), v) {
+            ("namespaces", Some(v)) => {
+                if !v.split(',').any(|p| pattern_match(p.trim(), crate::auth::NAMESPACE)) {
+                    l.refused = Some(format!("namespaces=\"{v}\" excludes {}", crate::auth::NAMESPACE));
+                }
+            }
+            ("valid-after", Some(v)) => match parse_ssh_time(&v) {
+                Some(t) => l.valid_after = Some(t),
+                None => l.refused = Some(format!("can't read valid-after={v}")),
+            },
+            ("valid-before", Some(v)) => match parse_ssh_time(&v) {
+                Some(t) => l.valid_before = Some(t),
+                None => l.refused = Some(format!("can't read valid-before={v}")),
+            },
+            ("cert-authority", _) => l.refused = Some("cert-authority lines aren't supported".into()),
+            (k, _) => l.refused = Some(format!("unsupported option {k}")),
+        }
+    }
+    l
+}
+
+/// Parses one `allowed_signers` line: `principals [options] keytype base64 [comment]`.
+pub fn parse_line(line: &str) -> Option<(User, PublicKey, Limits)> {
     let line = line.trim();
     if line.is_empty() || line.starts_with('#') {
         return None;
@@ -34,13 +148,20 @@ fn parse_line(line: &str) -> Option<(User, PublicKey)> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     let i = parts.iter().position(|p| p.starts_with("ssh-") || p.starts_with("ecdsa-") || p.starts_with("sk-"))?;
     let key = PublicKey::from_openssh(&format!("{} {}", parts[i], parts.get(i + 1)?)).ok()?;
+    let limits = if i >= 2 { parse_limits(&parts[1..i].join(" ")) } else { Limits::default() };
     let user = User {
         name: if i > 0 { parts[0].to_string() } else { String::new() },
         fingerprint: key.fingerprint(HashAlg::Sha256).to_string(),
         key_type: parts[i].to_string(),
         comment: parts.get(i + 2..).map(|c| c.join(" ")).unwrap_or_default(),
+        note: limits.check(Utc::now()),
     };
-    Some((user, key))
+    Some((user, key, limits))
+}
+
+/// Every parseable line of the file.
+pub fn load(path: &Path) -> Result<Vec<(User, PublicKey, Limits)>> {
+    Ok(read(path)?.lines().filter_map(parse_line).collect())
 }
 
 fn read(path: &Path) -> Result<String> {
@@ -61,7 +182,7 @@ fn write_atomic(path: &Path, text: &str) -> Result<()> {
 }
 
 pub fn list(path: &Path) -> Result<Vec<User>> {
-    Ok(read(path)?.lines().filter_map(parse_line).map(|(u, _)| u).collect())
+    Ok(read(path)?.lines().filter_map(parse_line).map(|(u, _, _)| u).collect())
 }
 
 fn conflict(message: String) -> ApiError {
@@ -88,7 +209,7 @@ pub fn add(path: &Path, name: &str, public_key: &str) -> Result<User, ApiError> 
     })?;
     let _guard = WRITE.lock().unwrap_or_else(|e| e.into_inner());
     let mut text = read(path)?;
-    for (u, k) in text.lines().filter_map(parse_line) {
+    for (u, k, _) in text.lines().filter_map(parse_line) {
         if k.key_data() == key.key_data() {
             return Err(conflict(format!("this key is already added, as {}", u.name)));
         }
@@ -105,7 +226,7 @@ pub fn add(path: &Path, name: &str, public_key: &str) -> Result<User, ApiError> 
     text.push('\n');
     write_atomic(path, &text)?;
     tracing::info!("added user {name} ({})", key.fingerprint(HashAlg::Sha256));
-    Ok(parse_line(&line).map(|(u, _)| u).expect("a line we just built parses"))
+    Ok(parse_line(&line).map(|(u, _, _)| u).expect("a line we just built parses"))
 }
 
 /// Removes every line holding the key with this fingerprint; returns the removed users.
@@ -116,7 +237,7 @@ pub fn remove(path: &Path, fingerprint: &str) -> Result<Vec<User>, ApiError> {
     let mut removed = Vec::new();
     for line in text.lines() {
         match parse_line(line) {
-            Some((u, _)) if u.fingerprint == fingerprint => removed.push(u),
+            Some((u, _, _)) if u.fingerprint == fingerprint => removed.push(u),
             _ => {
                 kept.push_str(line);
                 kept.push('\n');
@@ -145,6 +266,11 @@ pub fn base_url(headers: &HeaderMap, path: &str) -> String {
     };
     let prefix = if path.starts_with("/api/") { "/api" } else { "" };
     format!("{proto}://{host}{prefix}")
+}
+
+/// The owner's name in records every key can read (`COMPUTE_OWNER`, else "owner").
+pub fn owner_name() -> String {
+    std::env::var("COMPUTE_OWNER").ok().map(|v| v.trim().to_string()).filter(|v| !v.is_empty()).unwrap_or_else(|| "owner".into())
 }
 
 /// Who runs this network, for the guest skill (`COMPUTE_OWNER` in computed.env).

@@ -32,6 +32,8 @@ pub struct AppState {
     pub auth: Arc<Auth>,
     pub access: Option<Arc<crate::access::Access>>,
     pub tz: Tz,
+    /// `allowed_signers` principals with full access; other keys are guests (empty: none are).
+    pub owners: Arc<Vec<String>>,
 }
 
 /// The API is served at `/v1` and again at `/api/v1`. On the public hostname, Cloudflare Access
@@ -88,9 +90,57 @@ pub struct Session {
     pub name: String,
     /// SSH-key sessions have full access; Access (browser) sessions only view and do safe actions.
     pub full: bool,
+    /// A key that isn't one of the owners: its jobs are sandboxed and it only sees and uses
+    /// what it created.
+    pub guest: bool,
 }
 
 impl Session {
+    fn dashboard(&self) -> bool {
+        self.fingerprint.starts_with("cf:")
+    }
+
+    /// How this caller is named in records other keys can read (who cancelled a job): a
+    /// dashboard login is "<owner> (dashboard)", never its email.
+    pub fn public_name(&self) -> String {
+        if self.dashboard() { format!("{} (dashboard)", crate::users::owner_name()) } else { self.name.clone() }
+    }
+
+    pub fn public_key(&self) -> String {
+        if self.dashboard() { "dashboard".into() } else { self.fingerprint.clone() }
+    }
+
+    /// Refuses guests.
+    pub fn require_not_guest(&self, what: &str) -> ApiResult<()> {
+        if !self.guest {
+            return Ok(());
+        }
+        Err(ApiError::new(StatusCode::FORBIDDEN, "forbidden", format!("guest keys can't {what}"), "ask the network's owner"))
+    }
+
+    /// Whether this caller may act on (or see the details of) a job: owners any job, guests
+    /// only their own.
+    pub fn owns_job(&self, j: &Job) -> bool {
+        !self.guest || j.key_fingerprint == self.fingerprint
+    }
+
+    pub fn require_job(&self, j: &Job) -> ApiResult<()> {
+        if self.owns_job(j) {
+            return Ok(());
+        }
+        Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "not_yours",
+            format!("job {} isn't yours", j.id),
+            "guest keys can read the logs and outputs of, cancel and reuse only their own jobs",
+        ))
+    }
+
+    /// Owners may use anything; guests what they created (`kind`: snapshot, secret, dataset).
+    fn may_use(&self, s: &AppState, kind: &str, id: &str) -> ApiResult<bool> {
+        Ok(!self.guest || s.sched.store.owns(kind, id, &self.fingerprint)?)
+    }
+
     /// Submitting jobs, uploading code and changing secrets need an SSH-key session.
     pub fn require_full(&self) -> ApiResult<()> {
         if self.full {
@@ -117,17 +167,20 @@ impl FromRequestParts<AppState> for Session {
             .and_then(|v| v.strip_prefix("Bearer "));
         if let Some(bearer) = bearer {
             return match state.auth.session(bearer.trim())? {
-                Some(fingerprint) => {
-                    let name = state.sched.store.key_name(&fingerprint)?.unwrap_or_else(|| fingerprint.clone());
-                    Ok(Session { fingerprint, name, full: true })
+                Some((fingerprint, name)) => {
+                    let guest = !state.owners.is_empty() && !state.owners.contains(&name);
+                    Ok(Session { fingerprint, name, full: true, guest })
                 }
-                None => Err(ApiError::unauthorized("session expired or unknown")),
+                None => Err(ApiError::unauthorized("session expired, unknown, or its key is no longer in allowed_signers")),
             };
         }
         let jwt = parts.headers.get(ACCESS_HEADER).and_then(|v| v.to_str().ok());
         match (jwt, &state.access) {
             (Some(token), Some(access)) => match access.verify(token).await {
-                Ok(email) => Ok(Session { fingerprint: format!("cf:{email}"), name: email, full: false }),
+                Ok(email) => {
+                    same_origin(parts)?;
+                    Ok(Session { fingerprint: format!("cf:{email}"), name: email, full: false, guest: false })
+                }
                 Err(e) => {
                     tracing::warn!("Access token rejected: {e:#}");
                     Err(ApiError::unauthorized(format!("Cloudflare Access login rejected: {e}")))
@@ -138,16 +191,38 @@ impl FromRequestParts<AppState> for Session {
     }
 }
 
+/// The dashboard is authenticated by Cloudflare's cookie, which a browser attaches to requests
+/// other sites make too. So a state-changing request must come from the dashboard's own pages:
+/// `Sec-Fetch-Site: same-origin` (every current browser sends it), or for older browsers an
+/// `Origin` naming this host.
+fn same_origin(parts: &Parts) -> ApiResult<()> {
+    if matches!(parts.method, axum::http::Method::GET | axum::http::Method::HEAD | axum::http::Method::OPTIONS) {
+        return Ok(());
+    }
+    let h = |n: &str| parts.headers.get(n).and_then(|v| v.to_str().ok());
+    let ok = match (h("sec-fetch-site"), h(header::ORIGIN.as_str())) {
+        (Some(site), _) => site == "same-origin",
+        (None, Some(o)) => o.split_once("://").map(|(_, rest)| rest.trim_end_matches('/')) == h(header::HOST.as_str()),
+        (None, None) => true,
+    };
+    if ok {
+        return Ok(());
+    }
+    Err(ApiError::new(StatusCode::FORBIDDEN, "cross_site", "cross-site requests can't change anything", "use the dashboard itself"))
+}
+
 async fn whoami(sess: Session) -> Json<Value> {
     Json(json!({
         "identity": sess.fingerprint,
         "name": sess.name,
-        "scope": if sess.full { "full" } else { "dashboard" },
+        "scope": if !sess.full { "dashboard" } else if sess.guest { "guest" } else { "full" },
     }))
 }
 
 /// Changes within v1 that a running agent should know about, newest first.
 const CHANGES: &[(&str, &str)] = &[
+    ("2026-11-24", "Guest keys (any key not in `owners` in hosts.toml; whoami scope \"guest\"): jobs need container.image and run sandboxed (private code copy, no tailnet/LAN, one node, no paid backends, no builds); logs/metrics/outputs/cancel only on their own jobs; secrets, datasets and snapshots only their own (HEAD /v1/snapshots/{id} is 404 until they upload it). Errors: guest_sandbox, not_yours."),
+    ("2026-11-24", "Login nonces are signed, so /v1/auth/challenge no longer returns rate_limited (Cloudflare may still 429). A session stops working as soon as its key leaves allowed_signers. allowed_signers options: namespaces, valid-after and valid-before are honoured; lines with other options (cert-authority) can't log in. Uploads answer 507 disk_full when the coordinator would keep under 10 GB free."),
     ("2026-11-24", "submitted_by is the submitting key's nickname (its allowed_signers principal; submitted_by_key is the fingerprint), and cancelled jobs have cancelled_by {name, key, at}. GET /v1/whoami shows your name."),
     ("2026-11-24", "Job JSON always has command, env, snapshot and snapshot_created_at; list items have resources. GET /v1/jobs/{id}/outputs/list lists output files with sizes; /outputs answers 404 no_outputs when nothing matches and 410 once outputs are deleted; DELETE /v1/jobs/{id}/outputs frees a finished job's disk. /logs?tail=N gives the last N bytes. A cancel's reason says who cancelled. Long titles are shortened, not refused. retries defaults to 1."),
     ("2026-11-24", "GET /v1/skill: this skill for people using the network (install or update it with `curl -fsSL $COMPUTE_URL/v1/install | sh`). /v1/users lists, adds and removes users (dashboard owner only)."),
@@ -206,14 +281,22 @@ fn fmt_opt(tz: &Tz, t: Option<DateTime<Utc>>) -> Value {
 
 // ------------------------------------------------------------------ snapshots
 
-async fn upload_snapshot(State(s): State<AppState>, sess: Session, body: Body) -> ApiResult<Json<Value>> {
+fn content_length(headers: &HeaderMap) -> Option<u64> {
+    headers.get(header::CONTENT_LENGTH).and_then(|v| v.to_str().ok()).and_then(|v| v.parse().ok())
+}
+
+async fn upload_snapshot(State(s): State<AppState>, sess: Session, headers: HeaderMap, body: Body) -> ApiResult<Json<Value>> {
     sess.require_full()?;
-    let (id, existed) = s.sched.snapshots.store(body).await?;
+    let (id, existed) = s.sched.snapshots.store(body, content_length(&headers)).await?;
+    s.sched.store.claim("snapshot", &id, &sess.fingerprint)?;
     Ok(Json(json!({"id": id, "existed": existed})))
 }
 
-async fn head_snapshot(State(s): State<AppState>, _sess: Session, Path(id): Path<String>) -> StatusCode {
-    if s.sched.snapshots.exists(&id) { StatusCode::OK } else { StatusCode::NOT_FOUND }
+/// A guest sees only snapshots it uploaded itself, so it uploads (and so proves it has) the
+/// code before a job can use it.
+async fn head_snapshot(State(s): State<AppState>, sess: Session, Path(id): Path<String>) -> ApiResult<StatusCode> {
+    let found = s.sched.snapshots.exists(&id) && sess.may_use(&s, "snapshot", &id)?;
+    Ok(if found { StatusCode::OK } else { StatusCode::NOT_FOUND })
 }
 
 // ------------------------------------------------------------------ jobs
@@ -308,7 +391,10 @@ async fn submit(State(s): State<AppState>, sess: Session, body: Result<Json<Valu
             }
         }
     }
-    if !s.sched.snapshots.exists(&req.snapshot) {
+    if sess.guest {
+        guest_request(&s, &sess, &req)?;
+    }
+    if !s.sched.snapshots.exists(&req.snapshot) || !sess.may_use(&s, "snapshot", &req.snapshot)? {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
             "snapshot_missing",
@@ -319,7 +405,8 @@ async fn submit(State(s): State<AppState>, sess: Session, body: Result<Json<Valu
     s.sched.secrets.check(&req.secrets)?;
 
     if let Some(key) = &req.idempotency_key {
-        let existing = s.sched.store.jobs_by_idempotency_key(key)?;
+        let existing: Vec<Job> =
+            s.sched.store.jobs_by_idempotency_key(key)?.into_iter().filter(|j| j.key_fingerprint == sess.fingerprint).collect();
         if !existing.is_empty() && !req.dry_run {
             let first = &existing[0];
             let mut body = submit_body(&s.tz, first, None);
@@ -331,7 +418,15 @@ async fn submit(State(s): State<AppState>, sess: Session, body: Result<Json<Valu
         }
     }
 
-    let spec = build_spec(&s, &req).await?;
+    let mut spec = build_spec(&s, &req).await?;
+    if sess.guest {
+        for d in &spec.datasets {
+            if !sess.may_use(&s, "dataset", &d.name)? {
+                return Err(ApiError::new(StatusCode::FORBIDDEN, "not_yours", format!("dataset {} isn't yours", d.name), "guest keys use only datasets they registered"));
+            }
+        }
+        spec.sandbox = true;
+    }
     let hash = request_hash(&raw);
     let quoted = if req.max_cost_usd.is_some() && !req.dry_run {
         let Some(qid) = &req.quote_id else {
@@ -508,6 +603,43 @@ async fn submit(State(s): State<AppState>, sess: Session, body: Result<Json<Valu
     Ok((StatusCode::CREATED, Json(body)).into_response())
 }
 
+/// What a guest's job may ask for: a public image (no builds), no paid backends, and only its
+/// own secrets and jobs' outputs. Snapshots and datasets are checked where they're resolved.
+fn guest_request(s: &AppState, sess: &Session, req: &JobRequest) -> ApiResult<()> {
+    let forbid = |m: String, hint: &str| ApiError::new(StatusCode::FORBIDDEN, "guest_sandbox", m, hint);
+    match &req.container {
+        None => {
+            return Err(forbid(
+                "guest jobs run sandboxed in a container".into(),
+                "set container.image to a public image, e.g. {\"image\": \"python:3.12\"}",
+            ));
+        }
+        Some(c) if c.image.is_none() => {
+            return Err(forbid("guest keys can't build images here".into(), "build and push a public image elsewhere and set container.image"));
+        }
+        _ => {}
+    }
+    if req.max_cost_usd.is_some() {
+        return Err(forbid("guest keys can't use paid cloud backends".into(), "drop max_cost_usd, or ask the network's owner"));
+    }
+    if req.resources.nodes > 1 {
+        return Err(forbid("guest jobs run on one node".into(), "set resources.nodes to 1"));
+    }
+    for n in &req.secrets {
+        if !sess.may_use(s, "secret", n)? {
+            return Err(forbid(format!("secret {n:?} isn't yours"), "store your own with PUT /v1/secrets/{name}"));
+        }
+    }
+    for inp in &req.inputs {
+        if let Some(j) = s.sched.store.get_job(inp.from_job)?
+            && !sess.owns_job(&j)
+        {
+            return Err(forbid(format!("job {} isn't yours", j.id), "guest keys reuse only their own jobs' outputs"));
+        }
+    }
+    Ok(())
+}
+
 fn round2(x: f64) -> f64 {
     (x * 100.0).round() / 100.0
 }
@@ -574,6 +706,20 @@ fn resources_json(r: &crate::model::Resources) -> Value {
         "gpu_type": r.gpu_type, "time_s": r.time_s,
         "disk_gb": (r.disk_mb > 0).then(|| r.disk_mb as f64 / 1024.0),
     })
+}
+
+/// A job's full view for this caller: a guest sees what other keys' jobs run (command, env,
+/// secrets, inputs, datasets, description) only for its own.
+fn job_view(tz: &Tz, j: &Job, verbose: bool, sess: &Session) -> Value {
+    let mut v = job_full(tz, j, verbose);
+    if !sess.owns_job(j)
+        && let Some(m) = v.as_object_mut()
+    {
+        for k in ["description", "command", "env", "secrets", "inputs", "datasets", "handle", "idempotency_key"] {
+            m.remove(k);
+        }
+    }
+    v
 }
 
 fn job_full(tz: &Tz, j: &Job, verbose: bool) -> Value {
@@ -664,9 +810,9 @@ fn load_job(s: &AppState, id: i64) -> ApiResult<Job> {
     s.sched.store.get_job(id)?.ok_or_else(|| ApiError::not_found(format!("job {id} not found")))
 }
 
-async fn get_job(State(s): State<AppState>, _sess: Session, Path(id): Path<i64>, Query(q): Query<VerboseQuery>) -> ApiResult<Json<Value>> {
+async fn get_job(State(s): State<AppState>, sess: Session, Path(id): Path<i64>, Query(q): Query<VerboseQuery>) -> ApiResult<Json<Value>> {
     let j = load_job(&s, id)?;
-    let mut v = job_full(&s.tz, &j, q.verbose.unwrap_or(0) > 0);
+    let mut v = job_view(&s.tz, &j, q.verbose.unwrap_or(0) > 0, &sess);
     add_people(&s, &j, &mut v, &mut HashMap::new())?;
     if let Some((rate, cost)) = s.sched.store.cost_of(id)? {
         v["usd_per_hour"] = rate.into();
@@ -690,7 +836,7 @@ const PROXIED_WAIT_SECS: u64 = 90;
 
 async fn wait_job(
     State(s): State<AppState>,
-    _sess: Session,
+    sess: Session,
     Path(id): Path<i64>,
     Query(q): Query<WaitQuery>,
     headers: HeaderMap,
@@ -709,14 +855,14 @@ async fn wait_job(
         let j = load_job(&s, id)?;
         let reached = j.state.is_terminal() || (until == "running" && j.state == JobState::Running);
         if reached {
-            let mut v = job_full(&s.tz, &j, false);
+            let mut v = job_view(&s.tz, &j, false, &sess);
             add_people(&s, &j, &mut v, &mut HashMap::new())?;
             v["timed_out"] = false.into();
             return Ok(Json(v));
         }
         let changed = tokio::time::timeout_at(deadline, rx.changed()).await;
         if changed.is_err() {
-            let mut v = job_full(&s.tz, &j, false);
+            let mut v = job_view(&s.tz, &j, false, &sess);
             add_people(&s, &j, &mut v, &mut HashMap::new())?;
             v["timed_out"] = true.into();
             return Ok(Json(v));
@@ -732,8 +878,9 @@ struct LogQuery {
     tail: Option<u64>,
 }
 
-async fn job_logs(State(s): State<AppState>, _sess: Session, Path(id): Path<i64>, Query(q): Query<LogQuery>) -> ApiResult<Json<Value>> {
+async fn job_logs(State(s): State<AppState>, sess: Session, Path(id): Path<i64>, Query(q): Query<LogQuery>) -> ApiResult<Json<Value>> {
     let j = load_job(&s, id)?;
+    sess.require_job(&j)?;
     let offset = q.offset.unwrap_or(0);
     let max = q.max_bytes.unwrap_or(65_536).clamp(1, 1_048_576);
     let backend = j.backend.as_deref().and_then(|n| s.sched.backend(n));
@@ -773,8 +920,9 @@ struct MetricsQuery {
 
 /// Resource usage sampled by the runner every 10 s: CPU (percent of one core, summed), memory
 /// (MB resident), per-GPU utilization, memory and power, and free disk where the job runs.
-async fn job_metrics(State(s): State<AppState>, _sess: Session, Path(id): Path<i64>, Query(q): Query<MetricsQuery>) -> ApiResult<Json<Value>> {
+async fn job_metrics(State(s): State<AppState>, sess: Session, Path(id): Path<i64>, Query(q): Query<MetricsQuery>) -> ApiResult<Json<Value>> {
     let j = load_job(&s, id)?;
+    sess.require_job(&j)?;
     let requested = json!({"cpus": j.resources.cpus, "mem_mb": j.resources.mem_mb, "gpus": j.resources.gpus});
     let backend = j.backend.as_deref().and_then(|n| s.sched.backend(n)).filter(|b| b.root().is_some());
     let empty = json!({"latest": null, "history": [], "requested": requested, "state": j.state});
@@ -799,8 +947,9 @@ struct OutputsQuery {
 
 use crate::model::valid_glob;
 
-async fn job_outputs(State(s): State<AppState>, _sess: Session, Path(id): Path<i64>, Query(q): Query<OutputsQuery>) -> ApiResult<Response> {
+async fn job_outputs(State(s): State<AppState>, sess: Session, Path(id): Path<i64>, Query(q): Query<OutputsQuery>) -> ApiResult<Response> {
     let j = load_job(&s, id)?;
+    sess.require_job(&j)?;
     if let Some(g) = &q.glob
         && !valid_glob(g) {
             return Err(ApiError::bad_request(
@@ -852,8 +1001,9 @@ fn outputs_backend(s: &AppState, j: &Job) -> ApiResult<Arc<dyn crate::backend::B
 }
 
 /// The job's output files with their sizes (optionally only those matching `glob`).
-async fn list_outputs(State(s): State<AppState>, _sess: Session, Path(id): Path<i64>, Query(q): Query<OutputsQuery>) -> ApiResult<Json<Value>> {
+async fn list_outputs(State(s): State<AppState>, sess: Session, Path(id): Path<i64>, Query(q): Query<OutputsQuery>) -> ApiResult<Json<Value>> {
     let j = load_job(&s, id)?;
+    sess.require_job(&j)?;
     if let Some(g) = &q.glob
         && !valid_glob(g)
     {
@@ -874,6 +1024,7 @@ async fn list_outputs(State(s): State<AppState>, _sess: Session, Path(id): Path<
 async fn delete_outputs(State(s): State<AppState>, sess: Session, Path(id): Path<i64>) -> ApiResult<Json<Value>> {
     sess.require_full()?;
     let j = load_job(&s, id)?;
+    sess.require_job(&j)?;
     if !j.state.is_terminal() {
         return Err(ApiError::bad_request(format!("job {id} is {}", j.state.as_str()), "only a finished job's outputs can be deleted; cancel it first"));
     }
@@ -895,7 +1046,7 @@ async fn delete_outputs(State(s): State<AppState>, sess: Session, Path(id): Path
     }
     let backend = outputs_backend(&s, &j)?;
     backend.delete_outputs(&j).await?;
-    s.sched.store.mark_outputs_deleted(id, &format!("deleted on request by {}", sess.name))?;
+    s.sched.store.mark_outputs_deleted(id, &format!("deleted on request by {}", sess.public_name()))?;
     Ok(Json(json!({"deleted": true})))
 }
 
@@ -914,12 +1065,16 @@ async fn cancel_job(State(s): State<AppState>, sess: Session, Path(id): Path<i64
     } else {
         vec![load_job(&s, id)?]
     };
+    for j in &jobs {
+        sess.require_job(j)?;
+    }
+    let (by, key) = (sess.public_name(), sess.public_key());
     let mut cancelled = 0;
     let mut errors = Vec::new();
     for j in jobs.iter().filter(|j| !j.state.is_terminal()) {
-        match s.sched.cancel(j, &sess.name).await {
+        match s.sched.cancel(j, &by).await {
             Ok(()) => {
-                s.sched.store.record_cancel(j.id, &sess.name, &sess.fingerprint)?;
+                s.sched.store.record_cancel(j.id, &by, &key)?;
                 cancelled += 1
             }
             Err(e) => errors.push(format!("job {}: {e:#}", j.id)),
@@ -1047,7 +1202,8 @@ async fn get_backend(State(s): State<AppState>, _sess: Session, Path(name): Path
 
 /// The user's jobs in a Slurm backend's queue, with their start estimates; jobs compute
 /// submitted carry `compute_job`.
-async fn backend_queue(State(s): State<AppState>, _sess: Session, Path(name): Path<String>) -> ApiResult<Json<Value>> {
+async fn backend_queue(State(s): State<AppState>, sess: Session, Path(name): Path<String>) -> ApiResult<Json<Value>> {
+    sess.require_not_guest("read a backend's batch queue")?;
     let b = s.sched.backend(&name).ok_or_else(|| ApiError::not_found(format!("backend {name} not found")))?;
     if b.root().is_none() {
         return Ok(Json(json!({"jobs": [], "note": "not probed yet"})));
@@ -1081,10 +1237,11 @@ fn parse_until(tz: &Tz, s: &str) -> Option<DateTime<Utc>> {
 
 async fn enable_backend(
     State(s): State<AppState>,
-    _sess: Session,
+    sess: Session,
     Path(name): Path<String>,
     body: Option<Json<EnableReq>>,
 ) -> ApiResult<Json<Value>> {
+    sess.require_not_guest("turn backends on or off")?;
     if s.sched.backend(&name).is_none() {
         return Err(ApiError::not_found(format!("backend {name} not found")));
     }
@@ -1098,7 +1255,8 @@ async fn enable_backend(
     backend_summary(&s, &name).await.map(Json)
 }
 
-async fn disable_backend(State(s): State<AppState>, _sess: Session, Path(name): Path<String>) -> ApiResult<Json<Value>> {
+async fn disable_backend(State(s): State<AppState>, sess: Session, Path(name): Path<String>) -> ApiResult<Json<Value>> {
+    sess.require_not_guest("turn backends on or off")?;
     if s.sched.backend(&name).is_none() {
         return Err(ApiError::not_found(format!("backend {name} not found")));
     }
@@ -1114,7 +1272,7 @@ impl Session {
     /// Deciding who may use the API takes the owner: a Cloudflare Access login on the
     /// dashboard. SSH keys (including guests') can't add or remove keys.
     fn require_owner(&self) -> ApiResult<()> {
-        if self.fingerprint.starts_with("cf:") {
+        if self.dashboard() {
             return Ok(());
         }
         Err(ApiError::new(
@@ -1182,8 +1340,17 @@ async fn guest_skill(_sess: Session, headers: HeaderMap, OriginalUri(uri): Origi
 
 // ------------------------------------------------------------------ secrets
 
-async fn list_secrets(State(s): State<AppState>, _sess: Session) -> ApiResult<Json<Value>> {
-    let list = s.sched.secrets.list()?;
+async fn list_secrets(State(s): State<AppState>, sess: Session) -> ApiResult<Json<Value>> {
+    let mut list = s.sched.secrets.list()?;
+    if sess.guest {
+        let mut mine = Vec::new();
+        for i in list {
+            if sess.may_use(&s, "secret", &i.name)? {
+                mine.push(i);
+            }
+        }
+        list = mine;
+    }
     Ok(Json(json!({"secrets": list.iter().map(|i| json!({
         "name": i.name, "keys": i.keys, "updated_at": fmt(&s.tz, i.updated_at)
     })).collect::<Vec<_>>()})))
@@ -1202,14 +1369,25 @@ async fn put_secret(
 ) -> ApiResult<Json<Value>> {
     sess.require_full()?;
     let Json(req) = body.map_err(json_err)?;
+    if sess.guest && s.sched.registry.secret.as_deref() == Some(name.as_str()) {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "forbidden", format!("secret {name:?} is the daemon's registry login"), "pick another name"));
+    }
+    if s.sched.secrets.exists(&name) && !sess.may_use(&s, "secret", &name)? {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "not_yours", format!("secret {name:?} belongs to someone else"), "pick another name, e.g. prefixed with your own"));
+    }
     let keys: Vec<String> = req.env.keys().cloned().collect();
     s.sched.secrets.put(&name, req.env)?;
+    s.sched.store.claim("secret", &name, &sess.fingerprint)?;
     Ok(Json(json!({"name": name, "keys": keys})))
 }
 
 async fn delete_secret(State(s): State<AppState>, sess: Session, Path(name): Path<String>) -> ApiResult<Json<Value>> {
     sess.require_full()?;
+    if s.sched.secrets.exists(&name) && !sess.may_use(&s, "secret", &name)? {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "not_yours", format!("secret {name:?} belongs to someone else"), ""));
+    }
     if s.sched.secrets.delete(&name)? {
+        s.sched.store.disown_all("secret", &name)?;
         Ok(Json(json!({"deleted": name})))
     } else {
         Err(ApiError::not_found(format!("secret {name} not found")))
@@ -1237,7 +1415,21 @@ async fn register_dataset(
 ) -> ApiResult<Response> {
     sess.require_full()?;
     let Json(req) = body.map_err(json_err)?;
+    dataset_name_free(&s, &sess, &req.name)?;
+    if sess.guest {
+        use crate::datasets::Source;
+        let forbid = |m: &str| ApiError::new(StatusCode::FORBIDDEN, "guest_sandbox", m.to_string(), "upload the data, or register it from Hugging Face or your own job's outputs");
+        match &req.source {
+            Source::HostPath { .. } => return Err(forbid("guest keys can't register directories on the hosts")),
+            Source::Rclone { .. } => return Err(forbid("guest keys can't use the hosts' rclone remotes")),
+            Source::Hf { secret: Some(n), .. } if !sess.may_use(&s, "secret", n)? => return Err(forbid("that secret isn't yours")),
+            Source::JobOutputs { job, .. } => sess.require_job(&load_job(&s, *job)?)?,
+            _ => {}
+        }
+    }
+    let name = req.name.clone();
     let (row, new) = s.sched.register_dataset(req).await?;
+    s.sched.store.claim("dataset", &name, &sess.fingerprint)?;
     let mut v = dataset_json(&s.tz, &row);
     v["new_version"] = new.into();
     Ok((if new { StatusCode::CREATED } else { StatusCode::OK }, Json(v)).into_response())
@@ -1253,16 +1445,27 @@ async fn upload_dataset(
     sess: Session,
     Path(name): Path<String>,
     Query(q): Query<UploadQuery>,
+    headers: HeaderMap,
     body: Body,
 ) -> ApiResult<Response> {
     sess.require_full()?;
-    let (row, new) = s.sched.upload_dataset(&name, q.description.unwrap_or_default(), body).await?;
+    dataset_name_free(&s, &sess, &name)?;
+    let (row, new) = s.sched.upload_dataset(&name, q.description.unwrap_or_default(), content_length(&headers), body).await?;
+    s.sched.store.claim("dataset", &name, &sess.fingerprint)?;
     let mut v = dataset_json(&s.tz, &row);
     v["new_version"] = new.into();
     Ok((if new { StatusCode::CREATED } else { StatusCode::OK }, Json(v)).into_response())
 }
 
-async fn list_datasets(State(s): State<AppState>, _sess: Session) -> ApiResult<Json<Value>> {
+/// A guest may add versions only to dataset names that are new or its own.
+fn dataset_name_free(s: &AppState, sess: &Session, name: &str) -> ApiResult<()> {
+    if sess.guest && !s.sched.store.dataset_versions(Some(name))?.is_empty() && !sess.may_use(s, "dataset", name)? {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "not_yours", format!("dataset {name} belongs to someone else"), "pick another name"));
+    }
+    Ok(())
+}
+
+async fn list_datasets(State(s): State<AppState>, sess: Session) -> ApiResult<Json<Value>> {
     let versions = s.sched.store.dataset_versions(None)?;
     let copies = s.sched.store.dataset_copies(None, None)?;
     let mut out: Vec<Value> = Vec::new();
@@ -1270,6 +1473,9 @@ async fn list_datasets(State(s): State<AppState>, _sess: Session) -> ApiResult<J
     for d in &versions {
         if !seen.insert(d.name.clone()) {
             continue; // versions are newest first; list each name once
+        }
+        if !sess.may_use(&s, "dataset", &d.name)? {
+            continue;
         }
         let count = versions.iter().filter(|x| x.name == d.name).count();
         let on: Vec<&str> = copies.iter().filter(|c| c.name == d.name && c.version == d.version).map(|c| c.backend.as_str()).collect();
@@ -1286,9 +1492,9 @@ async fn list_datasets(State(s): State<AppState>, _sess: Session) -> ApiResult<J
     Ok(Json(json!({"datasets": out})))
 }
 
-async fn get_dataset(State(s): State<AppState>, _sess: Session, Path(name): Path<String>) -> ApiResult<Json<Value>> {
+async fn get_dataset(State(s): State<AppState>, sess: Session, Path(name): Path<String>) -> ApiResult<Json<Value>> {
     let versions = s.sched.store.dataset_versions(Some(&name))?;
-    if versions.is_empty() {
+    if versions.is_empty() || !sess.may_use(&s, "dataset", &name)? {
         return Err(ApiError::not_found(format!("dataset {name} not found")));
     }
     let copies = s.sched.store.dataset_copies(None, Some(&name))?;
@@ -1307,13 +1513,17 @@ async fn get_dataset(State(s): State<AppState>, _sess: Session, Path(name): Path
 
 async fn delete_dataset_copy(State(s): State<AppState>, sess: Session, Path((name, backend)): Path<(String, String)>) -> ApiResult<Json<Value>> {
     sess.require_full()?;
+    if !sess.may_use(&s, "dataset", &name)? {
+        return Err(ApiError::new(StatusCode::FORBIDDEN, "not_yours", format!("dataset {name} belongs to someone else"), ""));
+    }
     let n = s.sched.delete_dataset_copy(&name, &backend).await?;
     Ok(Json(json!({"deleted_copies": n, "backend": backend, "name": name})))
 }
 
 // ------------------------------------------------------------------ images
 
-async fn list_images(State(s): State<AppState>, _sess: Session) -> ApiResult<Json<Value>> {
+async fn list_images(State(s): State<AppState>, sess: Session) -> ApiResult<Json<Value>> {
+    sess.require_not_guest("see image builds")?;
     let rows = s.sched.store.images(100)?;
     Ok(Json(json!({
         "registry": s.sched.registry.prefix(),
@@ -1331,7 +1541,8 @@ async fn list_images(State(s): State<AppState>, _sess: Session) -> ApiResult<Jso
     })))
 }
 
-async fn image_logs(State(s): State<AppState>, _sess: Session, Path(key): Path<String>, Query(q): Query<LogQuery>) -> ApiResult<Json<Value>> {
+async fn image_logs(State(s): State<AppState>, sess: Session, Path(key): Path<String>, Query(q): Query<LogQuery>) -> ApiResult<Json<Value>> {
+    sess.require_not_guest("see image builds")?;
     if !key.chars().all(|c| c.is_ascii_hexdigit()) || key.is_empty() {
         return Err(ApiError::bad_request("bad image key", "use the `key` from GET /v1/images"));
     }

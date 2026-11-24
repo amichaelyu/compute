@@ -133,6 +133,9 @@ pub struct StageFiles {
     pub runtime: Option<String>,
     /// Extra exports for job.env (multi-node rendezvous, caches).
     pub env: Vec<(String, String)>,
+    /// A sandboxed job's own env (`user.env`), which only the container reads: the runner
+    /// never sources it, so it can't set PATH, LD_PRELOAD and the like for host commands.
+    pub user_env: Option<String>,
 }
 
 #[async_trait]
@@ -325,7 +328,7 @@ impl Remote {
                     port: Some(port),
                     tunnel: true,
                     alias: self.cfg.name.clone(),
-                    ephemeral: false,
+                    known_hosts: None,
                 })
             }
             Transport::Ssh => Ok(Ssh {
@@ -334,7 +337,7 @@ impl Remote {
                 port: self.cfg.ssh_port,
                 tunnel: false,
                 alias: self.cfg.name.clone(),
-                ephemeral: false,
+                known_hosts: None,
             }),
         }
     }
@@ -465,6 +468,11 @@ impl Remote {
         let root = self.root_or_err()?;
         self.stage_snapshot(&job.snapshot, snapshot, env_prelude, !job.is_container()).await?;
         let env = job_env(&root, job, timeout_s, files);
+        if job.spec.sandbox {
+            let mut files = files.clone();
+            files.user_env = Some(user_env(job));
+            return self.write_job_files(job.id, &env, &job.command, &files).await;
+        }
         self.write_job_files(job.id, &env, &job.command, files).await
     }
 
@@ -596,6 +604,9 @@ pub fn job_files_tar(job_env: &str, command: &str, files: &StageFiles) -> Result
     if let Some(s) = &files.secrets_env {
         add(".secrets.env", s.as_bytes(), 0o600)?;
     }
+    if let Some(u) = &files.user_env {
+        add("user.env", u.as_bytes(), 0o600)?;
+    }
     Ok(builder.into_inner()?)
 }
 
@@ -620,11 +631,22 @@ pub fn job_env(root: &str, job: &Job, timeout_s: u64, files: &StageFiles) -> Str
         lines.push(format!("export JOB_RUNTIME={}", shell_quote(rt)));
         lines.push(format!("export JOB_IMAGE={}", shell_quote(&c.image)));
     }
+    if job.spec.sandbox {
+        lines.push("export JOB_SANDBOX=1".into());
+    }
     let pairs = files.env.iter().map(|(k, v)| (k.as_str(), v.as_str()));
-    let user = job.env.iter().map(|(k, v)| (k.as_str(), v.as_str()));
+    // A sandboxed job's own env goes to user.env instead (see StageFiles::user_env).
+    let user = job.env.iter().filter(|_| !job.spec.sandbox).map(|(k, v)| (k.as_str(), v.as_str()));
     for (k, v) in pairs.chain(user) {
         lines.push(format!("export {k}={}", shell_quote(v)));
     }
+    lines.push(String::new());
+    lines.join("\n")
+}
+
+/// `export KEY='value'` lines of the job's own env.
+pub fn user_env(job: &Job) -> String {
+    let mut lines: Vec<String> = job.env.iter().map(|(k, v)| format!("export {k}={}", shell_quote(v))).collect();
     lines.push(String::new());
     lines.join("\n")
 }

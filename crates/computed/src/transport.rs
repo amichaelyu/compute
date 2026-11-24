@@ -69,8 +69,9 @@ pub struct Ssh {
     pub tunnel: bool,
     /// Backend name, used for `HostKeyAlias` on tunnels and in error messages.
     pub alias: String,
-    /// A throwaway cloud instance: don't record or check its host key.
-    pub ephemeral: bool,
+    /// A throwaway cloud instance: its host key is pinned in this file (one per address) on
+    /// first contact, which `wait_ssh` makes before anything secret is sent, and checked after.
+    pub known_hosts: Option<std::path::PathBuf>,
 }
 
 pub struct Output {
@@ -100,8 +101,9 @@ impl Ssh {
             c.arg("-o").arg(format!("HostKeyAlias=compute-{}", self.alias));
             c.args(["-o", "StrictHostKeyChecking=accept-new"]);
         }
-        if self.ephemeral {
-            c.args(["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR"]);
+        if let Some(f) = &self.known_hosts {
+            c.arg("-o").arg(format!("UserKnownHostsFile={}", f.display()));
+            c.args(["-o", "GlobalKnownHostsFile=/dev/null", "-o", "StrictHostKeyChecking=accept-new", "-o", "LogLevel=ERROR"]);
         }
         let dest = match &self.user {
             Some(u) => format!("{u}@{}", self.host),

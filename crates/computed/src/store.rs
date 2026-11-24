@@ -125,6 +125,13 @@ CREATE TABLE IF NOT EXISTS outputs_deleted (
   deleted_at TEXT NOT NULL,
   why TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS ownership (
+  kind TEXT NOT NULL,
+  id TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (kind, id, fingerprint)
+);
 CREATE TABLE IF NOT EXISTS cloud_costs (
   job_id INTEGER PRIMARY KEY,
   backend TEXT NOT NULL,
@@ -467,6 +474,49 @@ impl Store {
     pub fn key_name(&self, fingerprint: &str) -> Result<Option<String>> {
         let c = self.conn();
         Ok(c.query_row("SELECT name FROM key_names WHERE fingerprint = ?1", params![fingerprint], |r| r.get(0)).optional()?)
+    }
+
+    /// Records that `fingerprint` created (or, for content-addressed snapshots, uploaded) the
+    /// `kind` object `id`: `snapshot`, `secret` or `dataset`.
+    pub fn claim(&self, kind: &str, id: &str, fingerprint: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT OR IGNORE INTO ownership(kind, id, fingerprint, created_at) VALUES (?1, ?2, ?3, ?4)",
+            params![kind, id, fingerprint, ts(Utc::now())],
+        )?;
+        Ok(())
+    }
+
+    pub fn owns(&self, kind: &str, id: &str, fingerprint: &str) -> Result<bool> {
+        let c = self.conn();
+        Ok(c.query_row(
+            "SELECT 1 FROM ownership WHERE kind = ?1 AND id = ?2 AND fingerprint = ?3",
+            params![kind, id, fingerprint],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+    }
+
+    pub fn disown_all(&self, kind: &str, id: &str) -> Result<()> {
+        self.conn().execute("DELETE FROM ownership WHERE kind = ?1 AND id = ?2", params![kind, id])?;
+        Ok(())
+    }
+
+    /// Replaces dashboard logins' emails in cancel records and job reasons (which every key can
+    /// read) with `display`. Returns how many cancels changed.
+    pub fn scrub_dashboard_emails(&self, display: &str) -> Result<usize> {
+        let mut c = self.conn();
+        let tx = c.transaction()?;
+        let rows: Vec<(i64, String)> = {
+            let mut st = tx.prepare("SELECT job_id, by_name FROM cancels WHERE by_key LIKE 'cf:%'")?;
+            st.query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?.collect::<rusqlite::Result<_>>()?
+        };
+        for (job, email) in &rows {
+            tx.execute("UPDATE jobs SET reason = replace(reason, ?1, ?2) WHERE id = ?3", params![email, display, job])?;
+        }
+        tx.execute("UPDATE cancels SET by_name = ?1, by_key = 'dashboard' WHERE by_key LIKE 'cf:%'", params![display])?;
+        tx.commit()?;
+        Ok(rows.len())
     }
 
     /// Records who cancelled a job (the first cancel counts).

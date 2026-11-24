@@ -11,6 +11,11 @@
 # With JOB_RUNTIME=docker or apptainer the command runs in JOB_IMAGE, with the snapshot at /work,
 # outputs at /out, inputs at /in and each dataset read-only at /data/<name>.
 #
+# JOB_SANDBOX=1 (a guest's job) runs it cut off from this host: in a container only, on a
+# private copy of the snapshot, with the job's env and secrets (user.env, .secrets.env) read
+# inside the container and never by this script, and no route to the tailnet, the LAN or this
+# host (Docker; Apptainer gets --containall instead).
+#
 # Works with bash 3.2 (macOS) and bash 5; needs no timeout, setsid or jq.
 set -u
 
@@ -50,6 +55,8 @@ oom_kills() {
 # dependencies hold back the jobs that need this one.
 fail() { # <message> [exit_code]
   stop_setup_beat
+  rm -f "$jobdir/container.env"
+  [ -n "${sandbox:-}" ] && rm -rf "$jobdir/work"
   echo "compute: $1" >> "$jobdir/log"
   ended=$(date +%s)
   write_status failed "${2:-98}"
@@ -58,8 +65,13 @@ fail() { # <message> [exit_code]
 
 # shellcheck disable=SC1091
 . "$jobdir/job.env"
+sandbox=${JOB_SANDBOX:-}
 secret_names=""
-if [ -f "$jobdir/.secrets.env" ]; then
+if [ -n "$sandbox" ]; then
+  # The job's env and secrets only ever reach the container, as one 0600 file it sources.
+  (umask 077 && cat "$jobdir/user.env" "$jobdir/.secrets.env" > "$jobdir/container.env" 2>/dev/null)
+  rm -f "$jobdir/user.env" "$jobdir/.secrets.env"
+elif [ -f "$jobdir/.secrets.env" ]; then
   secret_names=$(sed -n 's/^\([A-Za-z_][A-Za-z0-9_]*\)=.*/\1/p' "$jobdir/.secrets.env")
   set -a
   # shellcheck disable=SC1091
@@ -126,10 +138,22 @@ if [ "${JOB_DISK_MB:-0}" -gt 0 ]; then
   fi
 fi
 
-cd "$JOB_SNAPSHOT_DIR" || fail "cannot enter $JOB_SNAPSHOT_DIR"
-cmd=$(cat "$jobdir/command")
 runtime=${JOB_RUNTIME:-native}
 container_name="compute-$JOB_ID${NODE_RANK:+-$NODE_RANK}"
+guard_name="compute-net-$JOB_ID"
+if [ -n "$sandbox" ]; then
+  case "$runtime" in docker|apptainer) ;; *) fail "sandboxed jobs need Docker or Apptainer; $host has neither for this job" ;; esac
+  [ -z "${NODE_RANK:-}" ] || fail "sandboxed jobs run on one node"
+  # A private copy of the snapshot (a copy-on-write clone where the filesystem has them): the
+  # shared one is also what native jobs run from.
+  work="$jobdir/work"
+  rm -rf "$work"
+  cp -cR "$JOB_SNAPSHOT_DIR" "$work" 2>/dev/null || { rm -rf "$work"; cp -a --reflink=auto "$JOB_SNAPSHOT_DIR" "$work" 2>/dev/null; } \
+    || { rm -rf "$work"; cp -pR "$JOB_SNAPSHOT_DIR" "$work"; } || fail "copying the snapshot for the sandbox failed"
+  JOB_SNAPSHOT_DIR=$work
+fi
+cd "$JOB_SNAPSHOT_DIR" || fail "cannot enter $JOB_SNAPSHOT_DIR"
+cmd=$(cat "$jobdir/command")
 
 # Variables passed into a container: the job's env, its secrets and the runner's own.
 pass_names() {
@@ -142,6 +166,46 @@ container_paths() {
   export JOB_SNAPSHOT_DIR=/work JOB_OUTPUT_DIR=/out JOB_INPUT_DIR=/in JOB_DATA_DIR=/data
 }
 in_shell='if command -v bash >/dev/null 2>&1; then exec bash -lc "$0"; else exec sh -c "$0"; fi'
+# Sandboxed: the job's env and secrets are read here, inside the container.
+[ -n "$sandbox" ] && in_shell='set -a; [ -f /run/compute.env ] && . /run/compute.env; set +a; '"$in_shell"
+
+# The network a sandboxed Docker job joins: a guard container's, whose firewall lets out DNS
+# and the internet but nothing private (tailnet 100.64/10, the LAN, link-local, the Docker
+# host) and has no IPv6. The job container lacks NET_ADMIN, so it can't change the rules.
+guard_image=compute-netguard:1
+start_guard() {
+  docker image inspect "$guard_image" >/dev/null 2>&1 \
+    || printf 'FROM alpine:3.20\nRUN apk add --no-cache iptables\n' | docker build -q -t "$guard_image" - >/dev/null \
+    || fail "building the sandbox network guard image failed"
+  docker rm -f "$guard_name" >/dev/null 2>&1
+  local rules
+  rules='set -e
+ns=$(awk "/^nameserver/ {print \$2; exit}" /etc/resolv.conf)
+iptables -A OUTPUT -o lo -j ACCEPT
+if [ -n "$ns" ]; then
+  iptables -A OUTPUT -d "$ns" -p udp --dport 53 -j ACCEPT
+  iptables -A OUTPUT -d "$ns" -p tcp --dport 53 -j ACCEPT
+fi
+for net in 0.0.0.0/8 10.0.0.0/8 100.64.0.0/10 127.0.0.0/8 169.254.0.0/16 172.16.0.0/12 192.168.0.0/16 198.18.0.0/15 224.0.0.0/3; do
+  iptables -A OUTPUT -d "$net" -j REJECT
+done
+touch /tmp/ready
+exec sleep 2147483647'
+  docker run -d --name "$guard_name" --cap-add NET_ADMIN --sysctl net.ipv6.conf.all.disable_ipv6=1 \
+    --sysctl net.ipv6.conf.default.disable_ipv6=1 "$guard_image" sh -c "$rules" >/dev/null \
+    || fail "starting the sandbox network guard failed"
+  for _ in $(seq 1 30); do
+    docker exec "$guard_name" test -f /tmp/ready 2>/dev/null && return 0
+    [ "$(docker inspect -f '{{.State.Running}}' "$guard_name" 2>/dev/null)" = true ] || break
+    sleep 1
+  done
+  docker logs "$guard_name" >> "$jobdir/log" 2>&1
+  docker rm -f "$guard_name" >/dev/null 2>&1
+  fail "the sandbox network guard didn't come up"
+}
+stop_guard() {
+  [ -n "$sandbox" ] && [ "$runtime" = docker ] && docker rm -f "$guard_name" >/dev/null 2>&1
+}
 
 start_docker() {
   command -v docker >/dev/null 2>&1 || fail "docker not found on $host"
@@ -168,6 +232,12 @@ start_docker() {
     done
   fi
   [ -n "${NODE_RANK:-}" ] && args+=(--network host --ipc host)
+  if [ -n "$sandbox" ]; then
+    start_guard
+    args+=(--network "container:$guard_name" --security-opt no-new-privileges
+           --cap-drop NET_ADMIN --cap-drop NET_RAW --pids-limit 8192)
+    [ -f "$jobdir/container.env" ] && args+=(-v "$jobdir/container.env:/run/compute.env:ro")
+  fi
   for n in $(pass_names); do args+=(-e "$n"); done
   args+=("$JOB_IMAGE" sh -c "$in_shell" "$cmd")
   set -m
@@ -207,13 +277,20 @@ start_apptainer() {
       [ -n "$name" ] && binds="$binds,$path:/data/$name:ro"
     done < "$jobdir/datasets"
   fi
-  local nv=""
+  local nv="" contain=""
   [ "${JOB_GPUS:-0}" -gt 0 ] && nv="--nv"
+  if [ -n "$sandbox" ]; then
+    # No home, /tmp, working directory or site bind paths from the host; own PID and IPC
+    # namespaces.
+    contain="--containall --no-mount bind-paths,home,tmp,cwd"
+    [ -f "$jobdir/container.env" ] && binds="$binds,$jobdir/container.env:/run/compute.env:ro"
+  fi
   set -m
   (
     container_paths
     for n in $(pass_names); do export "APPTAINERENV_$n=${!n}"; done
-    exec apptainer exec --cleanenv $nv --bind "$binds" --pwd /work "$sif" sh -c "$in_shell" "$cmd"
+    # shellcheck disable=SC2086  # option lists, split on purpose
+    exec apptainer exec --cleanenv $contain $nv --bind "$binds" --pwd /work "$sif" sh -c "$in_shell" "$cmd"
   ) >> "$jobdir/log" 2>&1 < /dev/null &
   pid=$!
   set +m
@@ -272,6 +349,7 @@ sample_metrics() {
 
 kill_job() {
   [ "$runtime" = docker ] && docker rm -f "$container_name" >/dev/null 2>&1
+  stop_guard
   kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
   for _ in 1 2 3 4 5; do
     kill -0 "$pid" 2>/dev/null || return 0
@@ -321,6 +399,9 @@ if [ "$runtime" = docker ]; then
   [ "$(docker inspect -f '{{.State.OOMKilled}}' "$container_name" 2>/dev/null)" = true ] && oomed=1
   docker rm -f "$container_name" >/dev/null 2>&1
 fi
+stop_guard
+rm -f "$jobdir/container.env"
+[ -n "$sandbox" ] && rm -rf "$jobdir/work"
 [ "$(oom_kills)" -gt "${oom_before:-0}" ] 2>/dev/null && oomed=1
 if [ "$final" = failed ]; then
   if [ -n "$oomed" ]; then

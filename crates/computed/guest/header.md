@@ -30,21 +30,27 @@ When `COMPUTE_URL` is an `https://` address (through Cloudflare):
 - Request bodies over 100 MB are refused (HTTP 413). Keep snapshots small (code only; data
   goes in datasets registered from a URL or Hugging Face). If a dataset must be uploaded from
   here and is over 100 MB, ask {{OWNER}}.
-- Logins are rate-limited: a Cloudflare 429 or `rate_limited` means wait a minute and retry.
+- Logins are rate-limited: a Cloudflare 429 means wait a minute and retry.
 
-## House rules (this is a shared network)
+## Guest keys: what the network enforces
 
-Every key has full access to the API, so these rules are what keeps it working for everyone:
+Unless {{OWNER}} made your key an owner, it is a guest key (`GET /v1/whoami` says
+`"scope": "guest"`), and the daemon enforces this:
 
-- **Only touch your own jobs.** Each job's `submitted_by` is the submitter's name; yours is
-  `name` in `GET /v1/whoami`. Never cancel, delete outputs of, or reuse outputs from a job that
-  isn't yours. When reporting to the user, show their own jobs.
-- **Never use secrets you didn't create.** `GET /v1/secrets` lists everyone's secrets by name.
-  Only reference a secret the user created, and name new ones with the user's name as a prefix
-  (e.g. `alice-wandb`, not `wandb`). Never read, replace or delete anyone else's.
-- **Don't change shared settings.** Never call `/v1/backends/{name}/enable` or `/disable`, and
-  never delete dataset copies you didn't upload.
-- **Paid clouds spend {{OWNER}}'s money.** Don't submit a job that would run on a paid backend
-  (a cost in its quote) unless the user says {{OWNER}} agreed to it.
-- **Be modest with shared GPUs.** Ask for the GPUs, memory and time the job needs, not the most
-  a backend allows. Cancel jobs you no longer need.
+- **Jobs run sandboxed in a container.** Every job needs `container.image`, a public image
+  (e.g. `{"image": "python:3.12"}` or your own pushed to a public registry); guests can't build
+  images here (`container.build`). The job gets a private copy of the code at `/work`, its
+  outputs at `/out`, inputs at `/in` and datasets at `/data/<name>`, nothing else from the host.
+  The network outside is reachable (pip, Hugging Face), the tailnet and private networks are
+  not. Env and secrets are visible only inside the container.
+- **One node, no paid clouds.** `max_cost_usd` and `resources.nodes > 1` are refused.
+- **Your own things only.** Logs, metrics, outputs, cancel and delete-outputs work on your own
+  jobs; other jobs show their state but not their command or env. Secrets, datasets and
+  snapshots are visible and usable only by whoever created them (a snapshot counts as yours
+  once you've uploaded it). Datasets come from uploads, Hugging Face or your own jobs' outputs,
+  not from directories on the hosts or their rclone remotes.
+- **Shared settings are the owner's.** Turning backends on or off, image builds and Slurm queue
+  views are refused (403).
+
+Errors for these say `guest_sandbox`, `not_yours` or `forbidden`. Still be modest with shared
+GPUs: ask for the GPUs, memory and time the job needs, and cancel jobs you no longer need.

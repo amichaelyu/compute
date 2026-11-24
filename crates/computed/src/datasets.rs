@@ -222,11 +222,11 @@ impl Scheduler {
     }
 
     /// Stores an uploaded tar.zst as a new version of `name`.
-    pub async fn upload_dataset(&self, name: &str, description: String, body: axum::body::Body) -> Result<(DatasetRow, bool), ApiError> {
+    pub async fn upload_dataset(&self, name: &str, description: String, expected: Option<u64>, body: axum::body::Body) -> Result<(DatasetRow, bool), ApiError> {
         if !valid_dir_name(name) {
             return Err(ApiError::bad_request("dataset name is invalid", "use letters, digits, _ . and -"));
         }
-        let (sha, size) = crate::snapshots::store_blob(&self.paths.datasets_dir(), body, 512 * 1024 * 1024 * 1024).await?;
+        let (sha, size) = crate::snapshots::store_blob(&self.paths.datasets_dir(), body, 512 * 1024 * 1024 * 1024, expected).await?;
         let row = DatasetRow {
             name: name.to_string(),
             version: sha[..12].to_string(),

@@ -116,7 +116,7 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   return body as T;
 }
 
-export const whoami = () => api<{ identity: string; name?: string; scope: "full" | "dashboard" }>("/v1/whoami");
+export const whoami = () => api<{ identity: string; name?: string; scope: "full" | "guest" | "dashboard" }>("/v1/whoami");
 
 /** A key in allowed_signers: someone who may use the API. */
 export interface User {
@@ -124,6 +124,8 @@ export interface User {
   fingerprint: string;
   key_type: string;
   comment: string;
+  /** Why this key can't sign in (an unsupported option, or outside its validity window). */
+  note?: string;
 }
 export const listUsers = () => api<{ users: User[] }>("/v1/users").then((r) => r.users);
 export const addUser = (name: string, public_key: string) =>

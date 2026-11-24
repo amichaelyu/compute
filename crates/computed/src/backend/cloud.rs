@@ -256,6 +256,7 @@ fn daemon_pubkey() -> Option<String> {
 
 impl CloudBackend {
     pub fn new(cfg: BackendConfig, paths: &Paths, store: Arc<Store>) -> Result<CloudBackend> {
+        let _ = KNOWN_HOSTS_DIR.set(paths.state_dir.join("cloud_known_hosts"));
         let ccfg = cfg.cloud.clone().unwrap_or_default();
         let key_file = paths.config_dir.join(ccfg.key_file.clone().unwrap_or_else(|| match cfg.kind {
             BackendKind::Modal => "modal.toml".into(),
@@ -483,6 +484,7 @@ impl CloudBackend {
         let _ = tokio::fs::create_dir_all(local.join("out")).await;
         let mut result: Collected = Collected { result: (forced, None, None, Some(Utc::now()), None) };
         let mut statuses = Vec::new();
+        let mut outputs_from: Option<(Arc<dyn Shell>, String)> = None;
         for rank in 0..nodes {
             let Ok(remote) = self.remote(inst, rank) else { continue };
             let status = remote.read_statuses(&[job.id]).await.ok().and_then(|m| m.get(&job.id).cloned());
@@ -508,13 +510,22 @@ impl CloudBackend {
                     {
                         let _ = tokio::io::copy(&mut r, &mut f).await;
                     }
-                    let glob = job.spec.keep_outputs.clone().filter(|g| g != "**" && g != "*");
-                    if let Ok(data) = shell.pipe_out(&tar_dir_script(&format!("{jobdir}/out"), glob.as_deref())).await {
-                        let dest = shell_quote(&local.join("out").to_string_lossy());
-                        if let Err(e) = LocalShell.pipe_in(&format!("tar -x -C {dest}"), data).await {
-                            tracing::warn!("copying outputs of job {} off {}: {e:#}", job.id, inst.name);
-                        }
-                    }
+                    outputs_from = Some((shell, jobdir));
+                }
+            }
+        }
+        // Outputs last, once every file the daemon writes itself is in place: the archive comes
+        // from the job, so a symlink in it must never be written through. Symlinks are dropped
+        // after unpacking (tar itself refuses `..` and absolute member names).
+        if let Some((shell, jobdir)) = outputs_from {
+            let glob = job.spec.keep_outputs.clone().filter(|g| g != "**" && g != "*");
+            if let Ok(data) = shell.pipe_out(&tar_dir_script(&format!("{jobdir}/out"), glob.as_deref())).await {
+                let dest = shell_quote(&local.join("out").to_string_lossy());
+                if let Err(e) = LocalShell
+                    .pipe_in(&format!("tar -x --no-same-owner -C {dest}; s=$?; find {dest} -type l -exec rm -f {{}} +; exit $s"), data)
+                    .await
+                {
+                    tracing::warn!("copying outputs of job {} off {}: {e:#}", job.id, inst.name);
                 }
             }
         }
@@ -1079,6 +1090,18 @@ fn read_key(path: &Path) -> Result<String> {
     Ok(k)
 }
 
+/// Where cloud nodes' host keys are pinned: one known_hosts file per address, set at startup.
+static KNOWN_HOSTS_DIR: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+fn known_hosts_file(addr: &SshAddr) -> std::path::PathBuf {
+    let dir = KNOWN_HOSTS_DIR.get_or_init(|| std::env::temp_dir().join("compute-known-hosts"));
+    let safe: String = format!("{}_{}", addr.host, addr.port)
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() || c == '.' || c == '-' { c } else { '_' })
+        .collect();
+    dir.join(safe)
+}
+
 fn ssh_shell(addr: &SshAddr, name: &str) -> Arc<dyn Shell> {
     Arc::new(Ssh {
         host: addr.host.clone(),
@@ -1086,11 +1109,18 @@ fn ssh_shell(addr: &SshAddr, name: &str) -> Arc<dyn Shell> {
         port: Some(addr.port),
         tunnel: false,
         alias: name.to_string(),
-        ephemeral: true,
+        known_hosts: Some(known_hosts_file(addr)),
     })
 }
 
+/// First contact with a new instance: forgets whatever an earlier instance at the same
+/// address presented, so this one's host key is pinned now, before staging sends secrets.
 async fn wait_ssh(addr: &SshAddr, name: &str, deadline: Instant) -> Result<()> {
+    let file = known_hosts_file(addr);
+    if let Some(dir) = file.parent() {
+        tokio::fs::create_dir_all(dir).await.with_context(|| format!("creating {}", dir.display()))?;
+    }
+    let _ = tokio::fs::remove_file(&file).await;
     let shell = ssh_shell(addr, name);
     let mut last = String::new();
     while Instant::now() < deadline {

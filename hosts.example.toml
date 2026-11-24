@@ -46,6 +46,12 @@
 listen = "127.0.0.1:8765"   # COMPUTE_LISTEN overrides this (deploy sets the tailnet address)
 tz = "America/Los_Angeles"
 
+# allowed_signers principals with full access. Every other key is a guest: its jobs run in a
+# container cut off from the hosts (a private copy of the code, no tailnet/LAN, env and
+# secrets only inside the container), it can't use paid backends or build images, and it only
+# sees and uses its own jobs' details, secrets, datasets and snapshots. Empty: no guests.
+owners = ["me"]
+
 # Image builds (`container.build`) run on the builder with docker buildx and push to
 # <prefix>:<hash>. The prefix comes from COMPUTE_REGISTRY_PREFIX (computed.env) when not set
 # here. `secret` names a secret holding REGISTRY_USERNAME / REGISTRY_PASSWORD, used only to push:

@@ -126,6 +126,10 @@ async fn serve() -> Result<()> {
     }
 
     let store = Arc::new(store::Store::open(&paths.db())?);
+    let scrubbed = store.scrub_dashboard_emails(&format!("{} (dashboard)", users::owner_name()))?;
+    if scrubbed > 0 {
+        tracing::info!("replaced dashboard emails in {scrubbed} cancel records");
+    }
     let tunnels = Arc::new(transport::Tunnels::default());
     let secrets = Arc::new(secrets::Secrets::new(paths.secrets_dir()));
     let mut backends: Vec<Arc<dyn Backend>> = Vec::new();
@@ -160,7 +164,13 @@ async fn serve() -> Result<()> {
         Some(a) => tracing::info!("Cloudflare Access logins enabled for team {}", a.team_domain()),
         None => tracing::info!("Cloudflare Access logins disabled (COMPUTE_CF_* not set)"),
     }
-    let app = api::router(api::AppState { sched, auth, access, tz });
+    if cfg.owners.is_empty() {
+        tracing::warn!("`owners` is not set in hosts.toml: every key in allowed_signers has full access, none is sandboxed");
+    } else {
+        tracing::info!("owners: {}; every other key is a sandboxed guest", cfg.owners.join(", "));
+    }
+    let owners = Arc::new(cfg.owners.clone());
+    let app = api::router(api::AppState { sched, auth, access, tz, owners });
     // Exit at once on a signal: all state is in SQLite and running jobs outlive the daemon. A
     // graceful shutdown would keep the scheduler running while systemd kills its ssh children,
     // so polls fail and healthy jobs look lost.

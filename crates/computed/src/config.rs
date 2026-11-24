@@ -71,6 +71,11 @@ pub struct Config {
     pub registry: RegistryConfig,
     #[serde(default)]
     pub budget: BudgetConfig,
+    /// `allowed_signers` principals with full access. Every other key is a guest: its jobs run
+    /// sandboxed in a container, and it can only see and use what it created (jobs' logs and
+    /// outputs, secrets, datasets, snapshots). Empty: every key is an owner.
+    #[serde(default)]
+    pub owners: Vec<String>,
 }
 
 /// Where image builds are pushed, and who builds them.

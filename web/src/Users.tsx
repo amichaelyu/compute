@@ -89,6 +89,7 @@ function UserRow({ u, onRemoved }: { u: User; onRemoved: () => void }) {
       <span className="muted small user-key" title={u.fingerprint}>
         {u.key_type.replace(/^ssh-/, "")} {u.fingerprint.replace(/^SHA256:/, "").slice(0, 12)}…{u.comment && ` ${u.comment}`}
       </span>
+      {u.note && <span className="error small">Can't sign in: {u.note}</span>}
       {confirm ? (
         <span className="confirm" role="group" aria-label={`Confirm removing ${u.name}`}>
           <span>Remove {u.name || "this key"} and sign them out?</span>

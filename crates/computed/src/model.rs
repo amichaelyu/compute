@@ -231,6 +231,10 @@ pub struct JobSpec {
     pub max_cost_usd: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub keep_outputs: Option<String>,
+    /// A guest's job: it runs in a container cut off from the host (a private copy of the
+    /// snapshot, no host paths, no tailnet or LAN).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub sandbox: bool,
 }
 
 impl JobSpec {
