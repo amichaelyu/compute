@@ -15,6 +15,7 @@ mod snapshots;
 mod store;
 mod transport;
 mod ui;
+mod users;
 
 use anyhow::{Context, Result};
 use backend::Backend;

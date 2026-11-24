@@ -60,6 +60,8 @@ The daemon reads `$COMPUTE_CONFIG_DIR` (default `~/.config/compute`):
   - `COMPUTE_LISTEN` sets the address to listen on.
   - `COMPUTE_CF_TEAM_DOMAIN`, `COMPUTE_CF_AUD` and `COMPUTE_CF_EMAILS` turn on Cloudflare Access
     logins for the dashboard.
+  - `COMPUTE_OWNER` is your name as shown to the people you share the network with (in the
+    skill served at `/v1/skill`).
   - `COMPUTE_REGISTRY_PREFIX` (e.g. `ghcr.io/<owner>/compute`) turns on image builds. See
     [Images](#images).
 
@@ -171,7 +173,12 @@ responses that take over 100 s), and request bodies over 100 MB are refused, so 
 and dataset uploads need the private address. The daemon also refuses new login challenges
 while 1024 are outstanding.
 
-To let someone in, add their public key to `allowed_signers`; to revoke them, delete the line.
-The daemon re-reads the file on every login. Their current session stays valid until it
-expires (12 h at most). Every key has full access: all jobs, all secrets (jobs may use any of
-them), the cloud budget, and every backend, including Slurm accounts that are yours alone.
+To let someone in, they run `curl -fsSL https://compute.example.com/api/v1/install | sh`. The
+script is public and holds no secrets. Until their key is allowed, it prints their public key
+line. Paste it on the dashboard's **Users** page (or add it to `allowed_signers` by hand); then
+the same command signs them in, writes their `client.env` and installs the compute skill
+(`GET /v1/skill`, behind the SSH-key login), which adds house rules for a shared network.
+Removing someone on the Users page deletes their line and ends their sessions at once. Only a
+Cloudflare Access login can manage users; SSH keys can't. Every key has full access: all jobs,
+all secrets (jobs may use any of them), the cloud budget, and every backend, including Slurm
+accounts that are yours alone.

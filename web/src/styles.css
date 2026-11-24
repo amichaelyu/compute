@@ -366,7 +366,9 @@ button {
 
 input[type="search"],
 input[type="password"],
-input[type="time"] {
+input[type="time"],
+input[type="text"],
+textarea {
   font: inherit;
   color: var(--ink);
   background: var(--raised);
@@ -716,6 +718,84 @@ input[type="search"] {
   gap: 0.4rem;
   align-items: center;
   color: var(--graphite);
+}
+
+/* ---------------------------------------------------------------- users */
+
+.users {
+  display: grid;
+  gap: 2.5rem;
+  max-width: 48rem;
+}
+
+.users h2 {
+  font-size: 1.1rem;
+  margin: 0 0 0.5rem;
+}
+
+.install {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  margin: 0.75rem 0 1.25rem;
+}
+
+.install code {
+  flex: 1;
+  min-width: 0;
+  overflow-x: auto;
+  white-space: nowrap;
+  background: var(--raised);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  padding: 0.4rem 0.6rem;
+}
+
+.add-user {
+  display: grid;
+  gap: 0.75rem;
+}
+
+.add-user label {
+  display: grid;
+  gap: 0.25rem;
+}
+
+.add-user input {
+  width: min(16rem, 100%);
+}
+
+.add-user textarea {
+  resize: vertical;
+  word-break: break-all;
+}
+
+.user-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border-top: 1px solid var(--rule);
+}
+
+.user {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.25rem 1rem;
+  align-items: center;
+  padding: 0.6rem 0;
+  border-bottom: 1px solid var(--rule);
+}
+
+.user-name {
+  min-width: 8rem;
+}
+
+.user-key {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 /* ---------------------------------------------------------------- sign in */

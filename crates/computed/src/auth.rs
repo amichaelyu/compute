@@ -64,6 +64,10 @@ impl Auth {
         Auth { allowed_signers, store, nonces: Mutex::new(HashMap::new()) }
     }
 
+    pub fn allowed_signers(&self) -> &std::path::Path {
+        &self.allowed_signers
+    }
+
     pub fn challenge(&self) -> Result<(String, DateTime<Utc>), ApiError> {
         let nonce = random_hex();
         let mut map = self.nonces.lock().unwrap_or_else(|e| e.into_inner());

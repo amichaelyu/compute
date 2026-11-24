@@ -116,7 +116,22 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
   return body as T;
 }
 
-export const whoami = () => api<{ identity: string; scope: "full" | "dashboard" }>("/v1/whoami");
+export const whoami = () => api<{ identity: string; name?: string; scope: "full" | "dashboard" }>("/v1/whoami");
+
+/** A key in allowed_signers: someone who may use the API. */
+export interface User {
+  name: string;
+  fingerprint: string;
+  key_type: string;
+  comment: string;
+}
+export const listUsers = () => api<{ users: User[] }>("/v1/users").then((r) => r.users);
+export const addUser = (name: string, public_key: string) =>
+  api<User>("/v1/users", { method: "POST", body: JSON.stringify({ name, public_key }) });
+export const removeUser = (fingerprint: string) =>
+  api<{ removed: User[]; sessions_ended: number }>(`/v1/users?fingerprint=${encodeURIComponent(fingerprint)}`, {
+    method: "DELETE",
+  });
 
 export const listJobs = (params: { state?: JobState[]; q?: string; limit?: number }) => {
   const sp = new URLSearchParams({ limit: String(params.limit ?? 300) });

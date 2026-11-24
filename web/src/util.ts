@@ -105,11 +105,12 @@ export function useNow(every = 30_000) {
   return now;
 }
 
-export type Route = { view: "jobs"; job: number | null } | { view: "backends"; job: number | null };
+export type Route = { view: "jobs" | "backends" | "users"; job: number | null };
 
 function parseHash(h: string): Route {
   const parts = h.replace(/^#\/?/, "").split("/").filter(Boolean);
   if (parts[0] === "backends") return { view: "backends", job: null };
+  if (parts[0] === "users") return { view: "users", job: null };
   if (parts[0] === "jobs" && parts[1] && /^\d+$/.test(parts[1])) return { view: "jobs", job: Number(parts[1]) };
   return { view: "jobs", job: null };
 }

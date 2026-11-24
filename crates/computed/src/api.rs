@@ -10,7 +10,7 @@ use crate::store::JobFilter;
 use async_compression::tokio::bufread::ZstdEncoder;
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
-use axum::extract::{DefaultBodyLimit, FromRequestParts, Path, Query, State};
+use axum::extract::{DefaultBodyLimit, FromRequestParts, OriginalUri, Path, Query, State};
 use axum::http::request::Parts;
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
@@ -66,7 +66,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/images", get(list_images))
         .route("/v1/images/{key}/logs", get(image_logs))
         .route("/v1/budget", get(budget))
-        .route("/v1/whoami", get(whoami));
+        .route("/v1/whoami", get(whoami))
+        .route("/v1/users", get(list_users).post(add_user).delete(remove_user))
+        .route("/v1/install", get(install_script))
+        .route("/v1/skill", get(guest_skill));
     Router::new()
         .merge(api.clone())
         .nest("/api", api)
@@ -147,6 +150,7 @@ async fn whoami(sess: Session) -> Json<Value> {
 const CHANGES: &[(&str, &str)] = &[
     ("2026-11-24", "submitted_by is the submitting key's nickname (its allowed_signers principal; submitted_by_key is the fingerprint), and cancelled jobs have cancelled_by {name, key, at}. GET /v1/whoami shows your name."),
     ("2026-11-24", "Job JSON always has command, env, snapshot and snapshot_created_at; list items have resources. GET /v1/jobs/{id}/outputs/list lists output files with sizes; /outputs answers 404 no_outputs when nothing matches and 410 once outputs are deleted; DELETE /v1/jobs/{id}/outputs frees a finished job's disk. /logs?tail=N gives the last N bytes. A cancel's reason says who cancelled. Long titles are shortened, not refused. retries defaults to 1."),
+    ("2026-11-24", "GET /v1/skill: this skill for people using the network (install or update it with `curl -fsSL $COMPUTE_URL/v1/install | sh`). /v1/users lists, adds and removes users (dashboard owner only)."),
     ("2026-11-24", "The API is also served under /api (e.g. /api/v1/jobs), which is how it is reached on the public hostname."),
     ("2026-11-24", "Through the public Cloudflare hostname, wait returns after at most 90 s and uploads over 100 MB are refused. POST /v1/auth/challenge can return 429 rate_limited."),
     ("2026-11-24", "resources.disk_gb: free disk the job needs; the runner checks it before starting, and cloud offers must have it. Failed jobs say in their reason when they ran out of memory or disk."),
@@ -1102,6 +1106,78 @@ async fn disable_backend(State(s): State<AppState>, _sess: Session, Path(name): 
     let mut v = backend_summary(&s, &name).await?;
     v["note"] = "draining: running jobs finish, no new jobs start".into();
     Ok(Json(v))
+}
+
+// ------------------------------------------------------------------ users
+
+impl Session {
+    /// Deciding who may use the API takes the owner: a Cloudflare Access login on the
+    /// dashboard. SSH keys (including guests') can't add or remove keys.
+    fn require_owner(&self) -> ApiResult<()> {
+        if self.fingerprint.starts_with("cf:") {
+            return Ok(());
+        }
+        Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "only the owner manages users, from the dashboard",
+            "open the dashboard and sign in through Cloudflare Access",
+        ))
+    }
+}
+
+async fn list_users(State(s): State<AppState>, sess: Session) -> ApiResult<Json<Value>> {
+    sess.require_owner()?;
+    let users = crate::users::list(s.auth.allowed_signers())?;
+    Ok(Json(json!({"users": users})))
+}
+
+#[derive(Deserialize)]
+struct AddUserReq {
+    name: String,
+    public_key: String,
+}
+
+async fn add_user(State(s): State<AppState>, sess: Session, body: Result<Json<AddUserReq>, JsonRejection>) -> ApiResult<Json<Value>> {
+    sess.require_owner()?;
+    let Json(req) = body.map_err(json_err)?;
+    let user = crate::users::add(s.auth.allowed_signers(), &req.name, &req.public_key)?;
+    s.sched.store.set_key_name(&user.fingerprint, &user.name)?;
+    Ok(Json(json!(user)))
+}
+
+#[derive(Deserialize)]
+struct FingerprintQuery {
+    fingerprint: String,
+}
+
+/// Removes a key and ends its sessions now, rather than when they expire.
+async fn remove_user(State(s): State<AppState>, sess: Session, Query(q): Query<FingerprintQuery>) -> ApiResult<Json<Value>> {
+    sess.require_owner()?;
+    let removed = crate::users::remove(s.auth.allowed_signers(), &q.fingerprint)?;
+    let ended = s.sched.store.delete_sessions(&q.fingerprint)?;
+    Ok(Json(json!({"removed": removed, "sessions_ended": ended})))
+}
+
+/// The one-command setup (`curl -fsSL <url>/v1/install | sh`). Public: it holds no secrets, and
+/// signs in with the caller's own key before fetching the skill.
+async fn install_script(headers: HeaderMap, OriginalUri(uri): OriginalUri) -> Response {
+    let url = crate::users::base_url(&headers, uri.path());
+    (
+        [(header::CONTENT_TYPE, "text/x-shellscript; charset=utf-8"), (header::CACHE_CONTROL, "no-store")],
+        crate::users::install_script(&url),
+    )
+        .into_response()
+}
+
+/// The compute skill for people using this network, with its URL filled in.
+async fn guest_skill(_sess: Session, headers: HeaderMap, OriginalUri(uri): OriginalUri) -> Response {
+    let url = crate::users::base_url(&headers, uri.path());
+    (
+        [(header::CONTENT_TYPE, "text/markdown; charset=utf-8"), (header::CACHE_CONTROL, "no-store")],
+        crate::users::skill(&url),
+    )
+        .into_response()
 }
 
 // ------------------------------------------------------------------ secrets

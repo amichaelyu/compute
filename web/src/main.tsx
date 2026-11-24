@@ -6,6 +6,7 @@ import { JobList } from "./JobList";
 import { JobPanel } from "./JobPanel";
 import { Lanes } from "./Lanes";
 import { SignIn } from "./SignIn";
+import { Users } from "./Users";
 import { useNow, usePoll, useRoute } from "./util";
 
 /** Reloads the page when the daemon serves a newer dashboard build, so an open tab never runs
@@ -71,6 +72,11 @@ function App() {
           <a href="#/backends" aria-current={route.view === "backends" ? "page" : undefined}>
             Backends
           </a>
+          {me.data?.scope === "dashboard" && (
+            <a href="#/users" aria-current={route.view === "users" ? "page" : undefined}>
+              Users
+            </a>
+          )}
         </nav>
         <span className="who">
           {token.get() && (
@@ -90,6 +96,8 @@ function App() {
       <main className="main">
         {route.view === "backends" ? (
           <Backends />
+        ) : route.view === "users" ? (
+          <Users />
         ) : (
           <>
             <Lanes jobs={jobs.data ?? []} backends={backends.data ?? []} queues={queues.data ?? {}} now={now} />

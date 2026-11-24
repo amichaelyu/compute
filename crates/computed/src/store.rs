@@ -446,6 +446,11 @@ impl Store {
         Ok(row.and_then(|(f, e)| parse_ts(Some(e)).map(|e| (f, e))))
     }
 
+    /// Ends every session of a key (when it's removed); returns how many there were.
+    pub fn delete_sessions(&self, fingerprint: &str) -> Result<usize> {
+        Ok(self.conn().execute("DELETE FROM sessions WHERE fingerprint = ?1", params![fingerprint])?)
+    }
+
     // ---- who did what ----
 
     /// The nickname (allowed_signers principal) of an SSH key, recorded at login. Kept after
