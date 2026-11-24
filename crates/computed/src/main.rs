@@ -1,5 +1,6 @@
 //! computed: the compute scheduler daemon.
 
+mod access;
 mod api;
 mod auth;
 mod backend;
@@ -11,6 +12,7 @@ mod secrets;
 mod snapshots;
 mod store;
 mod transport;
+mod ui;
 
 use anyhow::{Context, Result};
 use backend::Backend;
@@ -76,7 +78,12 @@ async fn serve() -> Result<()> {
         .await
         .with_context(|| format!("binding {listen}"))?;
     tracing::info!("computed {} listening on {listen}", env!("CARGO_PKG_VERSION"));
-    let app = api::router(api::AppState { sched, auth, tz });
+    let access = access::Access::from_env().map(Arc::new);
+    match &access {
+        Some(a) => tracing::info!("Cloudflare Access logins enabled for team {}", a.team_domain()),
+        None => tracing::info!("Cloudflare Access logins disabled (COMPUTE_CF_* not set)"),
+    }
+    let app = api::router(api::AppState { sched, auth, access, tz });
     axum::serve(listener, app).with_graceful_shutdown(shutdown()).await?;
     Ok(())
 }

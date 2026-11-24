@@ -30,6 +30,7 @@ use tokio_util::io::ReaderStream;
 pub struct AppState {
     pub sched: Arc<Scheduler>,
     pub auth: Arc<Auth>,
+    pub access: Option<Arc<crate::access::Access>>,
     pub tz: Tz,
 }
 
@@ -53,15 +54,37 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/backends/{name}/disable", post(disable_backend))
         .route("/v1/secrets", get(list_secrets))
         .route("/v1/secrets/{name}", put(put_secret).delete(delete_secret))
+        .route("/v1/whoami", get(whoami))
+        .fallback(crate::ui::serve)
         .with_state(state)
 }
 
 // ------------------------------------------------------------------ auth
 
-/// An authenticated request; holds the fingerprint of the key that signed the session.
+/// An authenticated request. `fingerprint` is the SSH key that signed an API session, or
+/// `cf:<email>` for a dashboard request that passed Cloudflare Access.
 pub struct Session {
     pub fingerprint: String,
+    /// SSH-key sessions have full access; Access (browser) sessions only view and do safe actions.
+    pub full: bool,
 }
+
+impl Session {
+    /// Submitting jobs, uploading code and changing secrets need an SSH-key session.
+    pub fn require_full(&self) -> ApiResult<()> {
+        if self.full {
+            return Ok(());
+        }
+        Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "forbidden",
+            "the dashboard can view jobs, cancel them and turn backends on or off, nothing more",
+            "use an SSH-key session (the compute skill) for this",
+        ))
+    }
+}
+
+const ACCESS_HEADER: &str = "cf-access-jwt-assertion";
 
 impl FromRequestParts<AppState> for Session {
     type Rejection = ApiError;
@@ -70,13 +93,32 @@ impl FromRequestParts<AppState> for Session {
             .headers
             .get(header::AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Bearer "))
-            .ok_or_else(|| ApiError::unauthorized("missing `Authorization: Bearer <session>`"))?;
-        match state.auth.session(bearer.trim())? {
-            Some(fingerprint) => Ok(Session { fingerprint }),
-            None => Err(ApiError::unauthorized("session expired or unknown")),
+            .and_then(|v| v.strip_prefix("Bearer "));
+        if let Some(bearer) = bearer {
+            return match state.auth.session(bearer.trim())? {
+                Some(fingerprint) => Ok(Session { fingerprint, full: true }),
+                None => Err(ApiError::unauthorized("session expired or unknown")),
+            };
+        }
+        let jwt = parts.headers.get(ACCESS_HEADER).and_then(|v| v.to_str().ok());
+        match (jwt, &state.access) {
+            (Some(token), Some(access)) => match access.verify(token).await {
+                Ok(email) => Ok(Session { fingerprint: format!("cf:{email}"), full: false }),
+                Err(e) => {
+                    tracing::warn!("Access token rejected: {e:#}");
+                    Err(ApiError::unauthorized(format!("Cloudflare Access login rejected: {e}")))
+                }
+            },
+            _ => Err(ApiError::unauthorized("missing `Authorization: Bearer <session>`")),
         }
     }
+}
+
+async fn whoami(sess: Session) -> Json<Value> {
+    Json(json!({
+        "identity": sess.fingerprint,
+        "scope": if sess.full { "full" } else { "dashboard" },
+    }))
 }
 
 async fn root() -> Json<Value> {
@@ -115,7 +157,8 @@ fn fmt_opt(tz: &Tz, t: Option<DateTime<Utc>>) -> Value {
 
 // ------------------------------------------------------------------ snapshots
 
-async fn upload_snapshot(State(s): State<AppState>, _sess: Session, body: Body) -> ApiResult<Json<Value>> {
+async fn upload_snapshot(State(s): State<AppState>, sess: Session, body: Body) -> ApiResult<Json<Value>> {
+    sess.require_full()?;
     let (id, existed) = s.sched.snapshots.store(body).await?;
     Ok(Json(json!({"id": id, "existed": existed})))
 }
@@ -141,6 +184,7 @@ fn quote_line(tz: &Tz, q: &Quote) -> String {
 }
 
 async fn submit(State(s): State<AppState>, sess: Session, body: Result<Json<JobRequest>, JsonRejection>) -> ApiResult<Response> {
+    sess.require_full()?;
     let Json(req) = body.map_err(json_err)?;
     let res = req.validate()?;
     if let Some(list) = &req.backends {
@@ -280,9 +324,13 @@ fn job_short(tz: &Tz, j: &Job) -> Value {
         "title": j.title,
         "state": j.state,
         "backend": j.backend,
+        "reason": j.reason,
         "created_at": fmt(tz, j.created_at),
         "started_at": fmt_opt(tz, j.started_at),
         "ended_at": fmt_opt(tz, j.ended_at),
+        "estimated_start": fmt_opt(tz, j.est_start),
+        "estimated_finish": fmt_opt(tz, j.est_finish),
+        "time_s": j.resources.time_s,
         "exit_code": j.exit_code,
     })
 }
@@ -659,17 +707,19 @@ struct SecretReq {
 
 async fn put_secret(
     State(s): State<AppState>,
-    _sess: Session,
+    sess: Session,
     Path(name): Path<String>,
     body: Result<Json<SecretReq>, JsonRejection>,
 ) -> ApiResult<Json<Value>> {
+    sess.require_full()?;
     let Json(req) = body.map_err(json_err)?;
     let keys: Vec<String> = req.env.keys().cloned().collect();
     s.sched.secrets.put(&name, req.env)?;
     Ok(Json(json!({"name": name, "keys": keys})))
 }
 
-async fn delete_secret(State(s): State<AppState>, _sess: Session, Path(name): Path<String>) -> ApiResult<Json<Value>> {
+async fn delete_secret(State(s): State<AppState>, sess: Session, Path(name): Path<String>) -> ApiResult<Json<Value>> {
+    sess.require_full()?;
     if s.sched.secrets.delete(&name)? {
         Ok(Json(json!({"deleted": name})))
     } else {

@@ -274,8 +274,13 @@ impl Backend for SlurmBackend {
                     let f: Vec<&str> = l.split('|').collect();
                     json!({
                         "nodes": f.first().and_then(|v| v.trim().parse::<u32>().ok()),
-                        "cpus": f.get(1).and_then(|v| v.trim().parse::<u32>().ok()),
-                        "mem_gb": f.get(2).and_then(|v| v.trim().trim_end_matches('+').parse::<u64>().ok()).map(|m| m / 1024),
+                        // Mixed partitions report "80+" (the smallest node, plus); keep it as text.
+                        "cpus": f.get(1).map(|v| v.trim()),
+                        "mem_gb": f.get(2).and_then(|v| {
+                            let v = v.trim();
+                            let plus = if v.ends_with('+') { "+" } else { "" };
+                            v.trim_end_matches('+').parse::<u64>().ok().map(|m| format!("{}{plus}", m / 1024))
+                        }),
                         "gres_or_nodes": f.get(3).map(|v| v.trim()),
                     })
                 })

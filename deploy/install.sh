@@ -25,6 +25,11 @@ target=x86_64-unknown-linux-gnu
 if [ "$mode" = install ]; then
   command -v cargo-zigbuild >/dev/null || { echo "install cargo-zigbuild first (brew install cargo-zigbuild)" >&2; exit 1; }
   rustup target list --installed 2>/dev/null | grep -qx "$target" || rustup target add "$target"
+  if command -v bun >/dev/null; then
+    (cd web && bun install --frozen-lockfile && bun run build)
+  else
+    echo "bun not found: building without rebuilding the dashboard (web/dist as it is)" >&2
+  fi
   cargo zigbuild --release --target "$target" -p computed
 fi
 
