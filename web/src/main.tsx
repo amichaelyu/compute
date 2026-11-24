@@ -1,4 +1,5 @@
 import { createRoot } from "react-dom/client";
+import "./styles.css";
 import { ApiError, listBackends, listJobs, token, whoami } from "./api";
 import { Backends } from "./Backends";
 import { JobList } from "./JobList";
