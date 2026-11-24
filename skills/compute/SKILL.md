@@ -1,24 +1,43 @@
 ---
 name: compute
-description: Run compute jobs (training, eval, sweeps, data processing, anything longer than a few minutes, and all GPU work) on the user's machines through the compute scheduler's HTTP API. Use instead of running long jobs on the MacBook, instead of hand-written sbatch scripts, and whenever work needs FarmShare GPUs or the Mac Mini.
+description: Run compute jobs (training, eval, sweeps, data processing, anything longer than a few minutes, and all GPU work) through the compute scheduler's HTTP API, which places them on the user's machines and clusters. Use instead of running long jobs on the local machine and instead of hand-written sbatch scripts.
 ---
 
 # compute: the job scheduler API (v1)
 
-The daemon places each job on the backend that can start it soonest:
-
-- **farm**: FarmShare Slurm. The only GPUs (L40S, at most 4 per user) and lots of CPU.
-- **mini**: the Mac Mini, macOS/arm64. CPU only.
+A daemon (`computed`) places each job on the backend that can start it soonest: machines it
+reaches directly, and Slurm clusters it submits to. Which backends exist, what hardware they
+have and what they allow all come from the API (`GET /v1/backends`), not from this file.
 
 You describe a job as JSON. The daemon uploads code, picks a backend, runs the job and keeps
 its logs and outputs. This skill targets **API v1**: `GET $COMPUTE_URL/v1/` must list `"v1"`
 in `api_versions`.
 
+## Configuration
+
+Each machine you run agents from has a client config file, `~/.config/compute/client.env`
+(or the path in `$COMPUTE_CLIENT_CONFIG`). It's a shell file of `KEY=value` lines:
+
+```bash
+# ~/.config/compute/client.env
+COMPUTE_URL=http://<coordinator>:8765       # where computed listens (required)
+COMPUTE_KEY=$HOME/.ssh/id_ed25519.pub       # an SSH key in the daemon's allowed_signers (optional)
+```
+
+Environment variables of the same names override the file. If neither sets `COMPUTE_URL`,
+stop and ask the user for the daemon's address; don't guess one.
+
 ## Setup per shell
 
 ```bash
-COMPUTE_URL="${COMPUTE_URL:-http://<coordinator>:8765}"   # the daemon on Wesley
-COMPUTE_KEY="${COMPUTE_KEY:-$HOME/.ssh/id_ed25519.pub}"   # a key listed in the daemon's allowed_signers
+COMPUTE_CLIENT_CONFIG="${COMPUTE_CLIENT_CONFIG:-$HOME/.config/compute/client.env}"
+if [ -f "$COMPUTE_CLIENT_CONFIG" ]; then
+  _url=${COMPUTE_URL-} _key=${COMPUTE_KEY-}
+  set -a; . "$COMPUTE_CLIENT_CONFIG"; set +a
+  COMPUTE_URL=${_url:-${COMPUTE_URL-}} COMPUTE_KEY=${_key:-${COMPUTE_KEY-}}
+fi
+: "${COMPUTE_URL:?set COMPUTE_URL in $COMPUTE_CLIENT_CONFIG}"
+COMPUTE_KEY="${COMPUTE_KEY:-$HOME/.ssh/id_ed25519.pub}"
 mkdir -p ~/.config/compute
 
 compute_login() {   # signs a challenge with your SSH key; the session lasts 12 h
@@ -42,11 +61,12 @@ If any call returns `401` (`"code": "unauthorized"`), run `compute_login` and re
 
 ```bash
 cx "$COMPUTE_URL/v1/backends"                  # one line per backend
-cx "$COMPUTE_URL/v1/backends/farm" | jq .      # hardware, live availability, restrictions
+cx "$COMPUTE_URL/v1/backends/<name>" | jq .    # hardware, live availability, restrictions
 ```
 
 Restrictions are enforced by placement, so pick `cpus`, `mem_gb`, `gpus` and `time` within
-them. On farm, memory is requested as CPUs × 4000 MB, so asking for more memory means more CPUs.
+them. Read them rather than assuming: a Slurm backend, for example, may tie memory to CPU count,
+so asking for more memory also means more CPUs.
 
 ## 2. Upload the code (a snapshot)
 
@@ -97,8 +117,9 @@ Fields:
   - `title` says *what* the job is. `description` says *why* it is being run and what it belongs
     to, so the user can tell jobs apart weeks later.
 - **Resources:** `cpus` (default 1), `mem_gb` (default 4), `gpus` (default 0), `gpu_type`
-  (`"L40S"` or null), `nodes` (1 only for now).
-- **Placement:** `backends` (an allowlist, e.g. `["farm"]`), `os` (`"mac"` or `"linux"`),
+  (a type a backend reports, or null for any), `nodes` (1 only for now).
+- **Placement:** `backends` (an allowlist of backend names from `GET /v1/backends`), `os`
+  (`"mac"` or `"linux"`),
   `priority` (higher starts first in the daemon's queue).
 - **Arrays:** `array: {"count": 100}` makes 100 tasks. `{index}` in `command` becomes the task
   index, also available as `$ARRAY_INDEX`. Tasks spread across backends.
@@ -132,8 +153,8 @@ wouldn't take it). Tell the user:
 
 - where the job runs and why
 - the estimated start and finish, and whether the start is Slurm's estimate or the daemon's
-- for FarmShare GPU jobs, the queue position: `GET /v1/backends/farm` shows `my_pending` and
-  `next_gpu_free_estimate`
+- for jobs on a Slurm backend, where it stands in the queue: `GET /v1/backends/<name>` shows
+  `my_pending` and `next_gpu_free_estimate`
 
 Update the estimate once the first log lines show a real rate.
 
@@ -172,9 +193,10 @@ On `secret_missing`, ask the user for the value; don't go looking for one. Creat
 secret only with a value the user gave you, and only after they asked:
 `cx -X PUT --json '{"env":{"WANDB_API_KEY":"..."}}' "$COMPUTE_URL/v1/secrets/wandb"`.
 
-## 7. The MacBook
+## 7. Long work never runs locally
 
-The MacBook is not a backend. Long jobs never run there: send them through this API instead.
+Don't run long jobs on the machine you're working from; submit them here. Only the backends
+listed by `GET /v1/backends` run jobs.
 
 ## Errors
 

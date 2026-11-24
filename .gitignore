@@ -1,2 +1,4 @@
 target/
 .local/
+# Design notes stay local and are never committed.
+docs/

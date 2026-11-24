@@ -7,9 +7,7 @@ export function SignIn({ onSaved }: { onSaved: () => void }) {
   return (
     <main className="signin">
       <h1>Sign in to see your jobs</h1>
-      <p>
-        Open <a href="https://compute.yumichael.com">compute.yumichael.com</a> and sign in through Cloudflare Access.
-      </p>
+      <p>Open this dashboard at its public address and sign in through Cloudflare Access.</p>
       <p>On the tailnet, you can paste an API session token instead (from ~/.config/compute/session).</p>
       <form
         onSubmit={(e) => {
