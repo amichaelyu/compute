@@ -109,6 +109,17 @@ CREATE TABLE IF NOT EXISTS quotes (
   estimated_cost REAL,
   expires_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS key_names (
+  fingerprint TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS cancels (
+  job_id INTEGER PRIMARY KEY,
+  by_name TEXT NOT NULL,
+  by_key TEXT NOT NULL,
+  at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS outputs_deleted (
   job_id INTEGER PRIMARY KEY,
   deleted_at TEXT NOT NULL,
@@ -433,6 +444,42 @@ impl Store {
             )
             .optional()?;
         Ok(row.and_then(|(f, e)| parse_ts(Some(e)).map(|e| (f, e))))
+    }
+
+    // ---- who did what ----
+
+    /// The nickname (allowed_signers principal) of an SSH key, recorded at login. Kept after
+    /// the key is removed, so old jobs still show who submitted them.
+    pub fn set_key_name(&self, fingerprint: &str, name: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT INTO key_names(fingerprint, name, updated_at) VALUES (?1, ?2, ?3) \
+             ON CONFLICT(fingerprint) DO UPDATE SET name = excluded.name, updated_at = excluded.updated_at",
+            params![fingerprint, name, ts(Utc::now())],
+        )?;
+        Ok(())
+    }
+
+    pub fn key_name(&self, fingerprint: &str) -> Result<Option<String>> {
+        let c = self.conn();
+        Ok(c.query_row("SELECT name FROM key_names WHERE fingerprint = ?1", params![fingerprint], |r| r.get(0)).optional()?)
+    }
+
+    /// Records who cancelled a job (the first cancel counts).
+    pub fn record_cancel(&self, job_id: i64, by_name: &str, by_key: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT OR IGNORE INTO cancels(job_id, by_name, by_key, at) VALUES (?1, ?2, ?3, ?4)",
+            params![job_id, by_name, by_key, ts(Utc::now())],
+        )?;
+        Ok(())
+    }
+
+    /// `(name, key, at)` of whoever cancelled the job.
+    pub fn cancel_of(&self, job_id: i64) -> Result<Option<(String, String, DateTime<Utc>)>> {
+        let c = self.conn();
+        let row: Option<(String, String, String)> = c
+            .query_row("SELECT by_name, by_key, at FROM cancels WHERE job_id = ?1", params![job_id], |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)))
+            .optional()?;
+        Ok(row.and_then(|(n, k, t)| Some((n, k, parse_ts(Some(t))?))))
     }
 
     // ---- backend overrides ----

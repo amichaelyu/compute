@@ -339,6 +339,12 @@ fn print_job(j: &Value) {
         println!("  {r}");
     }
     println!("  backend   {}", j["backend"].as_str().unwrap_or("not placed yet"));
+    if let Some(by) = j["submitted_by"].as_str() {
+        println!("  by        {by}");
+    }
+    if let Some(c) = j["cancelled_by"].as_object() {
+        println!("  cancelled by {} at {}", c["name"].as_str().unwrap_or("?"), c["at"].as_str().unwrap_or("?"));
+    }
     let r = &j["resources"];
     if r.is_object() {
         println!(

@@ -32,7 +32,8 @@ fn find(path: &str) -> Option<&'static [u8]> {
 
 pub async fn serve(uri: Uri) -> Response {
     let path = uri.path().trim_start_matches('/');
-    if path == "v1" || path.starts_with("v1/") {
+    let api_path = path.strip_prefix("api/").unwrap_or(path);
+    if path == "api" || api_path == "v1" || api_path.starts_with("v1/") {
         let body = json!({"error": {"code": "not_found", "message": format!("no API route {}", uri.path()), "hint": "see GET /v1/ and the compute skill"}});
         return (StatusCode::NOT_FOUND, axum::Json(body)).into_response();
     }

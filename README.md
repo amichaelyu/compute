@@ -149,17 +149,22 @@ deploy/install.sh config   # push hosts.toml and restart (running jobs survive a
 
 ## Public API through Cloudflare
 
-The API can be reached from outside the tailnet through a Cloudflare tunnel, with the SSH-key
-login as its only lock. The tunnel hides the coordinator's address, and Cloudflare adds TLS,
-DDoS protection and rate limits.
+The daemon serves the API at `/v1` and again at `/api/v1`, so one public hostname can carry
+both the dashboard and the API: the dashboard behind a Cloudflare Access login, and `/api`
+open to SSH-key clients, with the SSH-key login as its only lock. The tunnel hides the
+coordinator's address, and Cloudflare adds TLS, DDoS protection and rate limits.
 
-1. In Zero Trust → Networks → Tunnels, add a public hostname (e.g. `api.compute.example.com`)
-   to the coordinator's tunnel: `HTTP` → `<coordinator tailnet IP>:8765`. Don't put an Access
-   application on it: CLI and agent logins can't get past an Access login page. Keep the
-   browser dashboard on its own hostname behind Access.
-2. Add a rate-limiting rule (Security → WAF → Rate limiting rules) for that hostname:
-   URI path starts with `/v1/auth/`, about 10 requests per minute per IP, block for a minute.
-3. Clients set `COMPUTE_URL=https://api.compute.example.com` in `client.env`.
+1. Route the dashboard's hostname (e.g. `compute.example.com`) through the coordinator's tunnel
+   to `<coordinator tailnet IP>:8765`, with an Access application on it (see the dashboard
+   setup).
+2. Add a second Access application for the path `compute.example.com/api` with a single
+   **Bypass** policy (include: Everyone). Access applies the most specific path, so `/api`
+   skips the login page while everything else, including the dashboard's own `/v1` calls,
+   still needs it.
+3. Add a rate-limiting rule (Security → WAF → Rate limiting rules):
+   `http.host eq "compute.example.com" and starts_with(http.request.uri.path, "/api/v1/auth/")`,
+   5 requests per 10 s per IP.
+4. Clients set `COMPUTE_URL=https://compute.example.com/api` in `client.env`.
 
 Through Cloudflare, `GET /v1/jobs/{id}/wait` returns after at most 90 s (Cloudflare drops
 responses that take over 100 s), and request bodies over 100 MB are refused, so big snapshot

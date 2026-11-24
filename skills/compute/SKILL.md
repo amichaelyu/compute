@@ -28,7 +28,7 @@ Environment variables of the same names override the file. If neither sets `COMP
 stop and ask the user for the daemon's address; don't guess one.
 
 `COMPUTE_URL` may be the daemon's private address (`http://<coordinator>:8765`) or its public
-`https://` hostname behind Cloudflare. Through Cloudflare:
+`https://<host>/api` URL behind Cloudflare. Through Cloudflare:
 - `wait` returns after at most 90 s (`timed_out: true` if nothing happened); call it again.
 - Request bodies over 100 MB are refused (HTTP 413), so big snapshots and dataset uploads
   fail. Make the snapshot smaller, or upload from a machine that can reach the private address.

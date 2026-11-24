@@ -34,8 +34,9 @@ pub fn hash_token(token: &str) -> String {
     hex::encode(Sha256::digest(token.as_bytes()))
 }
 
-/// Parses `allowed_signers`: `principal [options] keytype base64 [comment]` per line.
-fn load_allowed(path: &PathBuf) -> Result<Vec<PublicKey>> {
+/// Parses `allowed_signers`: `principal [options] keytype base64 [comment]` per line. The
+/// principal is the key's nickname (e.g. `michael`).
+fn load_allowed(path: &PathBuf) -> Result<Vec<(String, PublicKey)>> {
     let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     let mut keys = Vec::new();
     for line in text.lines() {
@@ -51,7 +52,8 @@ fn load_allowed(path: &PathBuf) -> Result<Vec<PublicKey>> {
         };
         if let Some(b64) = parts.get(i + 1)
             && let Ok(k) = PublicKey::from_openssh(&format!("{} {}", parts[i], b64)) {
-                keys.push(k);
+                let name = if i > 0 { parts[0].to_string() } else { String::new() };
+                keys.push((name, k));
             }
     }
     Ok(keys)
@@ -98,12 +100,13 @@ impl Auth {
         let key = PublicKey::from_openssh(public_key.trim())
             .map_err(|e| ApiError::bad_request(format!("bad public_key: {e}"), "send the .pub line"))?;
         let allowed = load_allowed(&self.allowed_signers).map_err(ApiError::from)?;
-        if !allowed.iter().any(|k| k.key_data() == key.key_data()) {
+        let Some((name, _)) = allowed.iter().find(|(_, k)| k.key_data() == key.key_data()) else {
             return Err(ApiError::unauthorized(format!(
                 "key {} is not in allowed_signers",
                 key.fingerprint(HashAlg::Sha256)
             )));
-        }
+        };
+        let name = name.clone();
         let sig = SshSig::from_pem(signature.trim())
             .map_err(|e| ApiError::bad_request(format!("bad signature: {e}"), "send the full -----BEGIN SSH SIGNATURE----- block"))?;
         key.verify(NAMESPACE, nonce.as_bytes(), &sig).map_err(|_| {
@@ -115,6 +118,9 @@ impl Auth {
         let fingerprint = key.fingerprint(HashAlg::Sha256).to_string();
         let expires = Utc::now() + chrono::Duration::hours(SESSION_TTL_HOURS);
         self.store.put_session(&hash_token(&token), &fingerprint, expires)?;
+        if !name.is_empty() {
+            self.store.set_key_name(&fingerprint, &name)?;
+        }
         Ok((token, fingerprint, expires))
     }
 

@@ -20,7 +20,7 @@ use chrono::{DateTime, NaiveTime, SecondsFormat, TimeZone, Utc};
 use chrono_tz::Tz;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::BufReader;
@@ -34,8 +34,10 @@ pub struct AppState {
     pub tz: Tz,
 }
 
+/// The API is served at `/v1` and again at `/api/v1`. On the public hostname, Cloudflare Access
+/// guards everything (the dashboard and its `/v1` calls) except `/api`, which SSH-key clients use.
 pub fn router(state: AppState) -> Router {
-    Router::new()
+    let api: Router<AppState> = Router::new()
         .route("/v1/", get(root))
         .route("/v1", get(root))
         .route("/v1/auth/challenge", post(challenge))
@@ -64,7 +66,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/images", get(list_images))
         .route("/v1/images/{key}/logs", get(image_logs))
         .route("/v1/budget", get(budget))
-        .route("/v1/whoami", get(whoami))
+        .route("/v1/whoami", get(whoami));
+    Router::new()
+        .merge(api.clone())
+        .nest("/api", api)
         .fallback(crate::ui::serve)
         .with_state(state)
 }
@@ -75,6 +80,9 @@ pub fn router(state: AppState) -> Router {
 /// `cf:<email>` for a dashboard request that passed Cloudflare Access.
 pub struct Session {
     pub fingerprint: String,
+    /// Who it is: the key's nickname from allowed_signers (else its fingerprint), or the
+    /// dashboard user's email.
+    pub name: String,
     /// SSH-key sessions have full access; Access (browser) sessions only view and do safe actions.
     pub full: bool,
 }
@@ -106,14 +114,17 @@ impl FromRequestParts<AppState> for Session {
             .and_then(|v| v.strip_prefix("Bearer "));
         if let Some(bearer) = bearer {
             return match state.auth.session(bearer.trim())? {
-                Some(fingerprint) => Ok(Session { fingerprint, full: true }),
+                Some(fingerprint) => {
+                    let name = state.sched.store.key_name(&fingerprint)?.unwrap_or_else(|| fingerprint.clone());
+                    Ok(Session { fingerprint, name, full: true })
+                }
                 None => Err(ApiError::unauthorized("session expired or unknown")),
             };
         }
         let jwt = parts.headers.get(ACCESS_HEADER).and_then(|v| v.to_str().ok());
         match (jwt, &state.access) {
             (Some(token), Some(access)) => match access.verify(token).await {
-                Ok(email) => Ok(Session { fingerprint: format!("cf:{email}"), full: false }),
+                Ok(email) => Ok(Session { fingerprint: format!("cf:{email}"), name: email, full: false }),
                 Err(e) => {
                     tracing::warn!("Access token rejected: {e:#}");
                     Err(ApiError::unauthorized(format!("Cloudflare Access login rejected: {e}")))
@@ -127,13 +138,16 @@ impl FromRequestParts<AppState> for Session {
 async fn whoami(sess: Session) -> Json<Value> {
     Json(json!({
         "identity": sess.fingerprint,
+        "name": sess.name,
         "scope": if sess.full { "full" } else { "dashboard" },
     }))
 }
 
 /// Changes within v1 that a running agent should know about, newest first.
 const CHANGES: &[(&str, &str)] = &[
+    ("2026-11-24", "submitted_by is the submitting key's nickname (its allowed_signers principal; submitted_by_key is the fingerprint), and cancelled jobs have cancelled_by {name, key, at}. GET /v1/whoami shows your name."),
     ("2026-11-24", "Job JSON always has command, env, snapshot and snapshot_created_at; list items have resources. GET /v1/jobs/{id}/outputs/list lists output files with sizes; /outputs answers 404 no_outputs when nothing matches and 410 once outputs are deleted; DELETE /v1/jobs/{id}/outputs frees a finished job's disk. /logs?tail=N gives the last N bytes. A cancel's reason says who cancelled. Long titles are shortened, not refused. retries defaults to 1."),
+    ("2026-11-24", "The API is also served under /api (e.g. /api/v1/jobs), which is how it is reached on the public hostname."),
     ("2026-11-24", "Through the public Cloudflare hostname, wait returns after at most 90 s and uploads over 100 MB are refused. POST /v1/auth/challenge can return 429 rate_limited."),
     ("2026-11-24", "resources.disk_gb: free disk the job needs; the runner checks it before starting, and cloud offers must have it. Failed jobs say in their reason when they ran out of memory or disk."),
     ("2026-11-24", "Images are public: backends pull without credentials, so images must hold no secrets (pass them with `secrets`). A build whose registry package is private fails with build_failed: not_public: and a link to make it public."),
@@ -510,6 +524,25 @@ fn submit_body(tz: &Tz, j: &Job, per_backend: Option<Value>) -> Value {
     v
 }
 
+/// Fills in who submitted the job (the key's nickname) and who cancelled it.
+fn add_people(s: &AppState, j: &Job, v: &mut Value, names: &mut HashMap<String, String>) -> ApiResult<()> {
+    let name = match names.get(&j.key_fingerprint) {
+        Some(n) => n.clone(),
+        None => {
+            let n = s.sched.store.key_name(&j.key_fingerprint)?.unwrap_or_else(|| j.key_fingerprint.clone());
+            names.insert(j.key_fingerprint.clone(), n.clone());
+            n
+        }
+    };
+    v["submitted_by"] = name.into();
+    if j.state == JobState::Cancelled
+        && let Some((by, key, at)) = s.sched.store.cancel_of(j.id)?
+    {
+        v["cancelled_by"] = json!({"name": by, "key": key, "at": fmt(&s.tz, at)});
+    }
+    Ok(())
+}
+
 fn job_short(tz: &Tz, j: &Job) -> Value {
     json!({
         "id": j.id,
@@ -526,6 +559,7 @@ fn job_short(tz: &Tz, j: &Job) -> Value {
         "estimated_finish": fmt_opt(tz, j.est_finish),
         "time_s": j.resources.time_s,
         "resources": resources_json(&j.resources),
+        "submitted_by": j.key_fingerprint,
         "exit_code": j.exit_code,
     })
 }
@@ -566,6 +600,7 @@ fn job_full(tz: &Tz, j: &Job, verbose: bool) -> Value {
         "retries_left": j.retries_left,
         "priority": j.priority,
         "submitted_by": j.key_fingerprint,
+        "submitted_by_key": j.key_fingerprint,
         "exit_code": j.exit_code,
         "created_at": fmt(tz, j.created_at),
         "started_at": fmt_opt(tz, j.started_at),
@@ -606,7 +641,14 @@ async fn list_jobs(State(s): State<AppState>, _sess: Session, Query(q): Query<Li
         array_id: q.array,
         limit: Some(q.limit.unwrap_or(50).min(1000)),
     })?;
-    Ok(Json(json!({"jobs": jobs.iter().map(|j| job_short(&s.tz, j)).collect::<Vec<_>>()})))
+    let mut names = HashMap::new();
+    let mut out = Vec::with_capacity(jobs.len());
+    for j in &jobs {
+        let mut v = job_short(&s.tz, j);
+        add_people(&s, j, &mut v, &mut names)?;
+        out.push(v);
+    }
+    Ok(Json(json!({"jobs": out})))
 }
 
 #[derive(Deserialize)]
@@ -621,6 +663,7 @@ fn load_job(s: &AppState, id: i64) -> ApiResult<Job> {
 async fn get_job(State(s): State<AppState>, _sess: Session, Path(id): Path<i64>, Query(q): Query<VerboseQuery>) -> ApiResult<Json<Value>> {
     let j = load_job(&s, id)?;
     let mut v = job_full(&s.tz, &j, q.verbose.unwrap_or(0) > 0);
+    add_people(&s, &j, &mut v, &mut HashMap::new())?;
     if let Some((rate, cost)) = s.sched.store.cost_of(id)? {
         v["usd_per_hour"] = rate.into();
         v["cost_usd"] = cost.map(round2).into();
@@ -663,12 +706,14 @@ async fn wait_job(
         let reached = j.state.is_terminal() || (until == "running" && j.state == JobState::Running);
         if reached {
             let mut v = job_full(&s.tz, &j, false);
+            add_people(&s, &j, &mut v, &mut HashMap::new())?;
             v["timed_out"] = false.into();
             return Ok(Json(v));
         }
         let changed = tokio::time::timeout_at(deadline, rx.changed()).await;
         if changed.is_err() {
             let mut v = job_full(&s.tz, &j, false);
+            add_people(&s, &j, &mut v, &mut HashMap::new())?;
             v["timed_out"] = true.into();
             return Ok(Json(v));
         }
@@ -846,7 +891,7 @@ async fn delete_outputs(State(s): State<AppState>, sess: Session, Path(id): Path
     }
     let backend = outputs_backend(&s, &j)?;
     backend.delete_outputs(&j).await?;
-    s.sched.store.mark_outputs_deleted(id, &format!("deleted on request by {}", sess.fingerprint))?;
+    s.sched.store.mark_outputs_deleted(id, &format!("deleted on request by {}", sess.name))?;
     Ok(Json(json!({"deleted": true})))
 }
 
@@ -868,8 +913,11 @@ async fn cancel_job(State(s): State<AppState>, sess: Session, Path(id): Path<i64
     let mut cancelled = 0;
     let mut errors = Vec::new();
     for j in jobs.iter().filter(|j| !j.state.is_terminal()) {
-        match s.sched.cancel(j, &sess.fingerprint).await {
-            Ok(()) => cancelled += 1,
+        match s.sched.cancel(j, &sess.name).await {
+            Ok(()) => {
+                s.sched.store.record_cancel(j.id, &sess.name, &sess.fingerprint)?;
+                cancelled += 1
+            }
             Err(e) => errors.push(format!("job {}: {e:#}", j.id)),
         }
     }
