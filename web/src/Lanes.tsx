@@ -95,7 +95,7 @@ export function Lanes({ jobs, backends, now }: { jobs: JobRow[]; backends: Backe
     <section className="lanes" aria-label="Schedule, two hours back to six hours ahead">
       <div className="lanes-axis" aria-hidden="true">
         {ticks
-          .filter((t) => Math.abs(pct(t) - pct(now)) > 4.5)
+          .filter((t) => Math.abs(pct(t) - pct(now)) > 7)
           .map((t) => (
             <span
               key={t}

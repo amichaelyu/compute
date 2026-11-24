@@ -55,7 +55,7 @@ pub async fn serve(uri: Uri) -> Response {
     h.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
     h.insert(
         header::CONTENT_SECURITY_POLICY,
-        HeaderValue::from_static("default-src 'self'; img-src 'self' data:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'"),
+        HeaderValue::from_static("default-src 'self'; img-src 'self' data:; font-src 'self' data:; style-src 'self' 'unsafe-inline'; frame-ancestors 'none'"),
     );
     resp
 }
