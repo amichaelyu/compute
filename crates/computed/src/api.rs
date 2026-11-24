@@ -741,7 +741,7 @@ async fn job_logs(State(s): State<AppState>, _sess: Session, Path(id): Path<i64>
     }
     let (offset, max) = match q.tail {
         Some(t) => {
-            let (_, size) = backend.logs(&j, 0, 0).await?;
+            let (_, size) = backend.logs(&j, 0, 1).await?;
             let t = t.clamp(1, 1_048_576);
             (size.saturating_sub(t), t)
         }

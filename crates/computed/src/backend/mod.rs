@@ -510,6 +510,8 @@ impl Remote {
     }
 
     pub async fn logs(&self, id: i64, offset: u64, max: u64) -> Result<(Vec<u8>, u64)> {
+        // BSD head (macOS) refuses `-c 0`.
+        let max = max.max(1);
         let root = self.root_or_err()?;
         let f = shell_quote(&format!("{}/log", Self::jobdir(&root, id)));
         let script = format!(
