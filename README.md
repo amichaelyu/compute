@@ -50,7 +50,7 @@ The daemon reads `$COMPUTE_CONFIG_DIR` (default `~/.config/compute`):
   `<principal> <keytype> <base64>` form.
 - `secrets/`: named job secrets (0600 files), managed through the API. The daemon also reads
   two kinds itself: the `[registry] secret` (`REGISTRY_USERNAME`, `REGISTRY_PASSWORD`) for
-  pushing builds and pulling private images, and secrets with `HF_TOKEN` named by Hugging Face
+  pushing builds, and secrets with `HF_TOKEN` named by Hugging Face
   datasets.
 - Cloud API keys, one 0600 file each: `runpod.key`, `lambda.key`, and `modal.toml` (with
   `token_id` and `token_secret`). `deploy/install.sh` copies any of these it finds in your
@@ -60,10 +60,16 @@ The daemon reads `$COMPUTE_CONFIG_DIR` (default `~/.config/compute`):
   - `COMPUTE_LISTEN` sets the address to listen on.
   - `COMPUTE_CF_TEAM_DOMAIN`, `COMPUTE_CF_AUD` and `COMPUTE_CF_EMAILS` turn on Cloudflare Access
     logins for the dashboard.
-  - `COMPUTE_REGISTRY_PREFIX` (e.g. `ghcr.io/<owner>/compute`) turns on image builds.
+  - `COMPUTE_REGISTRY_PREFIX` (e.g. `ghcr.io/<owner>/compute`) turns on image builds. See
+    [Images](#images).
+
+Local backends also take `docker_mem_gb` (memory for all containers; detected from `docker info`,
+which on macOS is the OrbStack or Docker Desktop VM), `disk_reserve_gb` (disk kept free; 5) and
+`keep_outputs_days` (how long finished jobs' outputs stay on the host; 7, also for Slurm).
 
 `hosts.toml` also has `[registry]` (builder backend, credentials secret, platforms) and
-`[budget]` (`monthly_usd`, 0 by default, so paid backends run nothing until it's raised).
+`[budget]` (`hourly_usd`: how many USD per hour the running cloud instances may cost together; 0
+by default, so paid backends run nothing until it's raised).
 
 State (SQLite, code snapshots, uploaded datasets, build logs, and outputs copied off cloud
 instances) lives in `$COMPUTE_STATE_DIR` (default `~/.local/state/compute`).
@@ -74,6 +80,24 @@ Clients (agents, and the dashboard's dev server) read `~/.config/compute/client.
 COMPUTE_URL=http://<coordinator>:8765
 COMPUTE_KEY=$HOME/.ssh/id_ed25519.pub
 ```
+
+## Images
+
+Job images are public. The builder (`[registry] builder`) logs in to push builds to
+`<prefix>:<hash>`; every backend pulls without credentials, and jobs get credentials at run time
+from secrets, never from the image. With GHCR:
+
+1. Create a classic GitHub token with `write:packages` (GHCR doesn't take fine-grained tokens)
+   and store it as the registry secret:
+   `PUT /v1/secrets/registry` with `{"env":{"REGISTRY_USERNAME":"<user>","REGISTRY_PASSWORD":"<token>"}}`.
+2. Set `prefix = "ghcr.io/<owner>/compute"` under `[registry]` (or `COMPUTE_REGISTRY_PREFIX`),
+   and `platforms = ["linux/amd64"]` unless you run arm64 jobs.
+3. After the first push, make the package public on GitHub (package settings, Change
+   visibility). GHCR creates packages private and has no API to change that. Until then builds
+   fail with `not_public:` and the settings link. All builds are tags of one package, so this is
+   needed once.
+
+Public packages are free on GHCR, with no storage limit.
 
 ## Installing with Homebrew
 
@@ -122,3 +146,27 @@ Then, from your machine (needs `cargo-zigbuild` and `bun`):
 deploy/install.sh          # build the dashboard and daemon, install, restart
 deploy/install.sh config   # push hosts.toml and restart (running jobs survive a restart)
 ```
+
+## Public API through Cloudflare
+
+The API can be reached from outside the tailnet through a Cloudflare tunnel, with the SSH-key
+login as its only lock. The tunnel hides the coordinator's address, and Cloudflare adds TLS,
+DDoS protection and rate limits.
+
+1. In Zero Trust → Networks → Tunnels, add a public hostname (e.g. `api.compute.example.com`)
+   to the coordinator's tunnel: `HTTP` → `<coordinator tailnet IP>:8765`. Don't put an Access
+   application on it: CLI and agent logins can't get past an Access login page. Keep the
+   browser dashboard on its own hostname behind Access.
+2. Add a rate-limiting rule (Security → WAF → Rate limiting rules) for that hostname:
+   URI path starts with `/v1/auth/`, about 10 requests per minute per IP, block for a minute.
+3. Clients set `COMPUTE_URL=https://api.compute.example.com` in `client.env`.
+
+Through Cloudflare, `GET /v1/jobs/{id}/wait` returns after at most 90 s (Cloudflare drops
+responses that take over 100 s), and request bodies over 100 MB are refused, so big snapshot
+and dataset uploads need the private address. The daemon also refuses new login challenges
+while 1024 are outstanding.
+
+To let someone in, add their public key to `allowed_signers`; to revoke them, delete the line.
+The daemon re-reads the file on every login. Their current session stays valid until it
+expires (12 h at most). Every key has full access: all jobs, all secrets (jobs may use any of
+them), the cloud budget, and every backend, including Slurm accounts that are yours alone.

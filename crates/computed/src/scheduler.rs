@@ -22,6 +22,10 @@ const PROBE_RETRY: Duration = Duration::from_secs(60);
 const PROBE_REFRESH: Duration = Duration::from_secs(24 * 3600);
 const SWEEP_EVERY: Duration = Duration::from_secs(300);
 const LOST_AFTER: i64 = 5 * 60;
+/// States a job can still leave on its own; writes that end or move a job check for these.
+const LIVE: &[JobState] = &[JobState::Waiting, JobState::Queued, JobState::Staging, JobState::Pending, JobState::Running];
+/// States of a job the backend has.
+const LAUNCHED: &[JobState] = &[JobState::Pending, JobState::Running];
 const NO_STATUS_AFTER: i64 = 10 * 60;
 const STAGE_ATTEMPTS: u32 = 3;
 
@@ -54,6 +58,8 @@ pub struct Scheduler {
     dataset_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     builds: Mutex<HashSet<String>>,
     logged_in: Mutex<HashSet<String>>,
+    /// Hourly rates of paid jobs placed but not launched yet (launch records the real cost row).
+    reserved: Mutex<HashMap<i64, f64>>,
 }
 
 /// The chosen backend for a job.
@@ -117,6 +123,7 @@ impl Scheduler {
             dataset_locks: Mutex::new(HashMap::new()),
             builds: Mutex::new(HashSet::new()),
             logged_in: Mutex::new(HashSet::new()),
+            reserved: Mutex::new(HashMap::new()),
         })
     }
 
@@ -188,16 +195,24 @@ impl Scheduler {
         }
     }
 
-    pub fn update(&self, id: i64, u: JobUpdate) -> Result<()> {
-        self.store.update_job(id, u)?;
-        self.bump();
-        Ok(())
+    /// Updates a job only while the job is in one of `states`; false when it has moved on (e.g.
+    /// it was cancelled since it was read).
+    pub fn update_if(&self, id: i64, states: &[JobState], u: JobUpdate) -> Result<bool> {
+        let applied = self.store.update_job_if(id, states, u)?;
+        if applied {
+            self.bump();
+        }
+        Ok(applied)
     }
 
-    /// Startup: jobs caught mid-staging go back to the queue; running jobs get a fresh grace
-    /// period so a long daemon outage doesn't mark them lost before the first poll.
+    /// Startup: jobs caught mid-staging go back to the queue, except cloud jobs that already
+    /// have an instance, which resume staging on it (see `resume_staging`); running jobs get a
+    /// fresh grace period so a long daemon outage doesn't mark them lost before the first poll.
     pub fn reconcile(&self) -> Result<()> {
         for j in self.store.jobs_in_states(&[JobState::Staging])? {
+            if self.resumable(&j) {
+                continue;
+            }
             self.store.update_job(
                 j.id,
                 JobUpdate {
@@ -213,6 +228,27 @@ impl Scheduler {
             self.store.update_job(j.id, JobUpdate { last_seen: Some(Some(Utc::now())), ..Default::default() })?;
         }
         Ok(())
+    }
+
+    /// A cloud job whose instance was recorded while staging.
+    fn resumable(&self, j: &Job) -> bool {
+        j.backend.as_deref().and_then(|n| self.backend(n)).is_some_and(|b| b.is_paid())
+            && j.handle.as_ref().is_some_and(|h| h["staging"].as_bool() == Some(true) && h["instance"].is_object())
+    }
+
+    /// After a restart: finish staging the cloud jobs `reconcile` left in Staging, once their
+    /// backend has been probed. (Jobs staging in this run are in flight and skipped.)
+    fn resume_staging(self: &Arc<Self>) {
+        let Ok(jobs) = self.store.jobs_in_states(&[JobState::Staging]) else { return };
+        let in_flight = lock(&self.in_flight).clone();
+        for j in jobs.into_iter().filter(|j| !in_flight.contains(&j.id) && self.resumable(j)) {
+            if let Some(b) = j.backend.as_deref().and_then(|n| self.backend(n))
+                && b.root().is_some()
+            {
+                tracing::info!("job {}: resuming staging on {}", j.id, b.name());
+                self.spawn_launch(b, vec![j], Shape::default());
+            }
+        }
     }
 
     pub async fn run(self: Arc<Self>) {
@@ -245,6 +281,7 @@ impl Scheduler {
         self.probe_due().await;
         self.resolve_deps().await?;
         self.poll_all().await?;
+        self.resume_staging();
         self.place_queued().await
     }
 
@@ -265,13 +302,61 @@ impl Scheduler {
                 tracing::warn!("sweep {}: {e:#}", b.name());
             }
         }
+        self.tidy_hosts().await;
+    }
+
+    /// Local and Slurm backends: re-measure free disk and Docker memory, and delete outputs
+    /// older than the backend's keep_outputs_days (keeping any a live job still needs as inputs)
+    /// along with stale entries of the shared input cache.
+    async fn tidy_hosts(&self) {
+        let needed: HashSet<i64> = self
+            .store
+            .jobs_in_states(LIVE)
+            .map(|js| js.iter().flat_map(|j| j.spec.inputs.iter().map(|i| i.from_job)).collect())
+            .unwrap_or_default();
+        for b in self.backends.iter().filter(|b| !b.is_paid() && b.root().is_some()) {
+            let name = b.name().to_string();
+            if b.config().kind == BackendKind::Local
+                && let Ok(Err(e)) = tokio::time::timeout(Duration::from_secs(60), b.refresh()).await
+            {
+                tracing::warn!("measuring {name}: {e:#}");
+            }
+            let days = b.config().keep_outputs_days;
+            let before = Utc::now() - chrono::Duration::days(i64::from(days));
+            let Ok(ids) = self.store.outputs_to_expire(&name, before, 200) else { continue };
+            for id in ids.into_iter().filter(|id| !needed.contains(id)) {
+                let Ok(Some(j)) = self.store.get_job(id) else { continue };
+                match tokio::time::timeout(Duration::from_secs(60), b.delete_outputs(&j)).await {
+                    Ok(Ok(())) => {
+                        let _ = self.store.mark_outputs_deleted(id, &format!("kept {days} days (keep_outputs_days on {name})"));
+                    }
+                    Ok(Err(e)) => {
+                        tracing::warn!("deleting old outputs of job {id} on {name}: {e:#}");
+                        break;
+                    }
+                    Err(_) => break,
+                }
+            }
+            if let Ok((shell, root)) = b.shell_for(None).await {
+                let cache = crate::transport::shell_quote(&format!("{root}/cache/inputs"));
+                // Entries are named <parent job>-<glob hash>; keep the ones live jobs need.
+                let keep: String = needed.iter().map(|id| format!(" ! -name '{id}-*'")).collect();
+                let _ = shell.run(&format!("[ -d {cache} ] && find {cache} -mindepth 1 -maxdepth 1 -mtime +{days}{keep} -exec rm -rf {{}} + ; true")).await;
+            }
+        }
     }
 
     async fn probe_due(self: &Arc<Self>) {
+        // A disabled backend takes no new jobs, but the jobs it has still need polling.
+        let busy: HashSet<String> = self
+            .store
+            .jobs_in_states(&[JobState::Staging, JobState::Pending, JobState::Running])
+            .map(|js| js.into_iter().filter_map(|j| j.backend).collect())
+            .unwrap_or_default();
         let mut due = Vec::new();
         for b in &self.backends {
             let name = b.name().to_string();
-            if !self.enabled(&name).map(|(on, _)| on).unwrap_or(false) {
+            if !self.enabled(&name).map(|(on, _)| on).unwrap_or(false) && !busy.contains(&name) {
                 continue;
             }
             let rt = self.runtime(&name);
@@ -346,7 +431,13 @@ impl Scheduler {
             for p in parents {
                 if p.state.is_terminal() {
                     if p.state != JobState::Succeeded {
-                        return Ok(Deps::Failed(format!("job {} ({}) {}", p.id, p.title, p.state.as_str())));
+                        let why = p.reason.as_deref().map(|r| format!(": {}", crate::backend::tail(r, 200))).unwrap_or_default();
+                        return Ok(Deps::Failed(format!(
+                            "job {} ({}) {}{why}. Resubmit that job, then this one with the new id in after_ok/inputs",
+                            p.id,
+                            p.title,
+                            p.state.as_str()
+                        )));
                     }
                 } else {
                     track(&p, &mut unfinished);
@@ -372,15 +463,16 @@ impl Scheduler {
             }
             match self.deps(&job)? {
                 Deps::Met => {
-                    self.update(job.id, JobUpdate { state: Some(JobState::Queued), reason: Some(Some("dependencies met".into())), ..Default::default() })?;
+                    self.update_if(job.id, &[JobState::Waiting], JobUpdate { state: Some(JobState::Queued), reason: Some(Some("dependencies met".into())), ..Default::default() })?;
                     self.kick();
                 }
                 Deps::Failed(why) => self.fail_dependency(&job, &why)?,
                 Deps::Pending(parents, latest) => {
                     if let Some((name, shape, start)) = self.native_dependency(&job, &parents, latest).await? {
                         let finish = start + chrono::Duration::seconds(job.resources.time_s as i64);
-                        self.update(
+                        if !self.update_if(
                             job.id,
+                            &[JobState::Waiting],
                             JobUpdate {
                                 state: Some(JobState::Staging),
                                 backend: Some(Some(name.clone())),
@@ -390,7 +482,9 @@ impl Scheduler {
                                 est_source: Some(Some("daemon".into())),
                                 ..Default::default()
                             },
-                        )?;
+                        )? {
+                            continue;
+                        }
                         let mut job = job;
                         job.state = JobState::Staging;
                         job.backend = Some(name.clone());
@@ -402,8 +496,9 @@ impl Scheduler {
                     let reason = Some(format!("waiting for job {}{more}", names.join(", ")));
                     let est = latest.map(|t| t.max(Utc::now()));
                     if job.reason != reason || job.est_start.map(|t| t.timestamp() / 60) != est.map(|t| t.timestamp() / 60) {
-                        self.update(
+                        self.update_if(
                             job.id,
+                            &[JobState::Waiting],
                             JobUpdate {
                                 reason: Some(reason),
                                 est_start: Some(est),
@@ -436,8 +531,9 @@ impl Scheduler {
     }
 
     fn fail_dependency(&self, job: &Job, why: &str) -> Result<()> {
-        self.update(
+        self.update_if(
             job.id,
+            LIVE,
             JobUpdate {
                 state: Some(JobState::DependencyFailed),
                 ended_at: Some(Some(Utc::now())),
@@ -447,6 +543,7 @@ impl Scheduler {
                 ..Default::default()
             },
         )
+        .map(|_| ())
     }
 
     /// When every unfinished parent is queued or running on one Slurm backend and the child
@@ -530,7 +627,25 @@ impl Scheduler {
             }
         }
         for (name, jobs) in groups {
-            let Some(backend) = self.backend(&name) else { continue };
+            let Some(backend) = self.backend(&name) else {
+                // The backend was removed from hosts.toml: nothing can reach these jobs now.
+                for j in &jobs {
+                    let _ = self.end_cost(j, Utc::now());
+                    self.update_if(
+                        j.id,
+                        LAUNCHED,
+                        JobUpdate {
+                            state: Some(JobState::Lost),
+                            ended_at: Some(Some(Utc::now())),
+                            reason: Some(Some(format!(
+                                "lost: backend {name} is no longer configured; if the job (or a cloud instance) still runs there, stop it by hand"
+                            ))),
+                            ..Default::default()
+                        },
+                    )?;
+                }
+                continue;
+            };
             if backend.root().is_none() {
                 // Not probed yet in this daemon run; wait for the probe.
                 continue;
@@ -574,11 +689,22 @@ impl Scheduler {
                     reason = Some(n);
                 }
                 let ended = r.ended.unwrap_or(now);
-                if let Some(cost) = self.end_cost(job, ended)? {
+                // Its linked inputs and dataset view were only for the run.
+                if let Some(b) = job.backend.as_deref().and_then(|n| self.backend(n)) {
+                    let j = job.clone();
+                    tokio::spawn(async move {
+                        if let Ok(Err(e)) = tokio::time::timeout(Duration::from_secs(120), b.delete_inputs(&j)).await {
+                            tracing::warn!("removing the inputs of job {}: {e:#}", j.id);
+                        }
+                    });
+                }
+                // A cloud instance bills until teardown, which is done by now.
+                if let Some(cost) = self.end_cost(job, now)? {
                     reason = Some(format!("{} (cost ${cost:.2})", reason.unwrap_or_default()).trim_start().to_string());
                 }
-                self.update(
+                self.update_if(
                     job.id,
+                    LAUNCHED,
                     JobUpdate {
                         state: Some(s),
                         exit_code: Some(r.exit_code),
@@ -601,7 +727,9 @@ impl Scheduler {
                     u.est_finish = Some(Some(started + chrono::Duration::seconds(job.resources.time_s as i64)));
                     u.est_source = Some(Some("actual".into()));
                 }
-                self.update(job.id, u)?;
+                if !self.update_if(job.id, LAUNCHED, u)? {
+                    return Ok(());
+                }
                 if let Some(seen) = seen
                     && (now - seen).num_seconds() > LOST_AFTER
                     && r.heartbeat.is_some()
@@ -613,8 +741,9 @@ impl Scheduler {
                 if let Some(start) = r.est_start
                     && job.est_start != Some(start)
                 {
-                    self.update(
+                    self.update_if(
                         job.id,
+                        &[JobState::Pending],
                         JobUpdate {
                             est_start: Some(Some(start)),
                             est_finish: Some(Some(start + chrono::Duration::seconds(job.resources.time_s as i64))),
@@ -625,9 +754,10 @@ impl Scheduler {
                 }
             }
             _ => {
-                // No status yet. A local job whose runner never wrote status.json, or a Slurm job
-                // that vanished from squeue and sacct, is lost after a grace period.
-                let since = job.started_at.unwrap_or(job.created_at);
+                // No status. A local job whose runner never wrote status.json, a Slurm job that
+                // vanished from squeue and sacct, or a cloud instance that stopped answering is
+                // lost after a grace period, counted from when it was last seen.
+                let since = job.last_seen.or(job.started_at).unwrap_or(job.created_at);
                 if (now - since).num_seconds() > NO_STATUS_AFTER && job.state == JobState::Running {
                     self.mark_lost(job, "no status from the runner for 10 minutes").await?;
                 }
@@ -637,19 +767,22 @@ impl Scheduler {
     }
 
     /// Closes a paid job's cost record; returns its cost.
+    /// Closes the job's open cost record, if it has one (by job id, so it works even if the
+    /// backend is gone from the config).
     fn end_cost(&self, job: &Job, ended: DateTime<Utc>) -> Result<Option<f64>> {
-        match job.backend.as_deref().and_then(|n| self.backend(n)) {
-            Some(b) if b.is_paid() => self.store.cost_end(job.id, ended),
-            _ => Ok(None),
-        }
+        self.store.cost_end(job.id, ended)
     }
 
+    /// The backend didn't answer. Its jobs may well still be running there, and they can't be
+    /// cancelled now, so they stay as they are (with a note) until it answers again; requeueing
+    /// them would run them twice.
     async fn check_lost(&self, jobs: &[Job], _err: Option<String>) -> Result<()> {
         let now = Utc::now();
         for j in jobs.iter().filter(|j| j.state == JobState::Running) {
             let seen = j.last_seen.or(j.started_at).unwrap_or(j.created_at);
-            if (now - seen).num_seconds() > LOST_AFTER {
-                self.mark_lost(j, "backend unreachable for 5 minutes").await?;
+            let note = format!("backend {} unreachable; status unknown until it answers", j.backend.as_deref().unwrap_or("?"));
+            if (now - seen).num_seconds() > LOST_AFTER && j.reason.as_deref() != Some(note.as_str()) {
+                self.update_if(j.id, LAUNCHED, JobUpdate { reason: Some(Some(note)), ..Default::default() })?;
             }
         }
         Ok(())
@@ -658,13 +791,25 @@ impl Scheduler {
     async fn mark_lost(&self, job: &Job, why: &str) -> Result<()> {
         let backend = job.backend.clone().unwrap_or_default();
         if let Some(b) = self.backend(&backend) {
-            let _ = tokio::time::timeout(Duration::from_secs(60), b.cancel(job)).await;
+            // Only end or requeue a job once it's known to be stopped; otherwise retry next tick.
+            match tokio::time::timeout(Duration::from_secs(60), b.cancel(job)).await {
+                Ok(Ok(())) => {}
+                Ok(Err(e)) => {
+                    tracing::warn!("job {} looks lost on {backend} ({why}), but cancelling it failed: {e:#}", job.id);
+                    return Ok(());
+                }
+                Err(_) => {
+                    tracing::warn!("job {} looks lost on {backend} ({why}), but cancelling it timed out", job.id);
+                    return Ok(());
+                }
+            }
         }
         let _ = self.end_cost(job, Utc::now());
         if job.retries_left > 0 {
             tracing::warn!("job {} lost on {backend} ({why}); requeueing", job.id);
-            self.update(
+            self.update_if(
                 job.id,
+                LAUNCHED,
                 JobUpdate {
                     state: Some(JobState::Queued),
                     backend: Some(None),
@@ -675,10 +820,12 @@ impl Scheduler {
                     ..Default::default()
                 },
             )
+            .map(|_| ())
         } else {
             tracing::warn!("job {} lost on {backend} ({why})", job.id);
-            self.update(
+            self.update_if(
                 job.id,
+                LAUNCHED,
                 JobUpdate {
                     state: Some(JobState::Lost),
                     ended_at: Some(Some(Utc::now())),
@@ -686,6 +833,7 @@ impl Scheduler {
                     ..Default::default()
                 },
             )
+            .map(|_| ())
         }
     }
 
@@ -700,27 +848,31 @@ impl Scheduler {
             .unwrap_or_else(Utc::now)
     }
 
-    /// `(spent this month, committed by running cloud jobs until their time limits)`.
-    pub fn spend(&self) -> Result<(f64, f64)> {
+    /// Cloud spend so far this calendar month (in the daemon's time zone), for reporting.
+    pub fn spent_this_month(&self) -> Result<f64> {
         let now = Utc::now();
         let since = self.month_start();
         let mut spent = 0.0;
-        let mut committed = 0.0;
-        for (job_id, _, rate, started, ended, cost) in self.store.costs_since(since)? {
+        for (_, _, rate, started, ended, cost) in self.store.costs_since(since)? {
             match (ended, cost) {
                 (Some(_), Some(c)) => spent += c,
-                _ => {
-                    let from = started.max(since);
-                    let hours = (now - from).num_seconds().max(0) as f64 / 3600.0;
-                    spent += rate * hours;
-                    if let Ok(Some(j)) = self.store.get_job(job_id) {
-                        let limit = started + chrono::Duration::seconds(j.resources.time_s as i64 + 600);
-                        committed += rate * ((limit - now).num_seconds().max(0) as f64 / 3600.0);
-                    }
-                }
+                // Open: earlier attempts plus this one so far.
+                (_, prior) => spent += prior.unwrap_or(0.0) + rate * (now - started.max(since)).num_seconds().max(0) as f64 / 3600.0,
             }
         }
-        Ok((spent, committed))
+        Ok(spent)
+    }
+
+    /// USD per hour of the cloud instances running or about to start, which counts against
+    /// `budget.hourly_usd`.
+    pub fn hourly_in_use(&self) -> Result<f64> {
+        let open: HashMap<i64, f64> =
+            self.store.costs_since(Utc::now())?.into_iter().filter(|r| r.4.is_none()).map(|r| (r.0, r.2)).collect();
+        let staging: HashSet<i64> = self.store.jobs_in_states(&[JobState::Staging])?.iter().map(|j| j.id).collect();
+        let mut reserved = lock(&self.reserved);
+        reserved.retain(|id, _| staging.contains(id) && !open.contains_key(id));
+        // + 0.0: an empty float sum is -0.0.
+        Ok(open.values().sum::<f64>() + reserved.values().sum::<f64>() + 0.0)
     }
 
     /// Bytes used on the coordinator by outputs copied off cloud instances.
@@ -740,6 +892,16 @@ impl Scheduler {
 
     // ---------------------------------------------------------------- placement
 
+    /// How long a job is expected to run: the median of recent successful runs with the same
+    /// title (with 20% slack), capped by its time limit; the time limit when there are none.
+    pub fn expected_secs(&self, job: &Job) -> i64 {
+        let limit = job.resources.time_s as i64;
+        match self.store.typical_secs(&job.title) {
+            Ok(Some(t)) => (t + t / 5).clamp(60, limit.max(60)),
+            _ => limit,
+        }
+    }
+
     /// Resources held on a local backend by its staging and running jobs.
     fn allocs(&self, backend: &str) -> Result<Vec<Alloc>> {
         let now = Utc::now();
@@ -749,9 +911,12 @@ impl Scheduler {
             .into_iter()
             .filter(|j| j.backend.as_deref() == Some(backend))
             .map(|j| Alloc {
-                ends_at: j.started_at.unwrap_or(now) + chrono::Duration::seconds(j.resources.time_s as i64),
+                // A job past its expected end is assumed to finish soon, not at its limit.
+                ends_at: (j.started_at.unwrap_or(now) + chrono::Duration::seconds(self.expected_secs(&j))).max(now + chrono::Duration::minutes(1)),
                 cpus: j.resources.cpus,
                 mem_mb: j.resources.mem_mb,
+                disk_mb: j.resources.disk_mb,
+                container: j.is_container(),
             })
             .collect())
     }
@@ -759,8 +924,8 @@ impl Scheduler {
     /// Quotes from every backend, with the reason each one can't take the job.
     pub async fn plan(&self, job: &Job) -> Result<Placement> {
         let mut quotes = Vec::new();
-        let (spent, committed) = self.spend()?;
-        let remaining = self.budget.monthly_usd - spent - committed;
+        let limit = self.budget.hourly_usd;
+        let in_use = self.hourly_in_use()?;
         for b in &self.backends {
             let name = b.name().to_string();
             let q = if job.backends.as_ref().is_some_and(|l| !l.contains(&name)) {
@@ -775,14 +940,11 @@ impl Scheduler {
             } else {
                 match b.quote(job, &self.allocs(&name)?).await {
                     Quote::Ok { start, source, mut reason, shape, cost } => {
-                        if let Some(c) = cost
-                            && b.is_paid()
-                            && c > remaining
-                        {
-                            Quote::no(
-                                format!("estimated ${c:.2} is over the monthly budget (${remaining:.2} left of ${:.2})", self.budget.monthly_usd),
-                                false,
-                            )
+                        let rate = shape.usd_per_hour.unwrap_or(0.0);
+                        if b.is_paid() && rate > limit {
+                            Quote::no(format!("${rate:.2}/h is over the hourly limit of ${limit:.2}/h"), false)
+                        } else if b.is_paid() && in_use + rate > limit {
+                            Quote::no(format!("${rate:.2}/h doesn't fit the hourly limit yet: ${in_use:.2}/h of ${limit:.2}/h in use"), false)
                         } else {
                             let stage = self.staging_seconds(job, &name);
                             let mut start = start;
@@ -844,6 +1006,8 @@ impl Scheduler {
         let in_flight = lock(&self.in_flight).clone();
         let mut batches: HashMap<(String, String), (Shape, Vec<Job>)> = HashMap::new();
         let now = Utc::now();
+        // Batches collected so far are launched even if a later job errors.
+        let placed: Result<()> = async {
         for job in queued {
             if in_flight.contains(&job.id) {
                 continue;
@@ -853,13 +1017,14 @@ impl Scheduler {
                 ImageStatus::Building(tag) => {
                     let reason = Some(format!("waiting for the image build {tag} (GET /v1/images)"));
                     if job.reason != reason {
-                        self.update(job.id, JobUpdate { reason: Some(reason), ..Default::default() })?;
+                        self.update_if(job.id, &[JobState::Queued], JobUpdate { reason: Some(reason), ..Default::default() })?;
                     }
                     continue;
                 }
                 ImageStatus::Failed(err) => {
-                    self.update(
+                    self.update_if(
                         job.id,
+                        &[JobState::Queued],
                         JobUpdate {
                             state: Some(JobState::Failed),
                             ended_at: Some(Some(Utc::now())),
@@ -882,19 +1047,20 @@ impl Scheduler {
                     .collect();
                 let reason = Some(format!("waiting: {}", why.join("; ")));
                 if job.reason != reason {
-                    self.update(job.id, JobUpdate { reason: Some(reason), est_start: Some(None), est_finish: Some(None), est_source: Some(None), ..Default::default() })?;
+                    self.update_if(job.id, &[JobState::Queued], JobUpdate { reason: Some(reason), est_start: Some(None), est_finish: Some(None), est_source: Some(None), ..Default::default() })?;
                 }
                 continue;
             };
             let Best { backend: name, start, source, reason, shape, cost } = best;
             let Some(backend) = self.backend(&name) else { continue };
-            let finish = start + chrono::Duration::seconds(job.resources.time_s as i64);
+            let finish = start + chrono::Duration::seconds(self.expected_secs(&job));
             let kind = backend.config().kind;
             if kind == BackendKind::Local && start > now + chrono::Duration::seconds(5) {
                 // Best option is a busy local host: keep waiting here, and keep the estimate fresh.
                 if job.est_start.map(|t| t.timestamp() / 60) != Some(start.timestamp() / 60) || job.backend.is_some() {
-                    self.update(
+                    self.update_if(
                         job.id,
+                        &[JobState::Queued],
                         JobUpdate {
                             reason: Some(Some(format!("queued for {name}: {reason}"))),
                             est_start: Some(Some(start)),
@@ -910,8 +1076,10 @@ impl Scheduler {
                 Some(c) => format!("{reason} (estimated ${c:.2})"),
                 None => reason,
             };
-            self.update(
+            // Cancelled while it was being planned: leave it.
+            if !self.update_if(
                 job.id,
+                &[JobState::Queued],
                 JobUpdate {
                     state: Some(JobState::Staging),
                     backend: Some(Some(name.clone())),
@@ -921,7 +1089,14 @@ impl Scheduler {
                     est_source: Some(Some(source)),
                     ..Default::default()
                 },
-            )?;
+            )? {
+                continue;
+            }
+            if backend.is_paid()
+                && let Some(rate) = shape.usd_per_hour
+            {
+                lock(&self.reserved).insert(job.id, rate);
+            }
             let mut job = job;
             job.state = JobState::Staging;
             job.backend = Some(name.clone());
@@ -931,12 +1106,15 @@ impl Scheduler {
                 self.spawn_launch(backend, vec![job], shape);
             }
         }
+        Ok(())
+        }
+        .await;
         for ((name, _), (shape, jobs)) in batches {
             if let Some(b) = self.backend(&name) {
                 self.spawn_launch(b, jobs, shape);
             }
         }
-        Ok(())
+        placed
     }
 
     fn spawn_launch(self: &Arc<Self>, backend: Arc<dyn Backend>, jobs: Vec<Job>, shape: Shape) {
@@ -970,13 +1148,15 @@ impl Scheduler {
             }
             if !done {
                 for id in &ids {
-                    if backend.is_paid()
-                        && let Ok(Some(j)) = me.store.get_job(*id)
-                    {
-                        let _ = backend.cancel(&j).await;
+                    if let Ok(Some(j)) = me.store.get_job(*id) {
+                        if backend.is_paid() {
+                            let _ = backend.cancel(&j).await;
+                        }
+                        let _ = me.end_cost(&j, Utc::now());
                     }
-                    let _ = me.update(
+                    let _ = me.update_if(
                         *id,
+                        &[JobState::Staging],
                         JobUpdate {
                             state: Some(JobState::Failed),
                             ended_at: Some(Some(Utc::now())),
@@ -996,11 +1176,11 @@ impl Scheduler {
         });
     }
 
-    /// Files and settings for staging `job` on `backend`: secrets, registry credentials,
-    /// dataset copies and same-backend inputs.
+    /// Files and settings for staging `job` on `backend`: secrets, dataset copies and
+    /// same-backend inputs. Images are public, so pulls need no registry credentials.
     async fn stage_files(&self, backend: &Arc<dyn Backend>, job: &Job) -> Result<StageFiles> {
         let mut files = StageFiles { secrets_env: self.secrets.env_file(&job.secrets)?, ..Default::default() };
-        if let Some(c) = &job.spec.container {
+        if job.spec.container.is_some() {
             let runtimes = backend.runtimes();
             let rt = if runtimes.iter().any(|r| r == "docker") {
                 "docker"
@@ -1009,12 +1189,6 @@ impl Scheduler {
             } else {
                 "native" // cloud backends that run the image itself
             };
-            let from_registry = self.registry.host().is_some_and(|h| c.image.starts_with(&format!("{h}/")));
-            match rt {
-                "docker" if from_registry && !backend.config().kind.is_cloud() => self.registry_login(backend.as_ref()).await?,
-                "apptainer" => files.registry_env = self.registry_env(&c.image)?,
-                _ => {}
-            }
             if rt != "native" {
                 files.runtime = Some(rt.into());
             }
@@ -1024,30 +1198,52 @@ impl Scheduler {
             files.datasets.push((d.name.clone(), path));
         }
         if !backend.config().kind.is_cloud() {
-            let (_, root) = backend.shell_for(None).await?;
+            let (shell, root) = backend.shell_for(None).await?;
             for inp in &job.spec.inputs {
                 let parent = self.store.get_job(inp.from_job)?.with_context(|| format!("input job {} is gone", inp.from_job))?;
+                let glob = inp.glob.clone().unwrap_or_else(|| "*".into());
                 if parent.backend.as_deref() == Some(backend.name()) {
-                    files.inputs.push((
-                        format!("{}/out", crate::backend::Remote::jobdir(&root, parent.id)),
-                        inp.glob.clone().unwrap_or_else(|| "*".into()),
-                        inp.as_.clone(),
-                    ));
+                    files.inputs.push((format!("{}/out", crate::backend::Remote::jobdir(&root, parent.id)), glob, inp.as_.clone()));
+                    continue;
                 }
+                // From another backend: fetch once into this host's input cache, shared by every
+                // job (e.g. all array tasks) that needs the same outputs; the runner links them.
+                let tag = hex::encode(<sha2::Sha256 as sha2::Digest>::digest(glob.as_bytes()));
+                let dir = format!("{root}/cache/inputs/{}-{}", parent.id, &tag[..8]);
+                let q = crate::transport::shell_quote(&dir);
+                let lock = self.dataset_lock(&format!("input:{}:{dir}", backend.name()));
+                let _guard = lock.lock().await;
+                let have = shell.run(&format!("test -f {q}.complete && echo yes || true")).await?.text();
+                if have.trim() != "yes" {
+                    let pb = parent
+                        .backend
+                        .as_deref()
+                        .and_then(|n| self.backend(n))
+                        .with_context(|| format!("input job {} never ran", parent.id))?;
+                    let data = pb.fetch(&parent, inp.glob.as_deref()).await.with_context(|| format!("reading outputs of job {}", parent.id))?;
+                    shell
+                        .pipe_in(
+                            &format!("set -e\nrm -rf {q}.tmp\nmkdir -p {q}.tmp\ntar -x --exclude='._*' -C {q}.tmp\nrm -rf {q}\nmv {q}.tmp {q}\ntouch {q}.complete"),
+                            data,
+                        )
+                        .await
+                        .with_context(|| format!("copying outputs of job {} to {}", parent.id, backend.name()))?;
+                }
+                files.inputs.push((dir, "*".into(), inp.as_.clone()));
             }
         }
         Ok(files)
     }
 
-    /// Copies inputs whose parent ran on another backend (or in the cloud) into the job's
-    /// `in/<as>` directory.
+    /// Cloud jobs: copies their inputs into the instance's `in/<as>` directory. (Local and
+    /// Slurm backends link them from the parent's outputs or the input cache instead; see
+    /// `stage_files`.)
     async fn copy_inputs(&self, backend: &Arc<dyn Backend>, job: &Job) -> Result<()> {
+        if !backend.config().kind.is_cloud() {
+            return Ok(());
+        }
         for inp in &job.spec.inputs {
             let parent = self.store.get_job(inp.from_job)?.with_context(|| format!("input job {} is gone", inp.from_job))?;
-            let same = parent.backend.as_deref() == Some(backend.name()) && !backend.config().kind.is_cloud();
-            if same {
-                continue;
-            }
             let pb = parent
                 .backend
                 .as_deref()
@@ -1082,6 +1278,25 @@ impl Scheduler {
             self.copy_inputs(backend, j).await?;
             self.local_build(backend, j).await?;
         }
+        // Cancelled while staging: stop here, and tear down what staging set up (a cloud
+        // instance) instead of launching.
+        let mut still = Vec::new();
+        for j in live {
+            match self.store.get_job(j.id)? {
+                Some(cur) if cur.state == JobState::Staging => still.push(j),
+                Some(cur) => {
+                    if backend.is_paid() {
+                        let _ = backend.cancel(&cur).await;
+                    }
+                    let _ = self.end_cost(&cur, Utc::now());
+                }
+                None => {}
+            }
+        }
+        let live = still;
+        if live.is_empty() {
+            return Ok(());
+        }
         let handles = backend.launch(&live, shape).await?;
         let kind = backend.config().kind;
         let now = Utc::now();
@@ -1089,7 +1304,7 @@ impl Scheduler {
             if shape.dependency.is_some() {
                 h["native_deps"] = true.into();
             }
-            let mut u = JobUpdate { handle: Some(Some(h)), ..Default::default() };
+            let mut u = JobUpdate { handle: Some(Some(h.clone())), ..Default::default() };
             if kind == BackendKind::Local {
                 u.state = Some(JobState::Running);
                 u.started_at = Some(Some(now));
@@ -1097,16 +1312,11 @@ impl Scheduler {
             } else {
                 u.state = Some(JobState::Pending);
             }
-            if backend.is_paid()
-                && let Some(rate) = shape.usd_per_hour
-            {
-                self.store.cost_start(j.id, backend.name(), rate, now)?;
-            }
-            self.update(j.id, u)?;
-            // Cancelled between the check above and the launch: stop it now.
-            if self.store.get_job(j.id)?.is_some_and(|c| c.state == JobState::Cancelled) {
+            // (A cloud job's cost record was opened when its instance was created.)
+            if !self.update_if(j.id, &[JobState::Staging], u)? {
+                // Cancelled while launching: stop what was just started.
                 let mut launched = j.clone();
-                launched.handle = self.store.get_job(j.id)?.and_then(|c| c.handle);
+                launched.handle = Some(h);
                 let _ = backend.cancel(&launched).await;
                 let _ = self.end_cost(j, Utc::now());
             }
@@ -1114,25 +1324,38 @@ impl Scheduler {
         Ok(())
     }
 
-    pub async fn cancel(&self, job: &Job) -> Result<()> {
+    /// Cancels a job. A job still staging is stopped by its launch task, which sees the state
+    /// change. If the backend can't be reached the job is still marked cancelled, with a note
+    /// that it may be running there.
+    pub async fn cancel(&self, job: &Job, by: &str) -> Result<()> {
         if job.state.is_terminal() {
             return Ok(());
         }
+        let mut reason = format!("cancelled by request from {by}");
         if matches!(job.state, JobState::Pending | JobState::Running)
             && let Some(b) = job.backend.as_deref().and_then(|n| self.backend(n))
+            && let Err(e) = b.cancel(job).await
         {
-            b.cancel(job).await?;
+            tracing::warn!("cancelling job {} on {}: {e:#}", job.id, b.name());
+            reason = format!("cancelled by request from {by}; {} could not be reached, so it may still be running there", b.name());
         }
-        let _ = self.end_cost(job, Utc::now());
-        self.update(
+        // A job being staged right now has its cost closed by its launch task, after teardown.
+        // One left in Staging by a restart (not resumed yet) is closed here; the sweep then
+        // tears its instance down.
+        if !(job.state == JobState::Staging && lock(&self.in_flight).contains(&job.id)) {
+            let _ = self.end_cost(job, Utc::now());
+        }
+        self.update_if(
             job.id,
+            LIVE,
             JobUpdate {
                 state: Some(JobState::Cancelled),
                 ended_at: Some(Some(Utc::now())),
-                reason: Some(Some("cancelled by request".into())),
+                reason: Some(Some(reason)),
                 ..Default::default()
             },
         )
+        .map(|_| ())
     }
 
     /// Live availability for a backend, refreshed at most once a minute.

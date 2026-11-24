@@ -80,6 +80,9 @@ pub struct ResourcesReq {
     pub gpus: u32,
     #[serde(default)]
     pub gpu_type: Option<String>,
+    /// Disk the job needs free for its outputs and working files, in GB.
+    #[serde(default)]
+    pub disk_gb: Option<f64>,
     pub time: String,
 }
 
@@ -175,7 +178,8 @@ pub struct JobRequest {
     pub quote_id: Option<String>,
     #[serde(default)]
     pub keep_outputs: Option<String>,
-    #[serde(default)]
+    /// Requeues after the job is lost (host gone, no heartbeat). Default 1.
+    #[serde(default = "one")]
     pub retries: u32,
     #[serde(default)]
     pub priority: i64,
@@ -277,6 +281,9 @@ pub struct Resources {
     pub gpus: u32,
     pub gpu_type: Option<String>,
     pub time_s: u64,
+    /// Free disk the job needs (0: not stated).
+    #[serde(default)]
+    pub disk_mb: u64,
 }
 
 /// Parses `2h`, `90m`, `1h30m`, `45s`, `1d` (and combinations) into a duration.
@@ -413,6 +420,11 @@ impl JobRequest {
         if !(r.mem_gb > 0.0 && r.mem_gb.is_finite()) {
             return Err(ApiError::bad_request("`resources.mem_gb` must be positive", "e.g. 4"));
         }
+        if let Some(d) = r.disk_gb
+            && !(d > 0.0 && d.is_finite())
+        {
+            return Err(ApiError::bad_request("`resources.disk_gb` must be positive", "e.g. 50"));
+        }
         let time = parse_duration(&r.time).ok_or_else(|| {
             ApiError::bad_request(
                 format!("`resources.time` {:?} is not a duration", r.time),
@@ -452,6 +464,7 @@ impl JobRequest {
             gpus: r.gpus,
             gpu_type: r.gpu_type.clone(),
             time_s: time.as_secs(),
+            disk_mb: r.disk_gb.map(|d| (d * 1024.0).ceil() as u64).unwrap_or(0),
         })
     }
 }

@@ -16,6 +16,7 @@
 use super::{Alloc, Backend, PollResult, Probe, Quote, Remote, Shape, StageFiles, parse_status, tar_dir_script};
 use crate::config::{BackendConfig, BackendKind, CloudConfig, Paths};
 use crate::model::{Job, JobState};
+use crate::store::{JobUpdate, Store};
 use crate::transport::{LocalShell, Reader, Shell, Ssh, shell_quote};
 use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
@@ -29,6 +30,10 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 const OFFERS_TTL: Duration = Duration::from_secs(120);
+/// Room on a new instance's provider-side timeout for staging (dataset and input copies).
+const STAGING_ALLOWANCE_S: u64 = 1800;
+/// Room after the time limit for the runner to stop and the outputs to be copied off.
+const COLLECT_ALLOWANCE_S: u64 = 900;
 const MASTER_PORT: u16 = 29500;
 
 /// One way to rent the GPUs a job asks for.
@@ -45,6 +50,9 @@ pub struct Offer {
     pub available: bool,
     #[serde(default)]
     pub region: Option<String>,
+    /// Local disk per node in GB (0: unknown, or sized at creation as on RunPod).
+    #[serde(default)]
+    pub disk_gb: u32,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -87,6 +95,60 @@ fn one() -> u32 {
     1
 }
 
+/// What a job needs from an offer. GPU and node counts select the offers; CPUs, memory and
+/// the image's CUDA version let a provider that sizes machines per request (RunPod) price the
+/// right one.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct Need {
+    pub gpus: u32,
+    pub nodes: u32,
+    pub cpus: u32,
+    pub mem_gb: u32,
+    pub min_cuda: Option<String>,
+}
+
+impl Need {
+    fn of(job: &Job, image: Option<&str>) -> Need {
+        let r = &job.resources;
+        Need { gpus: r.gpus, nodes: r.nodes, cpus: r.cpus, mem_gb: r.mem_mb.div_ceil(1024) as u32, min_cuda: image.and_then(min_cuda_of) }
+    }
+    /// Any one GPU, for price and stock listings.
+    fn any_gpu() -> Need {
+        Need { gpus: 1, nodes: 1, cpus: 0, mem_gb: 0, min_cuda: None }
+    }
+}
+
+/// The CUDA version an image tag names (`nvidia/cuda:12.4.1-…`, `…-cuda12.1-…`, `…cu121…`),
+/// so the instance's driver can be required to support it.
+pub fn min_cuda_of(image: &str) -> Option<String> {
+    let tag = image.rsplit_once(':').map(|(_, t)| t).unwrap_or(image).to_ascii_lowercase();
+    let name = image.to_ascii_lowercase();
+    let digits = |s: &str| -> Option<(u32, u32)> {
+        let mut parts = s.split(|c: char| !c.is_ascii_digit()).filter(|x| !x.is_empty());
+        Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+    };
+    // nvidia/cuda:<major>.<minor>…
+    if name.contains("nvidia/cuda") && let Some((a, b)) = digits(&tag) {
+        return Some(format!("{a}.{b}"));
+    }
+    if let Some(i) = tag.find("cuda") {
+        let rest = tag[i + 4..].trim_start_matches(['-', '_', ':']);
+        if let Some((a, b)) = digits(rest) {
+            return Some(format!("{a}.{b}"));
+        }
+    }
+    // cu121 / cu118 / cu124
+    let mut search = tag.as_str();
+    while let Some(i) = search.find("cu") {
+        let d: String = search[i + 2..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        if d.len() == 3 {
+            return Some(format!("{}.{}", &d[..2], &d[2..]));
+        }
+        search = &search[i + 2..];
+    }
+    None
+}
+
 /// What to create.
 pub struct CreateReq<'a> {
     pub name: String,
@@ -95,14 +157,28 @@ pub struct CreateReq<'a> {
     pub offer: Offer,
     pub nodes: u32,
     pub pubkey: String,
-    pub registry: Option<(String, String, String)>,
+    /// More public keys to authorize (`authorized_keys` in hosts.toml).
+    pub extra_keys: Vec<String>,
     pub timeout_s: u64,
 }
 
 #[async_trait]
 pub trait Provider: Send + Sync {
-    /// Offers for `gpus` GPUs per node on `nodes` nodes.
-    async fn offers(&self, gpus: u32, nodes: u32) -> Result<Vec<Offer>>;
+    /// Offers for `need.gpus` GPUs per node (0: a CPU machine) on `need.nodes` nodes.
+    async fn offers(&self, need: &Need) -> Result<Vec<Offer>>;
+    /// Whether CPU-only jobs can run here (RunPod CPU pods).
+    fn cpu_pods(&self) -> bool {
+        false
+    }
+    /// Environment for multi-node jobs (e.g. which interface NCCL must use).
+    fn node_env(&self) -> Vec<(String, String)> {
+        Vec::new()
+    }
+    /// Moves an instance's own idle timer (if it has one) to `secs` from now; called at launch,
+    /// when the job's time limit starts.
+    async fn extend_deadline(&self, _shell: &dyn Shell, _secs: u64) -> Result<()> {
+        Ok(())
+    }
     async fn create(&self, req: &CreateReq<'_>) -> Result<Instance>;
     /// Waits until every node is reachable and fills in their addresses.
     async fn wait_ready(&self, inst: &mut Instance, deadline: Instant) -> Result<()>;
@@ -117,15 +193,16 @@ pub trait Provider: Send + Sync {
     /// `docker` when the job's image runs under Docker on a VM; `native` when the instance is
     /// the image.
     fn runtime(&self) -> &'static str;
-    /// Steps after the instance is reachable (Docker group, registry login).
-    async fn prepare(&self, _shell: &dyn Shell, _registry: Option<&(String, String, String)>) -> Result<()> {
+    /// Steps after the instance is reachable (Docker group). Images are public, so there is no
+    /// registry login.
+    async fn prepare(&self, _shell: &dyn Shell) -> Result<()> {
         Ok(())
     }
 }
 
 /// `(state, exit code, started, ended, note)` of a finished cloud job.
 type Outcome = (Option<JobState>, Option<i32>, Option<DateTime<Utc>>, Option<DateTime<Utc>>, Option<String>);
-type OfferCache = HashMap<(u32, u32), (Instant, Vec<Offer>)>;
+type OfferCache = HashMap<Need, (Instant, Vec<Offer>)>;
 
 /// Outcome of copying a finished job off its instance.
 #[derive(Clone)]
@@ -134,6 +211,7 @@ struct Collected {
 }
 
 pub struct CloudBackend {
+    store: Arc<Store>,
     cfg: BackendConfig,
     ccfg: CloudConfig,
     provider: Arc<dyn Provider>,
@@ -146,7 +224,20 @@ pub struct CloudBackend {
     collecting: Mutex<HashSet<i64>>,
     collected: Mutex<HashMap<i64, Collected>>,
     boot_secs: RwLock<Option<f64>>,
-    registry: RwLock<Option<(String, String, String)>>,
+    /// The offer each job was last quoted, so the instance rented is the one priced.
+    quoted: Mutex<HashMap<i64, Offer>>,
+}
+
+/// What the outputs directory records about how a job ended (survives a daemon restart
+/// between teardown and the next poll).
+#[derive(Serialize, Deserialize)]
+struct SavedOutcome {
+    provider_id: String,
+    state: Option<String>,
+    exit_code: Option<i32>,
+    started: Option<DateTime<Utc>>,
+    ended: Option<DateTime<Utc>>,
+    note: Option<String>,
 }
 
 /// The coordinator's own ssh public key, which cloud instances authorize.
@@ -164,7 +255,7 @@ fn daemon_pubkey() -> Option<String> {
 }
 
 impl CloudBackend {
-    pub fn new(cfg: BackendConfig, paths: &Paths) -> Result<CloudBackend> {
+    pub fn new(cfg: BackendConfig, paths: &Paths, store: Arc<Store>) -> Result<CloudBackend> {
         let ccfg = cfg.cloud.clone().unwrap_or_default();
         let key_file = paths.config_dir.join(ccfg.key_file.clone().unwrap_or_else(|| match cfg.kind {
             BackendKind::Modal => "modal.toml".into(),
@@ -177,6 +268,8 @@ impl CloudBackend {
             k => bail!("{} is not a cloud backend", k.as_str()),
         };
         Ok(CloudBackend {
+            store,
+            quoted: Mutex::new(HashMap::new()),
             pubkey: daemon_pubkey().unwrap_or_default(),
             cfg,
             ccfg,
@@ -189,13 +282,7 @@ impl CloudBackend {
             collecting: Mutex::new(HashSet::new()),
             collected: Mutex::new(HashMap::new()),
             boot_secs: RwLock::new(None),
-            registry: RwLock::new(None),
         })
-    }
-
-    /// Registry credentials for private images, set by the scheduler at startup.
-    pub fn set_registry(&self, creds: Option<(String, String, String)>) {
-        *self.registry.write().unwrap_or_else(|e| e.into_inner()) = creds;
     }
 
     fn boot(&self) -> f64 {
@@ -206,18 +293,18 @@ impl CloudBackend {
         self.outputs_dir.join(id.to_string())
     }
 
-    async fn cached_offers(&self, gpus: u32, nodes: u32) -> Result<Vec<Offer>> {
-        if let Some((at, o)) = self.offers.lock().await.get(&(gpus, nodes))
+    async fn cached_offers(&self, need: &Need) -> Result<Vec<Offer>> {
+        if let Some((at, o)) = self.offers.lock().await.get(need)
             && at.elapsed() < OFFERS_TTL
         {
             return Ok(o.clone());
         }
-        let mut o = self.provider.offers(gpus, nodes).await?;
+        let mut o = self.provider.offers(need).await?;
         if !self.ccfg.gpu_types.is_empty() {
             o.retain(|x| self.ccfg.gpu_types.iter().any(|t| contains_ci(&x.gpu_type, t) || contains_ci(&x.id, t)));
         }
         o.sort_by(|a, b| a.usd_per_hour.total_cmp(&b.usd_per_hour));
-        self.offers.lock().await.insert((gpus, nodes), (Instant::now(), o.clone()));
+        self.offers.lock().await.insert(need.clone(), (Instant::now(), o.clone()));
         Ok(o)
     }
 
@@ -226,15 +313,21 @@ impl CloudBackend {
     }
 
     /// The job's instance: from memory, from its handle (after a restart), or created now.
+    /// An instance recorded while staging (before launch) is picked up again when staging
+    /// resumes, instead of renting a second one.
     async fn instance(&self, job: &Job, create: bool) -> Result<Instance> {
         if let Some(i) = self.instances.lock().await.get(&job.id) {
             return Ok(i.clone());
         }
-        if let Some(h) = &job.handle
-            && let Ok(i) = serde_json::from_value::<Instance>(h["instance"].clone())
+        let stored = job.handle.as_ref().and_then(|h| {
+            let i = serde_json::from_value::<Instance>(h["instance"].clone()).ok()?;
+            Some((i, h["staging"].as_bool() == Some(true)))
+        });
+        if let Some((i, staging)) = &stored
+            && !(create && *staging)
         {
             self.instances.lock().await.insert(job.id, i.clone());
-            return Ok(i);
+            return Ok(i.clone());
         }
         if !create {
             bail!("job {} has no instance", job.id);
@@ -244,23 +337,56 @@ impl CloudBackend {
         if let Some(i) = self.instances.lock().await.get(&job.id) {
             return Ok(i.clone());
         }
+        if let Some((i, _)) = stored {
+            if self.provider.alive(&i).await.unwrap_or(false) {
+                tracing::info!("{}: resuming staging of job {} on {}", self.cfg.name, job.id, i.name);
+                self.instances.lock().await.insert(job.id, i.clone());
+                return self.ready_instance(job, i).await;
+            }
+            let _ = self.provider.terminate(&i).await;
+        }
         self.create_instance(job).await
+    }
+
+    /// The offer to rent for `job`: the one it was quoted if still available, else a fitting
+    /// one no dearer than that; never one over the job's `max_cost_usd`.
+    async fn pick_offer(&self, job: &Job) -> Result<Offer> {
+        let r = &job.resources;
+        let offers = self.cached_offers(&Need::of(job, self.image_for(job).as_deref())).await?;
+        let quoted = self.quoted.lock().await.get(&job.id).cloned();
+        let offer = match &quoted {
+            Some(q) => offers
+                .iter()
+                .find(|o| o.available && o.id == q.id && o.region == q.region)
+                .or_else(|| offers.iter().find(|o| o.available && offer_fits(o, job) && o.usd_per_hour <= q.usd_per_hour))
+                .cloned()
+                .with_context(|| format!("the quoted {} (${:.2}/h) has no capacity any more, and nothing as cheap does", q.gpu_type, q.usd_per_hour))?,
+            None => offers.into_iter().find(|o| o.available && offer_fits(o, job)).context("no offer with capacity right now")?,
+        };
+        if let Some(max) = job.spec.max_cost_usd {
+            let cost = self.rate(&offer, job) * (r.time_s as f64 + self.boot()) / 3600.0;
+            if cost > max {
+                bail!("{} would cost ~${cost:.2} for the full time limit, over max_cost_usd {max}", offer.gpu_type);
+            }
+        }
+        Ok(offer)
+    }
+
+    /// USD per hour for `job` on `offer`, all nodes (plus CPU/memory rates where billed apart).
+    fn rate(&self, offer: &Offer, job: &Job) -> f64 {
+        let r = &job.resources;
+        let extras = self.ccfg.cpu_rate * f64::from(r.cpus) + self.ccfg.mem_gb_rate * (r.mem_mb as f64 / 1024.0);
+        (offer.usd_per_hour + extras) * f64::from(r.nodes)
     }
 
     async fn create_instance(&self, job: &Job) -> Result<Instance> {
         let image = self.image_for(job).context("no image: set container.image (this backend has no default_image)")?;
         let r = &job.resources;
-        let offer = self
-            .cached_offers(r.gpus, r.nodes)
-            .await?
-            .into_iter()
-            .find(|o| o.available && offer_fits(o, job))
-            .context("no offer with capacity right now")?;
+        let offer = self.pick_offer(job).await?;
         if self.pubkey.is_empty() {
             bail!("the coordinator has no ssh public key (~/.ssh/id_ed25519.pub) for cloud instances");
         }
         let name = format!("compute-{}-{}", job.id, hex::encode(rand::random::<[u8; 3]>()));
-        let registry = self.registry.read().unwrap_or_else(|e| e.into_inner()).clone().filter(|(h, ..)| image.starts_with(&format!("{h}/")));
         let req = CreateReq {
             name,
             job,
@@ -268,17 +394,30 @@ impl CloudBackend {
             offer,
             nodes: r.nodes,
             pubkey: self.pubkey.clone(),
-            registry: registry.clone(),
-            timeout_s: r.time_s + 600 + self.boot() as u64,
+            extra_keys: self.ccfg.authorized_keys.clone(),
+            timeout_s: r.time_s + COLLECT_ALLOWANCE_S + STAGING_ALLOWANCE_S + self.boot() as u64,
         };
+        // A new attempt: what an earlier attempt of this job left locally is stale now.
+        let _ = tokio::fs::remove_dir_all(self.job_dir_local(job.id)).await;
         let started = Instant::now();
         let mut inst = self.provider.create(&req).await?;
         tracing::info!("{}: created {} ({}) for job {}", self.cfg.name, inst.name, inst.provider_id, job.id);
+        // Billing starts now. Record the instance with the job too, so a daemon restart while
+        // staging resumes with it instead of leaving it to the sweep.
+        inst.deadline = Utc::now() + chrono::Duration::seconds(req.timeout_s as i64);
         self.instances.lock().await.insert(job.id, inst.clone());
-        let deadline = Instant::now() + Duration::from_secs(20 * 60);
-        if let Err(e) = self.provider.wait_ready(&mut inst, deadline).await {
+        if let Err(e) = self.store.cost_start(job.id, &self.cfg.name, self.rate(&inst.offer, job), Utc::now()) {
+            tracing::warn!("recording the cost of {}: {e:#}", inst.name);
+        }
+        let _ = self.store.update_job_if(
+            job.id,
+            &[JobState::Staging],
+            JobUpdate { handle: Some(Some(json!({"instance": inst, "staging": true}))), ..Default::default() },
+        );
+        let boot_deadline = Instant::now() + Duration::from_secs(20 * 60);
+        if let Err(e) = self.provider.wait_ready(&mut inst, boot_deadline).await {
             let _ = self.provider.terminate(&inst).await;
-            self.instances.lock().await.remove(&job.id);
+            self.forget(&inst).await;
             return Err(e.context(format!("{} did not become ready", inst.name)));
         }
         let secs = started.elapsed().as_secs_f64();
@@ -289,9 +428,34 @@ impl CloudBackend {
                 None => secs,
             });
         }
+        self.prepare_instance(job, inst).await
+    }
+
+    /// Waits for an instance found again after a restart, then prepares it.
+    async fn ready_instance(&self, job: &Job, mut inst: Instance) -> Result<Instance> {
+        if inst.nodes.is_empty() {
+            let boot_deadline = Instant::now() + Duration::from_secs(20 * 60);
+            if let Err(e) = self.provider.wait_ready(&mut inst, boot_deadline).await {
+                let _ = self.provider.terminate(&inst).await;
+                self.forget(&inst).await;
+                return Err(e.context(format!("{} did not become ready", inst.name)));
+            }
+        }
+        self.prepare_instance(job, inst).await
+    }
+
+    /// Drops `inst` from memory, unless the job has moved on to another instance.
+    async fn forget(&self, inst: &Instance) {
+        let mut m = self.instances.lock().await;
+        if m.get(&inst.job_id).is_some_and(|i| i.provider_id == inst.provider_id) {
+            m.remove(&inst.job_id);
+        }
+    }
+
+    async fn prepare_instance(&self, job: &Job, inst: Instance) -> Result<Instance> {
         for node in &inst.nodes {
             let shell = self.provider.shell(node)?;
-            self.provider.prepare(shell.as_ref(), registry.as_ref()).await?;
+            self.provider.prepare(shell.as_ref()).await?;
             if node.ssh.is_some() && !self.ccfg.authorized_keys.is_empty() {
                 let keys: String = self.ccfg.authorized_keys.iter().map(|k| format!("{}\n", k.trim())).collect();
                 shell
@@ -313,10 +477,13 @@ impl CloudBackend {
     /// final state is reported by the next poll.
     async fn collect_and_teardown(&self, job: &Job, inst: &Instance, forced: Option<JobState>) -> Collected {
         let local = self.job_dir_local(job.id);
+        // A superseded attempt (the job was requeued onto a new instance) only tears down.
+        let current = self.instances.lock().await.get(&job.id).is_none_or(|i| i.provider_id == inst.provider_id);
+        let nodes = if current { inst.nodes.len() } else { 0 };
         let _ = tokio::fs::create_dir_all(local.join("out")).await;
         let mut result: Collected = Collected { result: (forced, None, None, Some(Utc::now()), None) };
         let mut statuses = Vec::new();
-        for rank in 0..inst.nodes.len() {
+        for rank in 0..nodes {
             let Ok(remote) = self.remote(inst, rank) else { continue };
             let status = remote.read_statuses(&[job.id]).await.ok().and_then(|m| m.get(&job.id).cloned());
             if let Some((s, beat)) = status {
@@ -356,7 +523,7 @@ impl CloudBackend {
         } else {
             tracing::info!("{}: terminated {} after job {}", self.cfg.name, inst.name, job.id);
         }
-        self.instances.lock().await.remove(&job.id);
+        self.forget(inst).await;
         if forced.is_none() {
             // Overall state: any node failed > timeout > cancelled > succeeded.
             let order = |s: Option<JobState>| match s {
@@ -367,9 +534,12 @@ impl CloudBackend {
                 _ => 4,
             };
             if let Some((rank, worst)) = statuses.iter().min_by_key(|(_, p)| order(p.state)) {
-                let note = (inst.nodes.len() > 1 && *rank > 0 && worst.state != Some(JobState::Succeeded))
-                    .then(|| format!("node {rank} {}", worst.state.map(|s| s.as_str()).unwrap_or("ended")));
                 let main = statuses.iter().find(|(r, _)| *r == 0).map(|(_, p)| p);
+                // The runner's diagnosis (out of memory, out of disk) beats a bare state.
+                let note = worst.note.clone().or_else(|| main.and_then(|p| p.note.clone())).or_else(|| {
+                    (inst.nodes.len() > 1 && *rank > 0 && worst.state != Some(JobState::Succeeded))
+                        .then(|| format!("node {rank} {}", worst.state.map(|s| s.as_str()).unwrap_or("ended")))
+                });
                 result.result = (
                     worst.state.or(Some(JobState::Lost)),
                     main.and_then(|p| p.exit_code).or(worst.exit_code),
@@ -381,7 +551,21 @@ impl CloudBackend {
                 result.result = (Some(JobState::Lost), None, None, Some(Utc::now()), Some("no status from the instance".into()));
             }
         }
+        if current {
+            let (state, exit_code, started, ended, note) = result.result.clone();
+            let saved = SavedOutcome { provider_id: inst.provider_id.clone(), state: state.map(|s| s.as_str().to_string()), exit_code, started, ended, note };
+            if let Ok(text) = serde_json::to_vec(&saved) {
+                let _ = tokio::fs::write(local.join("outcome.json"), text).await;
+            }
+        }
         result
+    }
+
+    /// How the job ended on `inst`, as saved by its teardown (None if it wasn't torn down).
+    async fn saved_outcome(&self, job_id: i64, inst: &Instance) -> Option<Outcome> {
+        let text = tokio::fs::read(self.job_dir_local(job_id).join("outcome.json")).await.ok()?;
+        let o: SavedOutcome = serde_json::from_slice(&text).ok()?;
+        (o.provider_id == inst.provider_id).then(|| (o.state.as_deref().and_then(JobState::parse), o.exit_code, o.started, o.ended, o.note))
     }
 
     fn spawn_collect(self: &Arc<Self>, job: Job, inst: Instance, forced: Option<JobState>) {
@@ -410,7 +594,8 @@ fn offer_fits(o: &Offer, job: &Job) -> bool {
     let type_ok = r.gpu_type.as_deref().is_none_or(|t| contains_ci(&o.gpu_type, t) || contains_ci(&o.id, t));
     let cpus_ok = o.cpus == 0 || o.cpus >= r.cpus;
     let mem_ok = o.mem_gb == 0 || u64::from(o.mem_gb) * 1024 >= r.mem_mb;
-    type_ok && cpus_ok && mem_ok && o.gpus == r.gpus
+    let disk_ok = o.disk_gb == 0 || u64::from(o.disk_gb) * 1024 >= r.disk_mb;
+    type_ok && cpus_ok && mem_ok && disk_ok && o.gpus == r.gpus
 }
 
 /// Wraps the backend so `spawn_collect` can hold an `Arc` to it.
@@ -436,7 +621,7 @@ impl Backend for Cloud {
 
     async fn probe(&self) -> Result<Probe> {
         let b = &self.0;
-        let offers = b.provider.offers(1, 1).await?;
+        let offers = b.provider.offers(&Need::any_gpu()).await?;
         let mut by_type: BTreeMap<String, Value> = BTreeMap::new();
         for o in &offers {
             by_type.insert(
@@ -464,8 +649,11 @@ impl Backend for Cloud {
         let Some(max) = job.spec.max_cost_usd else {
             return Quote::no("paid backend; set max_cost_usd to allow it", true);
         };
-        if r.gpus == 0 {
-            return Quote::no("cloud backends here run GPU jobs only", true);
+        if r.gpus == 0 && !b.provider.cpu_pods() {
+            return Quote::no(format!("{} runs GPU jobs only", b.cfg.name), true);
+        }
+        if r.gpus == 0 && r.nodes > 1 {
+            return Quote::no("multi-node CPU jobs aren't supported on cloud backends", true);
         }
         if r.nodes > b.cfg.max_nodes {
             return Quote::no(format!("nodes={}; {} allows at most {}", r.nodes, b.cfg.name, b.cfg.max_nodes), true);
@@ -479,7 +667,7 @@ impl Backend for Cloud {
         if job.os.as_deref() == Some("mac") {
             return Quote::no("os=mac; cloud instances are linux", true);
         }
-        let offers = match b.cached_offers(r.gpus, r.nodes).await {
+        let offers = match b.cached_offers(&Need::of(job, b.image_for(job).as_deref())).await {
             Ok(o) => o,
             Err(e) => return Quote::no(format!("price lookup failed: {e:#}"), false),
         };
@@ -504,6 +692,9 @@ impl Backend for Cloud {
                 true,
             );
         }
+        if job.id > 0 {
+            b.quoted.lock().await.insert(job.id, (*o).clone());
+        }
         let shape = Shape {
             cpus: o.cpus.max(r.cpus),
             mem_mb: (u64::from(o.mem_gb) * 1024).max(r.mem_mb),
@@ -517,7 +708,11 @@ impl Backend for Cloud {
         Quote::Ok {
             start: Utc::now() + chrono::Duration::seconds(boot as i64),
             source: "provider".into(),
-            reason: format!("{nodes}{} x{} at ${:.2}/h on {}", o.gpu_type, o.gpus, per_hour, b.cfg.name),
+            reason: if o.gpus == 0 {
+                format!("{} ({} vCPU, {} GB) at ${:.2}/h on {}", o.gpu_type, o.cpus, o.mem_gb, per_hour, b.cfg.name)
+            } else {
+                format!("{nodes}{} x{} at ${:.2}/h on {}", o.gpu_type, o.gpus, per_hour, b.cfg.name)
+            },
             shape,
             cost: Some(cost),
         }
@@ -541,6 +736,7 @@ impl Backend for Cloud {
                     ("MASTER_ADDR".to_string(), master.clone()),
                     ("MASTER_PORT".to_string(), MASTER_PORT.to_string()),
                 ]);
+                f.env.extend(b.provider.node_env());
             }
             if rank > 0 {
                 // Datasets were copied to node 0; replicate them.
@@ -561,7 +757,15 @@ impl Backend for Cloud {
         let b = &self.0;
         let mut handles = Vec::new();
         for job in jobs {
-            let inst = b.instance(job, false).await?;
+            let mut inst = b.instance(job, false).await?;
+            // The time limit runs from launch, not from creation: staging time doesn't count.
+            inst.deadline = Utc::now() + chrono::Duration::seconds((job.resources.time_s + COLLECT_ALLOWANCE_S) as i64);
+            b.instances.lock().await.insert(job.id, inst.clone());
+            for node in &inst.nodes {
+                let shell = b.provider.shell(node)?;
+                b.provider.extend_deadline(shell.as_ref(), job.resources.time_s + COLLECT_ALLOWANCE_S).await?;
+            }
+            b.quoted.lock().await.remove(&job.id);
             let root = b.provider.root();
             // Inputs were received on node 0; replicate them for multi-node jobs.
             let jobdir = Remote::jobdir(root, job.id);
@@ -605,6 +809,12 @@ impl Backend for Cloud {
                 out.push(PollResult { id: job.id, state: Some(JobState::Lost), note: Some("instance record is gone".into()), ..Default::default() });
                 continue;
             };
+            // Torn down before a daemon restart, but the outcome wasn't reported yet.
+            if let Some((state, exit_code, started, ended, note)) = b.saved_outcome(job.id, &inst).await {
+                b.forget(&inst).await;
+                out.push(PollResult { id: job.id, state, exit_code, started, ended, note, ..Default::default() });
+                continue;
+            }
             let mut node_results = Vec::new();
             let mut reach_err = None;
             for rank in 0..inst.nodes.len() {
@@ -662,7 +872,12 @@ impl Backend for Cloud {
             let end = (start + max as usize).min(data.len());
             return Ok((data[start..end].to_vec(), size));
         }
-        let inst = b.instance(job, false).await?;
+        let inst = match b.instance(job, false).await {
+            Ok(i) => i,
+            // Ended before it had an instance (e.g. failed in staging): there is no log.
+            Err(_) if job.state.is_terminal() => return Ok((Vec::new(), 0)),
+            Err(e) => return Err(e),
+        };
         b.remote(&inst, 0)?.logs(job.id, offset, max).await
     }
 
@@ -679,6 +894,8 @@ impl Backend for Cloud {
     async fn cancel(&self, job: &Job) -> Result<()> {
         let b = &self.0;
         let Ok(inst) = b.instance(job, false).await else { return Ok(()) };
+        // Forget it now, so a requeued job gets a new instance instead of this dying one.
+        b.forget(&inst).await;
         for rank in 0..inst.nodes.len() {
             if let Ok(r) = b.remote(&inst, rank) {
                 let _ = tokio::time::timeout(Duration::from_secs(20), r.touch_cancel(job.id)).await;
@@ -700,7 +917,7 @@ impl Backend for Cloud {
 
     async fn availability(&self) -> Result<Value> {
         let b = &self.0;
-        let offers = b.cached_offers(1, 1).await?;
+        let offers = b.cached_offers(&Need::any_gpu()).await?;
         let available: Vec<Value> = offers
             .iter()
             .filter(|o| o.available)
@@ -725,6 +942,31 @@ impl Backend for Cloud {
         b.remote(&inst, 0)?.metrics(job.id, history).await
     }
 
+    async fn list_outputs(&self, job: &Job, glob: Option<&str>) -> Result<Vec<(String, u64)>> {
+        let b = &self.0;
+        let local_out = b.job_dir_local(job.id).join("out");
+        if local_out.exists() && (job.state.is_terminal() || b.collected_locally(job.id)) {
+            let out = LocalShell.run(&super::list_dir_script(&local_out.to_string_lossy(), glob)).await?.text();
+            return Ok(super::parse_listing(&out));
+        }
+        let inst = b.instance(job, false).await?;
+        let node = inst.nodes.first().context("instance has no nodes")?;
+        let dir = format!("{}/out", Remote::jobdir(b.provider.root(), job.id));
+        let out = b.provider.shell(node)?.run(&super::list_dir_script(&dir, glob)).await?.text();
+        Ok(super::parse_listing(&out))
+    }
+
+    /// The copy on the coordinator (the instance is gone by the time a job has ended).
+    async fn delete_outputs(&self, job: &Job) -> Result<()> {
+        let _ = tokio::fs::remove_dir_all(self.0.job_dir_local(job.id).join("out")).await;
+        Ok(())
+    }
+
+    /// Nothing to do: the instance, and its inputs, are torn down with the job.
+    async fn delete_inputs(&self, _job: &Job) -> Result<()> {
+        Ok(())
+    }
+
     async fn shell_for(&self, job: Option<&Job>) -> Result<(Arc<dyn Shell>, String)> {
         let b = &self.0;
         let job = job.context("cloud backends have no shared host")?;
@@ -735,6 +977,8 @@ impl Backend for Cloud {
 
     async fn sweep(&self, live: &HashMap<i64, Option<Value>>) -> Result<()> {
         let b = &self.0;
+        let listed = b.provider.list().await?;
+        // Snapshot after listing, so an instance created meanwhile is known.
         let known: HashMap<i64, Instance> = b.instances.lock().await.clone();
         let mut owned: HashSet<String> = known.values().map(|i| i.provider_id.clone()).collect();
         for h in live.values().flatten() {
@@ -743,11 +987,16 @@ impl Backend for Cloud {
             }
         }
         let now = Utc::now();
-        for (id, name, cluster) in b.provider.list().await? {
+        let deadline_of = |job_id: i64| {
+            known.get(&job_id).map(|i| i.deadline).or_else(|| {
+                live.get(&job_id)?.as_ref().and_then(|h| serde_json::from_value::<Instance>(h["instance"].clone()).ok()).map(|i| i.deadline)
+            })
+        };
+        for (id, name, cluster) in listed {
             let Some(job_id) = name.strip_prefix("compute-").and_then(|r| r.split('-').next()).and_then(|x| x.parse::<i64>().ok()) else {
                 continue;
             };
-            let keep = live.contains_key(&job_id) && owned.contains(&id) && known.get(&job_id).is_none_or(|i| i.deadline > now);
+            let keep = live.contains_key(&job_id) && owned.contains(&id) && deadline_of(job_id).is_none_or(|d| d > now);
             if keep {
                 continue;
             }
@@ -761,7 +1010,7 @@ impl Backend for Cloud {
                 nodes: Vec::new(),
                 created_at: now,
                 deadline: now,
-                offer: Offer { id: String::new(), gpu_type: String::new(), gpus: 0, cpus: 0, mem_gb: 0, usd_per_hour: 0.0, available: false, region: None },
+                offer: Offer { id: String::new(), gpu_type: String::new(), gpus: 0, cpus: 0, mem_gb: 0, usd_per_hour: 0.0, available: false, region: None, disk_gb: 0 },
             };
             if let Err(e) = b.provider.terminate(&fake).await {
                 tracing::warn!("terminating {name}: {e:#}");
@@ -772,7 +1021,7 @@ impl Backend for Cloud {
 
     fn pricing(&self) -> Option<Value> {
         let b = &self.0;
-        let o = b.offers.try_lock().ok()?.get(&(1, 1)).map(|(_, o)| o.clone())?;
+        let o = b.offers.try_lock().ok()?.get(&Need::any_gpu()).map(|(_, o)| o.clone())?;
         Some(json!(o.iter().map(|o| json!({"gpu_type": o.gpu_type, "usd_per_hour_per_gpu": o.usd_per_hour, "available": o.available})).collect::<Vec<_>>()))
     }
 }
@@ -855,41 +1104,59 @@ async fn wait_ssh(addr: &SshAddr, name: &str, deadline: Instant) -> Result<()> {
     bail!("ssh to {name} never worked: {last}")
 }
 
-/// Container entrypoint for images without sshd: install it if needed, authorize the
-/// coordinator's key, start sshd, then idle until the deadline.
+/// Container entrypoint (POSIX sh, run as root): keep the image's environment for ssh
+/// sessions, install sshd and the runner's tools if missing, authorize the keys, start sshd,
+/// then idle until the deadline in /run/compute-deadline (moved at launch). Exits, failing the
+/// pod at once, when the image can't be made reachable, instead of idling unreachable.
 fn boot_script(timeout_s: u64) -> String {
     format!(
-        r#"if ! [ -x /usr/sbin/sshd ]; then
+        r#"exec >/tmp/compute-boot.log 2>&1
+echo "$(( $(date +%s) + {timeout_s} ))" > /run/compute-deadline
+if [ "$(id -u)" != 0 ]; then echo "compute: the image runs as uid $(id -u); RunPod jobs need an image that runs as root"; cat /tmp/compute-boot.log >&2; exit 1; fi
+# ssh sessions don't inherit PID 1's environment, and login shells reset PATH: replay it.
+export -p | grep -vE '^(export |declare -x )?(HOME|PWD|OLDPWD|SHLVL|HOSTNAME|_|PUBLIC_KEY)=' > /etc/profile.d/00-compute-env.sh
+need=""
+[ -x /usr/sbin/sshd ] || need="$need sshd"
+command -v bash >/dev/null 2>&1 || need="$need bash"
+command -v tar >/dev/null 2>&1 || need="$need tar"
+command -v ps >/dev/null 2>&1 || need="$need ps"
+if [ -n "$need" ]; then
   if command -v apt-get >/dev/null 2>&1; then
-    (apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server bash tar) > /tmp/compute-boot.log 2>&1
+    apt-get update -qq || true
+    DEBIAN_FRONTEND=noninteractive apt-get install -y -qq openssh-server bash tar procps
   elif command -v apk >/dev/null 2>&1; then
-    apk add --no-cache openssh bash tar > /tmp/compute-boot.log 2>&1
+    apk add --no-cache openssh bash tar procps
   elif command -v dnf >/dev/null 2>&1; then
-    dnf install -y openssh-server bash tar > /tmp/compute-boot.log 2>&1
+    dnf install -y openssh-server bash tar procps-ng
   fi
+fi
+if ! [ -x /usr/sbin/sshd ] || ! command -v bash >/dev/null 2>&1; then
+  echo "compute: couldn't install sshd and bash in this image (missing:$need)"; cat /tmp/compute-boot.log >&2; exit 1
 fi
 mkdir -p /root/.ssh /run/sshd /var/run/sshd
 chmod 700 /root/.ssh
 printf '%s\n' "$PUBLIC_KEY" > /root/.ssh/authorized_keys
 chmod 600 /root/.ssh/authorized_keys
-ssh-keygen -A > /dev/null 2>&1
-/usr/sbin/sshd -o PermitRootLogin=prohibit-password -o PasswordAuthentication=no
-sleep {timeout_s}"#
+ssh-keygen -A
+/usr/sbin/sshd -o PermitRootLogin=prohibit-password -o PasswordAuthentication=no || {{ cat /tmp/compute-boot.log >&2; exit 1; }}
+echo "compute: ready"
+while [ "$(date +%s)" -lt "$(cat /run/compute-deadline 2>/dev/null || echo 0)" ]; do sleep 30; done"#
     )
 }
 
 // ---------------------------------------------------------------------------- RunPod
 
-/// RunPod GPU Pods (single node) and Instant Clusters (multi-node) through REST v2.
+/// RunPod GPU and CPU Pods (single node) and Instant Clusters (multi-node) through REST v2.
 pub struct RunPod {
     key_file: std::path::PathBuf,
     tier: String,
     disk_gb: u32,
     regions: Vec<String>,
-    registry_ids: Mutex<HashMap<String, String>>,
 }
 
 const RUNPOD: &str = "https://api.runpod.io/v2";
+/// A pod RUNNING this long with no public ssh address won't get one (e.g. no public IP).
+const RUNPOD_NO_SSH_AFTER: Duration = Duration::from_secs(180);
 
 impl RunPod {
     fn new(key_file: &Path, c: &CloudConfig) -> RunPod {
@@ -898,33 +1165,32 @@ impl RunPod {
             tier: c.tier.clone().unwrap_or_else(|| "SECURE".into()).to_ascii_uppercase(),
             disk_gb: c.disk_gb,
             regions: c.regions.clone(),
-            registry_ids: Mutex::new(HashMap::new()),
         }
     }
     fn auth(&self) -> Result<String> {
         Ok(format!("Authorization: Bearer {}", read_key(&self.key_file)?))
     }
+    /// Retries rate limits (180 requests a minute per account), and for reads also server and
+    /// network errors. A create isn't retried on those: it may have gone through (the sweep
+    /// removes a duplicate).
     async fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
-        http(method, &format!("{RUNPOD}{path}"), &self.auth()?, body).await
-    }
-    /// A registry credential id for private images (created once per registry host).
-    async fn registry_id(&self, creds: &(String, String, String)) -> Result<String> {
-        let (host, user, pass) = creds;
-        if let Some(id) = self.registry_ids.lock().await.get(host) {
-            return Ok(id.clone());
+        let url = format!("{RUNPOD}{path}");
+        let auth = self.auth()?;
+        let mut attempt = 0;
+        loop {
+            match http(method, &url, &auth, body).await {
+                Err(e) if attempt < 4 => {
+                    let s = format!("{e}");
+                    let transient = s.contains("HTTP 429") || (method != "POST" && (s.contains("HTTP 50") || !s.contains("HTTP ")));
+                    if !transient {
+                        return Err(e);
+                    }
+                    attempt += 1;
+                    tokio::time::sleep(Duration::from_secs(5 << attempt)).await;
+                }
+                r => return r,
+            }
         }
-        let name = format!("compute-{}", host.replace('.', "-"));
-        let list = self.call("GET", "/registries", None).await?;
-        if let Some(id) = list["registries"].as_array().into_iter().flatten().find(|r| r["name"] == name.as_str()).and_then(|r| r["id"].as_str()) {
-            // Refresh the stored password in case it was rotated.
-            let _ = self.call("PATCH", &format!("/registries/{id}"), Some(&json!({"username": user, "password": pass}))).await;
-            self.registry_ids.lock().await.insert(host.clone(), id.to_string());
-            return Ok(id.to_string());
-        }
-        let r = self.call("POST", "/registries", Some(&json!({"name": name, "username": user, "password": pass}))).await?;
-        let id = r["id"].as_str().context("RunPod returned no registry id")?.to_string();
-        self.registry_ids.lock().await.insert(host.clone(), id.clone());
-        Ok(id)
     }
     fn ssh_of(pod: &Value) -> Option<SshAddr> {
         let d = &pod["ssh"]["direct"];
@@ -934,54 +1200,133 @@ impl RunPod {
             user: d["username"].as_str().unwrap_or("root").to_string(),
         })
     }
+    /// Stock in the configured regions (or overall when none are set).
+    fn in_stock(&self, item: &Value) -> bool {
+        if self.regions.is_empty() {
+            return item["availability"].as_str().is_some_and(|a| a != "NONE");
+        }
+        item["dataCenters"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .any(|d| d["id"].as_str().is_some_and(|id| self.regions.iter().any(|r| r == id)) && d["availability"].as_str().is_some_and(|a| a != "NONE"))
+    }
+    /// CPU pods: one offer per flavor and power-of-two vCPU count (RunPod's allowed sizes).
+    async fn cpu_offers(&self) -> Result<Vec<Offer>> {
+        let v = self.call("GET", "/catalog/cpus?include=AVAILABILITY&product=POD", None).await?;
+        let mut out = Vec::new();
+        for c in v["cpus"].as_array().into_iter().flatten() {
+            let (Some(id), Some(per_vcpu)) = (c["id"].as_str(), c["price"]["securePerVcpu"].as_f64()) else { continue };
+            let ram_per = c["ramGbPerVcpu"].as_u64().unwrap_or(0) as u32;
+            let (min, max) = (c["vcpu"]["min"].as_u64().unwrap_or(2).max(2) as u32, c["vcpu"]["max"].as_u64().unwrap_or(0) as u32);
+            let available = self.in_stock(c);
+            let name = c["name"].as_str().unwrap_or(id);
+            let mut n = 2u32;
+            while n <= max {
+                if n >= min {
+                    out.push(Offer {
+                        id: id.to_string(),
+                        gpu_type: format!("{name} CPU ({id})"),
+                        gpus: 0,
+                        cpus: n,
+                        mem_gb: n * ram_per,
+                        usd_per_hour: per_vcpu * f64::from(n),
+                        available,
+                        region: None,
+                        disk_gb: 0,
+                    });
+                }
+                n *= 2;
+            }
+        }
+        Ok(out)
+    }
 }
 
 #[async_trait]
 impl Provider for RunPod {
-    async fn offers(&self, gpus: u32, nodes: u32) -> Result<Vec<Offer>> {
-        let product = if nodes > 1 { "CLUSTER" } else { "POD" };
-        let v = self.call("GET", &format!("/catalog/gpus?include=AVAILABILITY&product={product}&count={gpus}"), None).await?;
-        let secure = self.tier == "SECURE";
+    async fn offers(&self, need: &Need) -> Result<Vec<Offer>> {
+        if need.gpus == 0 {
+            return self.cpu_offers().await;
+        }
+        let gpus = need.gpus;
+        let cluster = need.nodes > 1;
+        let product = if cluster { "CLUSTER" } else { "POD" };
+        // Clusters are secure-cloud only.
+        let secure = cluster || self.tier == "SECURE";
+        let cloud = if secure { "SECURE" } else { "COMMUNITY" };
+        let mut q = format!("/catalog/gpus?include=AVAILABILITY&product={product}&count={gpus}");
+        if !cluster {
+            q.push_str(&format!("&cloud={cloud}"));
+        }
+        // Ask for machines with enough CPU and memory per GPU, and a new enough driver.
+        if need.cpus > 0 {
+            q.push_str(&format!("&minVcpuCountPerGpu={}", need.cpus.div_ceil(gpus)));
+        }
+        if need.mem_gb > 0 {
+            q.push_str(&format!("&minRamPerGpu={}", need.mem_gb.div_ceil(gpus)));
+        }
+        if let Some(c) = &need.min_cuda {
+            q.push_str(&format!("&minCudaVersion={c}"));
+        }
+        let v = self.call("GET", &q, None).await?;
+        let key = if secure { "secure" } else { "community" };
         let mut out = Vec::new();
         for g in v["gpus"].as_array().into_iter().flatten() {
-            let price = g["price"][if secure { "secure" } else { "community" }].as_f64().unwrap_or(0.0);
-            let max = g["maxCount"][if secure { "secure" } else { "community" }].as_u64().unwrap_or(0) as u32;
-            let offered = g[if secure { "secure" } else { "community" }].as_bool().unwrap_or(false);
-            if price <= 0.0 || !offered || max < gpus.max(1) {
+            let price = g["price"][key].as_f64().unwrap_or(0.0);
+            let max = g["maxCount"][key].as_u64().unwrap_or(0) as u32;
+            let offered = g[key].as_bool().unwrap_or(false);
+            // AMD (ROCm) GPUs can't run CUDA images.
+            let amd = [g["id"].as_str(), g["name"].as_str()].into_iter().flatten().any(|t| contains_ci(t, "amd") || contains_ci(t, "instinct"));
+            if price <= 0.0 || !offered || max < gpus || amd {
                 continue;
             }
-            let stock = g["availability"].as_str().unwrap_or("NONE");
+            // The catalog was filtered to machines with this much per GPU, and the create asks
+            // for it: the offer has at least what the job needs.
+            let cpus = (g["minVcpuCount"].as_u64().unwrap_or(0) as u32).max(need.cpus);
+            let mem_gb = (g["minRam"].as_u64().unwrap_or(0) as u32).max(need.mem_gb);
             out.push(Offer {
                 id: g["id"].as_str().unwrap_or_default().to_string(),
                 gpu_type: g["name"].as_str().or(g["id"].as_str()).unwrap_or_default().to_string(),
-                gpus: gpus.max(1),
-                cpus: g["minVcpuCount"].as_u64().unwrap_or(0) as u32,
-                mem_gb: g["minRam"].as_u64().unwrap_or(0) as u32,
-                usd_per_hour: price * f64::from(gpus.max(1)),
-                available: stock != "NONE",
+                gpus,
+                cpus,
+                mem_gb,
+                usd_per_hour: price * f64::from(gpus),
+                available: self.in_stock(g),
                 region: None,
+                disk_gb: 0,
             });
         }
         Ok(out)
     }
 
+    fn cpu_pods(&self) -> bool {
+        true
+    }
+
+    fn node_env(&self) -> Vec<(String, String)> {
+        // RunPod's docs: NCCL must use the cluster interface.
+        vec![("NCCL_SOCKET_IFNAME".into(), "ens1".into())]
+    }
+
+    async fn extend_deadline(&self, shell: &dyn Shell, secs: u64) -> Result<()> {
+        shell.run(&format!("echo \"$(( $(date +%s) + {secs} ))\" > /run/compute-deadline")).await.map(|_| ())
+    }
+
     async fn create(&self, req: &CreateReq<'_>) -> Result<Instance> {
-        let registry = match &req.registry {
-            Some(c) => Some(self.registry_id(c).await?),
-            None => None,
-        };
+        let keys: Vec<String> = std::iter::once(req.pubkey.clone()).chain(req.extra_keys.iter().map(|k| k.trim().to_string())).collect();
         let mut body = json!({
             "name": req.name,
             "image": req.image,
-            "disk": self.disk_gb,
+            // Room for the job's disk_gb on top of the image and system.
+            "disk": self.disk_gb.max(req.job.resources.disk_mb.div_ceil(1024) as u32 + 20),
             "ports": ["22/tcp"],
-            "env": {"PUBLIC_KEY": req.pubkey},
-            "entrypoint": ["bash", "-c", boot_script(req.timeout_s)],
+            // The coordinator's key and the hosts.toml authorized_keys (kept across restarts).
+            "env": {"PUBLIC_KEY": keys.join("\n")},
+            "entrypoint": ["/bin/sh", "-c", boot_script(req.timeout_s)],
+            "cmd": [],
             "startSsh": true,
         });
-        if let Some(id) = registry {
-            body["registry"] = id.into();
-        }
         if !self.regions.is_empty() {
             body["dataCenterIds"] = json!(self.regions);
         }
@@ -994,14 +1339,37 @@ impl Provider for RunPod {
             let id = r["id"].as_str().context("RunPod returned no cluster id")?.to_string();
             return Ok(Instance { provider_id: id, name: req.name.clone(), job_id: req.job.id, cluster: true, node_count: req.nodes, nodes: Vec::new(), created_at: now, deadline, offer: req.offer.clone() });
         }
-        body["cloud"] = self.tier.clone().into();
-        body["gpu"] = json!({"id": req.offer.id, "count": req.offer.gpus});
+        if req.offer.gpus == 0 {
+            // CPU pods: secure cloud only; memory follows from the flavor.
+            body["cloud"] = "SECURE".into();
+            body["cpu"] = json!({"id": req.offer.id, "vcpuCount": req.offer.cpus});
+        } else {
+            body["cloud"] = self.tier.clone().into();
+            let r = &req.job.resources;
+            let mut gpu = json!({"id": req.offer.id, "count": req.offer.gpus});
+            if r.cpus > 0 {
+                gpu["minVcpuCountPerGpu"] = r.cpus.div_ceil(req.offer.gpus).into();
+            }
+            if r.mem_mb > 0 {
+                gpu["minRamPerGpu"] = (r.mem_mb.div_ceil(1024) as u32).div_ceil(req.offer.gpus).into();
+            }
+            if let Some(c) = min_cuda_of(&req.image) {
+                gpu["minCudaVersion"] = c.into();
+            }
+            body["gpu"] = gpu;
+        }
         let r = self.call("POST", "/pods", Some(&body)).await?;
         let id = r["id"].as_str().or(r["podId"].as_str()).context("RunPod returned no pod id")?.to_string();
-        Ok(Instance { provider_id: id, name: req.name.clone(), job_id: req.job.id, cluster: false, node_count: 1, nodes: Vec::new(), created_at: now, deadline, offer: req.offer.clone() })
+        let mut offer = req.offer.clone();
+        // The rate the pod is actually billed at.
+        if let Some(cost) = r["cost"].as_f64().filter(|c| *c > 0.0) {
+            offer.usd_per_hour = cost;
+        }
+        Ok(Instance { provider_id: id, name: req.name.clone(), job_id: req.job.id, cluster: false, node_count: 1, nodes: Vec::new(), created_at: now, deadline, offer })
     }
 
     async fn wait_ready(&self, inst: &mut Instance, deadline: Instant) -> Result<()> {
+        let mut running_since: Option<Instant> = None;
         loop {
             if Instant::now() > deadline {
                 bail!("not ready within 20 minutes");
@@ -1012,9 +1380,18 @@ impl Provider for RunPod {
                 vec![self.call("GET", &format!("/pods/{}", inst.provider_id), None).await?]
             };
             if pods.iter().any(|p| matches!(p["status"].as_str(), Some("ERROR" | "TERMINATED" | "EXITED"))) {
-                bail!("a pod failed to start ({})", pods.iter().filter_map(|p| p["status"].as_str()).collect::<Vec<_>>().join(", "));
+                bail!(
+                    "a pod stopped while booting ({}). The image must run as root and have (or be able to apt/apk/dnf install) sshd and bash, and its CUDA must suit the host; RunPod's pod log has the boot output",
+                    pods.iter().filter_map(|p| p["status"].as_str()).collect::<Vec<_>>().join(", ")
+                );
             }
-            let ready = pods.len() >= inst.node_count.max(1) as usize && pods.iter().all(|p| p["status"] == "RUNNING" && Self::ssh_of(p).is_some());
+            let all_running = pods.len() >= inst.node_count.max(1) as usize && pods.iter().all(|p| p["status"] == "RUNNING");
+            if all_running && running_since.is_none() {
+                running_since = Some(Instant::now());
+            }
+            // Clusters also need each pod's rank and overlay address before they're usable.
+            let placed = |p: &Value| !inst.cluster || (p["cluster"]["rank"].is_u64() && p["cluster"]["ip"].is_string());
+            let ready = all_running && pods.iter().all(|p| Self::ssh_of(p).is_some() && placed(p));
             if ready {
                 let mut nodes: Vec<Node> = pods
                     .iter()
@@ -1035,14 +1412,31 @@ impl Provider for RunPod {
                 inst.nodes = nodes;
                 return Ok(());
             }
+            if let Some(t) = running_since
+                && t.elapsed() > RUNPOD_NO_SSH_AFTER
+                && pods.iter().any(|p| Self::ssh_of(p).is_none())
+            {
+                bail!("the pod runs but has no public ssh address (community-cloud machines may lack a public IP; use tier = \"SECURE\")");
+            }
             tokio::time::sleep(Duration::from_secs(10)).await;
         }
     }
 
     async fn alive(&self, inst: &Instance) -> Result<bool> {
-        let path = if inst.cluster { format!("/clusters/{}", inst.provider_id) } else { format!("/pods/{}", inst.provider_id) };
-        match self.call("GET", &path, None).await {
-            Ok(v) => Ok(!matches!(v["status"].as_str(), Some("TERMINATED" | "EXITED" | "ERROR"))),
+        let dead = |s: Option<&str>| matches!(s, Some("TERMINATED" | "EXITED" | "ERROR"));
+        if inst.cluster {
+            // A cluster has no status of its own: go by its primary pod and pod counts.
+            return match self.call("GET", &format!("/clusters/{}", inst.provider_id), None).await {
+                Ok(v) => {
+                    let running = v["pods"]["byStatus"]["RUNNING"].as_u64();
+                    Ok(!dead(v["primary"]["status"].as_str()) && running != Some(0))
+                }
+                Err(e) if format!("{e}").contains("HTTP 404") => Ok(false),
+                Err(e) => Err(e),
+            };
+        }
+        match self.call("GET", &format!("/pods/{}", inst.provider_id), None).await {
+            Ok(v) => Ok(!dead(v["status"].as_str())),
             Err(e) if format!("{e}").contains("HTTP 404") => Ok(false),
             Err(e) => Err(e),
         }
@@ -1059,21 +1453,29 @@ impl Provider for RunPod {
 
     async fn list(&self) -> Result<Vec<(String, String, bool)>> {
         let mut out = Vec::new();
-        for p in self.call("GET", "/pods", None).await?["pods"].as_array().into_iter().flatten() {
-            if p["cluster"].is_object() {
-                continue; // torn down with its cluster
-            }
-            if let (Some(id), Some(name)) = (p["id"].as_str(), p["name"].as_str())
-                && name.starts_with("compute-")
-            {
-                out.push((id.to_string(), name.to_string(), false));
-            }
-        }
-        for c in self.call("GET", "/clusters", None).await?["clusters"].as_array().into_iter().flatten() {
-            if let (Some(id), Some(name)) = (c["id"].as_str(), c["name"].as_str())
-                && name.starts_with("compute-")
-            {
-                out.push((id.to_string(), name.to_string(), true));
+        // Both lists are paged; follow the cursor.
+        for (path, key, cluster) in [("/pods", "pods", false), ("/clusters", "clusters", true)] {
+            let mut cursor: Option<String> = None;
+            for _ in 0..50 {
+                let url = match &cursor {
+                    Some(c) => format!("{path}?cursor={}", urlencode(c)),
+                    None => path.to_string(),
+                };
+                let v = self.call("GET", &url, None).await?;
+                for p in v[key].as_array().into_iter().flatten() {
+                    if !cluster && p["cluster"].is_object() {
+                        continue; // torn down with its cluster
+                    }
+                    if let (Some(id), Some(name)) = (p["id"].as_str(), p["name"].as_str())
+                        && name.starts_with("compute-")
+                    {
+                        out.push((id.to_string(), name.to_string(), cluster));
+                    }
+                }
+                match v["pagination"]["nextCursor"].as_str() {
+                    Some(c) if v["pagination"]["hasNextPage"].as_bool() == Some(true) => cursor = Some(c.to_string()),
+                    _ => break,
+                }
             }
         }
         Ok(out)
@@ -1089,6 +1491,13 @@ impl Provider for RunPod {
     fn runtime(&self) -> &'static str {
         "native"
     }
+}
+
+/// Percent-encodes a query value.
+fn urlencode(s: &str) -> String {
+    s.bytes()
+        .map(|b| if b.is_ascii_alphanumeric() || b"-_.~".contains(&b) { (b as char).to_string() } else { format!("%{b:02X}") })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------- Lambda
@@ -1123,8 +1532,10 @@ impl Lambda {
         }
     }
     /// The name of a registered ssh key matching the coordinator's, registering it if needed.
+    /// The lock is held throughout, so jobs launched together register the key once.
     async fn ssh_key_name(&self, pubkey: &str) -> Result<String> {
-        if let Some(n) = self.key_name.lock().await.clone() {
+        let mut cached = self.key_name.lock().await;
+        if let Some(n) = cached.clone() {
             return Ok(n);
         }
         let body_of = |k: &str| k.split_whitespace().take(2).collect::<Vec<_>>().join(" ");
@@ -1134,19 +1545,23 @@ impl Lambda {
         let name = match found.and_then(|k| k["name"].as_str()) {
             Some(n) => n.to_string(),
             None => {
+                // The name comes from the key, so "already taken" means it is registered.
                 let name = format!("compute-daemon-{}", &hex::encode(<sha2::Sha256 as sha2::Digest>::digest(mine.as_bytes()))[..8]);
-                self.call("POST", "/ssh-keys", Some(&json!({"name": name, "public_key": pubkey}))).await?;
-                name
+                match self.call("POST", "/ssh-keys", Some(&json!({"name": name, "public_key": pubkey}))).await {
+                    Err(e) if !format!("{e}").contains("must be unique") => return Err(e),
+                    _ => name,
+                }
             }
         };
-        *self.key_name.lock().await = Some(name.clone());
+        *cached = Some(name.clone());
         Ok(name)
     }
 }
 
 #[async_trait]
 impl Provider for Lambda {
-    async fn offers(&self, gpus: u32, _nodes: u32) -> Result<Vec<Offer>> {
+    async fn offers(&self, need: &Need) -> Result<Vec<Offer>> {
+        let gpus = need.gpus;
         let v = self.call("GET", "/instance-types", None).await?;
         let mut out = Vec::new();
         for (name, t) in v["data"].as_object().into_iter().flatten() {
@@ -1168,6 +1583,7 @@ impl Provider for Lambda {
                 usd_per_hour: it["price_cents_per_hour"].as_f64().unwrap_or(0.0) / 100.0,
                 available: region.is_some(),
                 region,
+                disk_gb: specs["storage_gib"].as_u64().unwrap_or(0) as u32,
             });
         }
         Ok(out)
@@ -1255,17 +1671,17 @@ impl Provider for Lambda {
         "docker"
     }
 
-    async fn prepare(&self, shell: &dyn Shell, registry: Option<&(String, String, String)>) -> Result<()> {
-        // New ssh sessions pick up the docker group.
-        shell.run("sudo usermod -aG docker \"$(id -un)\" >/dev/null 2>&1 || true").await?;
-        if let Some((host, user, pass)) = registry {
-            shell
-                .run_input(
-                    &format!("IFS= read -r u\nIFS= read -r p\nprintf '%s' \"$p\" | sudo docker login {} -u \"$u\" --password-stdin >/dev/null\nsudo cp -r /root/.docker \"$HOME/\" 2>/dev/null; sudo chown -R \"$(id -un)\" \"$HOME/.docker\" 2>/dev/null; true", shell_quote(host)),
-                    Some(format!("{user}\n{pass}\n").into_bytes()),
-                )
-                .await?;
-        }
+    async fn prepare(&self, shell: &dyn Shell) -> Result<()> {
+        // New ssh sessions pick up the docker group. Hold snap and apt updates: they reload
+        // systemd mid-job (the runner also guards GPU access against that) and can change
+        // the driver under a running job.
+        shell
+            .run(
+                "sudo usermod -aG docker \"$(id -un)\" >/dev/null 2>&1 || true\n\
+                 sudo snap refresh --hold >/dev/null 2>&1 || true\n\
+                 sudo systemctl stop unattended-upgrades apt-daily.timer apt-daily-upgrade.timer >/dev/null 2>&1 || true",
+            )
+            .await?;
         Ok(())
     }
 }
@@ -1345,7 +1761,8 @@ impl Shell for ModalShell {
 
 #[async_trait]
 impl Provider for Modal {
-    async fn offers(&self, gpus: u32, _nodes: u32) -> Result<Vec<Offer>> {
+    async fn offers(&self, need: &Need) -> Result<Vec<Offer>> {
+        let gpus = need.gpus;
         // No pricing API: the rate table is the offer list; availability is learned at create.
         self.client().await?;
         Ok(self
@@ -1361,20 +1778,14 @@ impl Provider for Modal {
                 usd_per_hour: rate * f64::from(gpus.max(1)),
                 available: true,
                 region: None,
+                disk_gb: 0,
             })
             .collect())
     }
 
     async fn create(&self, req: &CreateReq<'_>) -> Result<Instance> {
         let (client, app) = self.client().await?;
-        let registry_secret = match &req.registry {
-            Some((_, user, pass)) => {
-                let env: BTreeMap<String, String> = [("REGISTRY_USERNAME".to_string(), user.clone()), ("REGISTRY_PASSWORD".to_string(), pass.clone())].into();
-                Some(client.secret_from_env(None, &env, self.cfg.environment.as_deref()).await?)
-            }
-            None => None,
-        };
-        let image = client.image_from_registry_in(&app, &req.image, registry_secret.as_deref(), self.cfg.environment.as_deref()).await?;
+        let image = client.image_from_registry_in(&app, &req.image, None, self.cfg.environment.as_deref()).await?;
         let r = &req.job.resources;
         let gpu = if req.offer.gpus > 1 { format!("{}:{}", req.offer.id, req.offer.gpus) } else { req.offer.id.clone() };
         // Account for CPU and memory in the price, from the rate table.

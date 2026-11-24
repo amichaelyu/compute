@@ -127,23 +127,13 @@ async fn serve() -> Result<()> {
     let store = Arc::new(store::Store::open(&paths.db())?);
     let tunnels = Arc::new(transport::Tunnels::default());
     let secrets = Arc::new(secrets::Secrets::new(paths.secrets_dir()));
-    let registry_creds = match (&cfg.registry.secret, cfg.registry.host()) {
-        (Some(s), Some(host)) => {
-            let user = secrets.value(s, "REGISTRY_USERNAME")?;
-            let pass = secrets.value(s, "REGISTRY_PASSWORD")?;
-            user.zip(pass).map(|(u, p)| (host, u, p))
-        }
-        _ => None,
-    };
     let mut backends: Vec<Arc<dyn Backend>> = Vec::new();
     for b in &cfg.backends {
         backends.push(match b.kind {
             BackendKind::Local => Arc::new(LocalBackend::new(b.clone(), tunnels.clone())),
             BackendKind::Slurm => Arc::new(SlurmBackend::new(b.clone(), tz, tunnels.clone())),
             _ => {
-                let cb = Arc::new(CloudBackend::new(b.clone(), &paths)?);
-                cb.set_registry(registry_creds.clone());
-                Arc::new(Cloud(cb))
+                Arc::new(Cloud(Arc::new(CloudBackend::new(b.clone(), &paths, store.clone())?)))
             }
         });
     }
@@ -170,7 +160,13 @@ async fn serve() -> Result<()> {
         None => tracing::info!("Cloudflare Access logins disabled (COMPUTE_CF_* not set)"),
     }
     let app = api::router(api::AppState { sched, auth, access, tz });
-    axum::serve(listener, app).with_graceful_shutdown(shutdown()).await?;
+    // Exit at once on a signal: all state is in SQLite and running jobs outlive the daemon. A
+    // graceful shutdown would keep the scheduler running while systemd kills its ssh children,
+    // so polls fail and healthy jobs look lost.
+    tokio::select! {
+        r = axum::serve(listener, app) => r?,
+        _ = shutdown() => {}
+    }
     Ok(())
 }
 

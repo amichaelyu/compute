@@ -469,7 +469,11 @@ impl Backend for SlurmBackend {
                     match state.as_str() {
                         "COMPLETED" => Some(if code == Some(0) { JobState::Succeeded } else { JobState::Failed }),
                         "TIMEOUT" => Some(JobState::Timeout),
-                        "FAILED" | "NODE_FAIL" | "OUT_OF_MEMORY" | "BOOT_FAIL" | "DEADLINE" | "PREEMPTED" => {
+                        "OUT_OF_MEMORY" => {
+                            r.note = Some("out of memory: Slurm killed the job for using more than resources.mem_gb; raise it".into());
+                            Some(JobState::Failed)
+                        }
+                        "FAILED" | "NODE_FAIL" | "BOOT_FAIL" | "DEADLINE" | "PREEMPTED" => {
                             r.note = Some(format!("slurm state {state}"));
                             Some(JobState::Failed)
                         }
@@ -497,7 +501,9 @@ impl Backend for SlurmBackend {
 
     async fn cancel(&self, job: &Job) -> Result<()> {
         if let Some(key) = job.handle.as_ref().and_then(Self::slurm_key) {
-            self.remote.shell().await?.run(&format!("scancel {}", shell_quote(&key))).await?;
+            // Success also when Slurm no longer has the job (it ended, or was cancelled already).
+            let k = shell_quote(&key);
+            self.remote.shell().await?.run(&format!("scancel {k} 2>/dev/null || ! squeue -h -j {k} 2>/dev/null | grep -q .")).await?;
         }
         Ok(())
     }

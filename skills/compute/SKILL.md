@@ -27,6 +27,12 @@ COMPUTE_KEY=$HOME/.ssh/id_ed25519.pub       # an SSH key in the daemon's allowed
 Environment variables of the same names override the file. If neither sets `COMPUTE_URL`,
 stop and ask the user for the daemon's address; don't guess one.
 
+`COMPUTE_URL` may be the daemon's private address (`http://<coordinator>:8765`) or its public
+`https://` hostname behind Cloudflare. Through Cloudflare:
+- `wait` returns after at most 90 s (`timed_out: true` if nothing happened); call it again.
+- Request bodies over 100 MB are refused (HTTP 413), so big snapshots and dataset uploads
+  fail. Make the snapshot smaller, or upload from a machine that can reach the private address.
+
 ## Setup per shell
 
 ```bash
@@ -68,6 +74,20 @@ Restrictions are enforced by placement, so pick `cpus`, `mem_gb`, `gpus` and `ti
 them. Read them rather than assuming: a Slurm backend, for example, may tie memory to CPU count,
 so asking for more memory also means more CPUs.
 
+**Always give RAM and disk.** Running out of memory or disk is the usual reason a job dies
+partway, often hours in. Set both in every request, sized from what the job actually uses:
+
+- `mem_gb`: peak RAM plus about 25% headroom (the default 4 GB is rarely right). Over it, the
+  job is killed: Docker and Slurm enforce it, and a host's OOM killer does the rest. On a Mac,
+  containers share the Docker VM's memory (OrbStack, Docker Desktop), which placement counts
+  separately and which can be much less than the host's.
+- `disk_gb`: what the job writes (outputs, checkpoints, caches, unpacked data) plus headroom.
+  The runner checks that much is free before starting and fails fast if not; a local host
+  only takes the job when that much (plus a spare 5 GB) is free; cloud instances are picked or
+  sized to have it. Inputs from parent jobs are linked, not copied, so array tasks share them.
+
+Estimate from an earlier run's metrics (`rss_mb`, `disk_free_gb`) when there is one.
+
 ## 2. Upload the code (a snapshot)
 
 Run this from the repo root. It packs tracked files plus new untracked files that aren't
@@ -98,7 +118,7 @@ cx --json @- "$COMPUTE_URL/v1/jobs" <<EOF
   "description": "Checks whether the lr-warmup change fixed the eval regression seen in run 17.",
   "command": "uv run python eval.py --ckpt ckpts/40k --out \"\$JOB_OUTPUT_DIR\"",
   "snapshot": "$SNAP",
-  "resources": {"cpus": 8, "mem_gb": 32, "gpus": 1, "time": "2h"},
+  "resources": {"cpus": 8, "mem_gb": 32, "disk_gb": 50, "gpus": 1, "time": "2h"},
   "secrets": ["wandb"],
   "env": {"WANDB_PROJECT": "evals"},
   "retries": 1,
@@ -117,15 +137,17 @@ Fields:
   `resources.time` (`"30m"`, `"2h"`, `"1h30m"`, `"1d"`).
   - `title` says *what* the job is. `description` says *why* it is being run and what it belongs
     to, so the user can tell jobs apart weeks later.
-- **Resources:** `cpus` (default 1), `mem_gb` (default 4), `gpus` (default 0), `gpu_type`
-  (a type a backend reports, or null for any), `nodes` (default 1; see section 3e).
+- **Resources:** `cpus` (default 1), `mem_gb` (default 4; always set it), `disk_gb` (always
+  set it; see section 1), `gpus` (default 0), `gpu_type` (a type a backend reports, or null for
+  any), `nodes` (default 1; see section 3e).
 - **Placement:** `backends` (an allowlist of backend names from `GET /v1/backends`), `os`
   (`"mac"` or `"linux"`),
   `priority` (higher starts first in the daemon's queue).
 - **Arrays:** `array: {"count": 100}` makes 100 tasks. `{index}` in `command` becomes the task
   index, also available as `$ARRAY_INDEX`. Tasks spread across backends.
-- `retries`: how many times a *lost* job (host vanished, no heartbeat) is requeued. A failed exit
-  code is not retried.
+- `retries`: how many times a *lost* job (host vanished, no heartbeat) is requeued; default 1.
+  A failed exit code is not retried. A job whose parent failed or was lost ends as
+  `dependency_failed`, with the parent's reason; resubmit the parent, then the child.
 - `idempotency_key`: re-sending the same key returns the original job instead of submitting it
   again. Use one whenever a retry of your own call could duplicate a job.
 - Pipelines (`after_ok`, `after_any`, `inputs`), `datasets`, `container`, paid cloud
@@ -201,8 +223,26 @@ Images are Linux images, so `os: "mac"` can't be combined with `container`.
 `"container": {"build": "docker/train.Dockerfile"}` builds the image from a Dockerfile in the
 snapshot (build context: the Dockerfile's directory, or `"context"`). The tag is a hash of the
 Dockerfile and its context, so an unchanged image is reused; the job waits in `queued` while a
-build runs. Builds only work when the daemon has a registry set up (`GET /v1/images` shows
-`registry`); otherwise use a prebuilt `image`.
+build runs. With a registry set up (`GET /v1/images` shows `registry`), builds are pushed there
+and run anywhere. Without one, the image is built on the Docker host that runs the job, and
+cloud backends can't run it.
+
+**Images are public.** Registry builds go to a public GitHub package, and no backend logs in to
+pull, so every image a job uses (built or prebuilt `image`, including the Dockerfile's `FROM`)
+must be one anyone could pull and read. Write the Dockerfile so it is fit to publish:
+
+- Put in only what anyone may see: OS packages, CUDA, the Python environment. No tokens, keys,
+  passwords, `.env` files, private data, unreleased weights or proprietary code.
+- No secrets in `ARG`, `ENV` or `RUN` lines (they stay in the image history). Don't `COPY` the
+  whole repo; copy just the dependency files (`pyproject.toml`, `uv.lock`,
+  `requirements.txt`), and add a `.dockerignore` excluding `.env*`, keys, `data/` and `.git`.
+- Credentials come separately, at run time: name them in `"secrets"` and the job gets them as
+  environment variables (section 6). Code comes from the snapshot at `/work`, data from
+  `datasets`.
+
+A build whose package isn't public yet fails with a reason starting `build_failed: not_public:`
+and a settings link. Only the user can make it public (GitHub has no API for it), once per
+package: show them the link, wait until they've done it, then resubmit.
 
 ```bash
 cx "$COMPUTE_URL/v1/images"                       # builds: state, error
@@ -215,7 +255,9 @@ A failed build ends the job as `failed` with a reason starting `build_failed:`.
 
 Backends with `"paid": true` in `GET /v1/backends` cost money. They only take jobs that set
 `max_cost_usd`, run GPU jobs in a container (`container`, or the backend's default image), and
-count against a monthly budget (`GET /v1/budget`).
+count against an hourly limit: the running cloud instances together may cost at most
+`hourly_usd` per hour (`GET /v1/budget` shows the limit and what's in use). A paid job whose
+rate doesn't fit yet waits in the queue until instances finish.
 
 1. Send the request with `"max_cost_usd": 5, "dry_run": true`. The response has `quote_id`,
    `backend`, `estimated_cost_usd` (null when a free backend wins), `cheapest_paid_option` and
@@ -274,21 +316,43 @@ cx "$COMPUTE_URL/v1/jobs/42/wait?until=running&timeout=600"   # blocks; use inst
 cx "$COMPUTE_URL/v1/jobs/42/wait?until=done&timeout=900"      # returns early on any end state
 cx "$COMPUTE_URL/v1/jobs/42/logs?offset=0"                     # {data, next_offset, eof}
 cx "$COMPUTE_URL/v1/jobs/42/logs?offset=<next_offset>"         # only the new output
+cx "$COMPUTE_URL/v1/jobs/42/logs?tail=20000"                   # just the last 20 kB
+cx "$COMPUTE_URL/v1/jobs/42/outputs/list?glob=metrics/*"       # output files and sizes
 cx "$COMPUTE_URL/v1/jobs/42/outputs?glob=metrics/*.json" | zstd -dc | tar -x -C ./results/42
 cx "$COMPUTE_URL/v1/jobs?state=running,pending,queued,waiting" # what's active
 cx "$COMPUTE_URL/v1/jobs?q=eval"                               # search titles and descriptions
 cx "$COMPUTE_URL/v1/jobs?array=7"                              # tasks of array 7
 cx -X POST "$COMPUTE_URL/v1/jobs/42/cancel"                     # ?array=1 cancels a whole array
+cx -X DELETE "$COMPUTE_URL/v1/jobs/42/outputs"                  # free a finished job's disk
 ```
 
 - `wait` returns `timed_out: true` when the timeout passes first. Call it again.
 - When fetching outputs, use `glob` to skip big checkpoints you don't need. `*` also matches
-  `/`. Allowed characters are letters, digits and `_ . * ? / - [ ]`.
+  `/`. Allowed characters are letters, digits and `_ . * ? / - [ ]`. `outputs/list` shows
+  what's there first. A glob that matches nothing gets 404 `no_outputs`; outputs already
+  deleted get 410 `outputs_deleted`.
+- Outputs on a local or Slurm backend are deleted after its `keep_outputs_days` (7 by default;
+  the log stays), unless a waiting job needs them as inputs. Fetch what you want to keep. Once
+  you've fetched a big job's outputs, `DELETE` them to free the host's disk.
+- `GET /v1/jobs/<id>` shows what the job ran: `command`, `env`, `snapshot` and
+  `snapshot_created_at` (check that it's the code you meant). A cancelled job's reason says who
+  cancelled it.
 - Put fetched outputs inside the project (a gitignored dir), never loose in `~`.
 - End states are `succeeded`, `failed` (see `exit_code` and `reason`), `cancelled`, `timeout`,
   `lost` and `dependency_failed`. A reason starting `staging_failed:` means the code, datasets
   or inputs couldn't be put on the backend, or `uv sync` failed; `build_failed:` means the image
   build failed (see `GET /v1/images`). Read the reason, fix it, and resubmit.
+
+**Check every failed job for out-of-memory and out-of-disk** before anything else:
+
+- Out of memory: a reason starting `out of memory:`, a reason mentioning exit 137 (SIGKILL), or
+  `Killed` / `CUDA out of memory` / `MemoryError` in the log. Raise `mem_gb` (for GPU memory:
+  a smaller batch, or a GPU with more memory) and resubmit.
+- Out of disk: a reason starting `out of disk:` or `not enough disk:`, or `No space left on
+  device` / `Disk quota exceeded` in the log. Raise `disk_gb`, or write less (fewer
+  checkpoints, `keep_outputs`), and resubmit.
+- While a job runs, watch it: `GET /v1/jobs/<id>/metrics` gives `rss_mb` (against `mem_gb`)
+  and `disk_free_gb`. `compute metrics <id>` warns at 90% of memory or under 5 GB of disk.
 
 ## 6. Secrets
 
@@ -315,10 +379,12 @@ Every error is `{"error": {"code", "message", "hint"}}`. Follow the `hint`.
 - `unplaceable`: no backend can ever run the job as asked. Change the request; resubmitting
   it unchanged fails again. Never add `max_cost_usd` just to get past this without asking the
   user.
-- `over_budget`: only paid backends could run it and the monthly budget doesn't cover it. Tell
-  the user; don't work around it.
+- `over_budget`: only paid backends could run it, and its rate alone is over the hourly limit.
+  Tell the user; don't work around it.
 - `quote_required`, `quote_expired`, `quote_mismatch`: get a (new) quote with a dry run and
   submit exactly that request.
 - `bad_request`, `snapshot_missing`, `dataset_missing`, `secret_missing`: fix the request as
   the hint says.
 - `unauthorized`: run `compute_login`.
+- `rate_limited` (HTTP 429), or a Cloudflare 429 page on login: too many logins in progress.
+  Wait a minute and retry.

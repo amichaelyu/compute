@@ -22,6 +22,9 @@
 #   ssh_user        transport rex: detected through Rex (`id -un` on the host) when omitted
 #   runtimes        native / docker / apptainer; detected when omitted
 #   data_cap_gb     space for dataset copies; least recently used copies are evicted past it
+#   docker_mem_gb   memory all containers share; detected (OrbStack/Docker Desktop VM) if omitted
+#   disk_reserve_gb disk kept free on a local host (default 5)
+#   keep_outputs_days  days finished jobs' outputs stay on the host (default 7; log kept)
 #   ssh_port, tunnel_port (auto), gpus, gpu_type, max_nodes, restrictions = [...]
 #
 # Paid GPU clouds take only jobs that set max_cost_usd (after a dry-run quote), count against
@@ -45,14 +48,16 @@ tz = "America/Los_Angeles"
 
 # Image builds (`container.build`) run on the builder with docker buildx and push to
 # <prefix>:<hash>. The prefix comes from COMPUTE_REGISTRY_PREFIX (computed.env) when not set
-# here. `secret` names a secret holding REGISTRY_USERNAME / REGISTRY_PASSWORD (push and pull).
+# here. `secret` names a secret holding REGISTRY_USERNAME / REGISTRY_PASSWORD, used only to push:
+# images must be public, and backends pull them without logging in (see README, Images).
 [registry]
 builder = "workstation"
 secret = "registry"
 
-# Cloud spend allowed per month; 0 means paid backends never run anything.
+# USD per hour that running cloud instances may cost together; a paid job waits until its
+# rate fits. 0 means paid backends never run anything.
 [budget]
-monthly_usd = 0
+hourly_usd = 0
 
 [[backend]]
 name = "workstation"

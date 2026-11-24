@@ -109,6 +109,11 @@ CREATE TABLE IF NOT EXISTS quotes (
   estimated_cost REAL,
   expires_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS outputs_deleted (
+  job_id INTEGER PRIMARY KEY,
+  deleted_at TEXT NOT NULL,
+  why TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS cloud_costs (
   job_id INTEGER PRIMARY KEY,
   backend TEXT NOT NULL,
@@ -226,6 +231,14 @@ impl Store {
         if !cols.iter().any(|c| c == "spec") {
             conn.execute_batch("ALTER TABLE jobs ADD COLUMN spec TEXT NOT NULL DEFAULT '{}'")?;
         }
+        // Cost of earlier attempts of the same job (retries reuse the row).
+        let cost_cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('cloud_costs')")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        if !cost_cols.iter().any(|c| c == "prior_usd") {
+            conn.execute_batch("ALTER TABLE cloud_costs ADD COLUMN prior_usd REAL NOT NULL DEFAULT 0")?;
+        }
         Ok(Store { conn: Mutex::new(conn) })
     }
 
@@ -334,6 +347,13 @@ impl Store {
     }
 
     pub fn update_job(&self, id: i64, u: JobUpdate) -> Result<()> {
+        self.update_job_if(id, &[], u).map(|_| ())
+    }
+
+    /// Applies `u` only while the job is in one of `states` (any state when empty), so a write
+    /// based on an older read can't undo a cancel or another transition. Returns whether it
+    /// applied.
+    pub fn update_job_if(&self, id: i64, states: &[JobState], u: JobUpdate) -> Result<bool> {
         let mut sets: Vec<String> = Vec::new();
         let mut args: Vec<rusqlite::types::Value> = Vec::new();
         let mut push = |col: &str, v: rusqlite::types::Value| {
@@ -380,12 +400,15 @@ impl Store {
             push("retries_left", V::Integer(v.into()));
         }
         if sets.is_empty() {
-            return Ok(());
+            return Ok(true);
         }
         args.push(id.into());
-        let sql = format!("UPDATE jobs SET {} WHERE id = ?{}", sets.join(", "), args.len());
-        self.conn().execute(&sql, params_from_iter(args))?;
-        Ok(())
+        let mut sql = format!("UPDATE jobs SET {} WHERE id = ?{}", sets.join(", "), args.len());
+        if !states.is_empty() {
+            let list: Vec<String> = states.iter().map(|s| format!("'{}'", s.as_str())).collect();
+            sql.push_str(&format!(" AND state IN ({})", list.join(",")));
+        }
+        Ok(self.conn().execute(&sql, params_from_iter(args))? > 0)
     }
 
     // ---- sessions ----
@@ -612,34 +635,111 @@ impl Store {
         Ok(row.and_then(|(h, b, c, e)| parse_ts(Some(e)).map(|e| (h, b, c, e))))
     }
 
+    /// When a snapshot was first uploaded.
+    pub fn snapshot_created(&self, id: &str) -> Result<Option<DateTime<Utc>>> {
+        let c = self.conn();
+        let t: Option<String> = c.query_row("SELECT created_at FROM snapshots WHERE id = ?1", params![id], |r| r.get(0)).optional()?;
+        Ok(parse_ts(t))
+    }
+
+    /// Records that a job's outputs were deleted from its backend.
+    pub fn mark_outputs_deleted(&self, job_id: i64, why: &str) -> Result<()> {
+        self.conn().execute(
+            "INSERT OR REPLACE INTO outputs_deleted(job_id, deleted_at, why) VALUES (?1, ?2, ?3)",
+            params![job_id, ts(Utc::now()), why],
+        )?;
+        Ok(())
+    }
+
+    /// When and why a job's outputs were deleted, if they were.
+    pub fn outputs_deleted(&self, job_id: i64) -> Result<Option<(DateTime<Utc>, String)>> {
+        let c = self.conn();
+        let row: Option<(String, String)> = c
+            .query_row("SELECT deleted_at, why FROM outputs_deleted WHERE job_id = ?1", params![job_id], |r| Ok((r.get(0)?, r.get(1)?)))
+            .optional()?;
+        Ok(row.and_then(|(t, w)| Some((parse_ts(Some(t))?, w))))
+    }
+
+    /// Finished jobs on `backend` that ended before `before` and still have outputs there.
+    pub fn outputs_to_expire(&self, backend: &str, before: DateTime<Utc>, limit: u32) -> Result<Vec<i64>> {
+        let c = self.conn();
+        let mut stmt = c.prepare(
+            "SELECT id FROM jobs WHERE backend = ?1 AND ended_at IS NOT NULL AND ended_at < ?2 \
+             AND state IN ('succeeded','failed','cancelled','timeout','lost') \
+             AND id NOT IN (SELECT job_id FROM outputs_deleted) ORDER BY id LIMIT ?3",
+        )?;
+        let ids = stmt.query_map(params![backend, ts(before), limit], |r| r.get(0))?.collect::<rusqlite::Result<Vec<i64>>>()?;
+        Ok(ids)
+    }
+
+    /// Median run time in seconds of the last few succeeded jobs with this title (array tasks
+    /// share their title), for estimating when a running job will really finish.
+    pub fn typical_secs(&self, title: &str) -> Result<Option<i64>> {
+        let c = self.conn();
+        let mut stmt = c.prepare(
+            "SELECT started_at, ended_at FROM jobs WHERE title = ?1 AND state = 'succeeded' \
+             AND started_at IS NOT NULL AND ended_at IS NOT NULL ORDER BY id DESC LIMIT 7",
+        )?;
+        let mut secs: Vec<i64> = stmt
+            .query_map(params![title], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+            .filter_map(|r| r.ok())
+            .filter_map(|(a, b)| Some((parse_ts(Some(b))? - parse_ts(Some(a))?).num_seconds()))
+            .filter(|s| *s > 0)
+            .collect();
+        if secs.is_empty() {
+            return Ok(None);
+        }
+        secs.sort_unstable();
+        Ok(Some(secs[secs.len() / 2]))
+    }
+
     // ---- cloud cost ledger ----
 
+    /// Opens a cost record when an instance is created. A retry of the same job carries the
+    /// earlier attempts' cost forward in `prior_usd` (closing an attempt left open at `started`).
     pub fn cost_start(&self, job_id: i64, backend: &str, rate: f64, started: DateTime<Utc>) -> Result<()> {
-        self.conn().execute(
-            "INSERT INTO cloud_costs(job_id, backend, rate_usd_h, started_at) VALUES (?1,?2,?3,?4) \
+        let c = self.conn();
+        let prev: Option<(f64, String, Option<f64>, f64)> = c
+            .query_row(
+                "SELECT rate_usd_h, started_at, cost_usd, prior_usd FROM cloud_costs WHERE job_id = ?1",
+                params![job_id],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .optional()?;
+        let prior = match prev {
+            // cost_usd already includes the attempts before it.
+            Some((_, _, Some(cost), _)) => cost,
+            Some((rate, st, None, prior)) => {
+                let st = parse_ts(Some(st)).unwrap_or(started);
+                prior + (rate * (started - st).num_seconds().max(0) as f64 / 3600.0 * 100.0).ceil() / 100.0
+            }
+            None => 0.0,
+        };
+        c.execute(
+            "INSERT INTO cloud_costs(job_id, backend, rate_usd_h, started_at, prior_usd) VALUES (?1,?2,?3,?4,?5) \
              ON CONFLICT(job_id) DO UPDATE SET backend = excluded.backend, rate_usd_h = excluded.rate_usd_h, \
-             started_at = excluded.started_at, ended_at = NULL, cost_usd = NULL",
-            params![job_id, backend, rate, ts(started)],
+             started_at = excluded.started_at, ended_at = NULL, cost_usd = NULL, prior_usd = excluded.prior_usd",
+            params![job_id, backend, rate, ts(started), prior],
         )?;
         Ok(())
     }
 
     pub fn cost_end(&self, job_id: i64, ended: DateTime<Utc>) -> Result<Option<f64>> {
         let c = self.conn();
-        let row: Option<(f64, String, Option<String>)> = c
+        let row: Option<(f64, String, Option<String>, f64)> = c
             .query_row(
-                "SELECT rate_usd_h, started_at, ended_at FROM cloud_costs WHERE job_id = ?1",
+                "SELECT rate_usd_h, started_at, ended_at, prior_usd FROM cloud_costs WHERE job_id = ?1",
                 params![job_id],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )
             .optional()?;
-        let Some((rate, started, already)) = row else { return Ok(None) };
+        let Some((rate, started, already, prior)) = row else { return Ok(None) };
         if already.is_some() {
             return Ok(None);
         }
         let started = parse_ts(Some(started)).unwrap_or(ended);
         let hours = (ended - started).num_seconds().max(0) as f64 / 3600.0;
-        let cost = (rate * hours * 100.0).ceil() / 100.0;
+        let cost = prior + (rate * hours * 100.0).ceil() / 100.0;
         c.execute(
             "UPDATE cloud_costs SET ended_at = ?2, cost_usd = ?3 WHERE job_id = ?1",
             params![job_id, ts(ended), cost],
@@ -654,11 +754,13 @@ impl Store {
             .optional()?)
     }
 
-    /// Rows since `since`: `(job_id, backend, rate, started, ended, cost)`.
+    /// Rows since `since`: `(job_id, backend, rate, started, ended, cost)`. For an open row,
+    /// `cost` is what earlier attempts of the job cost (None when there were none).
     pub fn costs_since(&self, since: DateTime<Utc>) -> Result<Vec<CostRow>> {
         let c = self.conn();
         let mut stmt = c.prepare(
-            "SELECT job_id, backend, rate_usd_h, started_at, ended_at, cost_usd FROM cloud_costs \
+            "SELECT job_id, backend, rate_usd_h, started_at, ended_at, \
+             CASE WHEN ended_at IS NULL AND prior_usd > 0 THEN prior_usd ELSE cost_usd END FROM cloud_costs \
              WHERE ended_at IS NULL OR ended_at >= ?1 ORDER BY started_at",
         )?;
         let rows = stmt.query_map(params![ts(since)], |r| {

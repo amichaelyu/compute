@@ -5,8 +5,8 @@
 #   compute-run --tasks <tasksfile>  Slurm array task: pick line SLURM_ARRAY_TASK_ID+1 as <jobdir>
 #
 # <jobdir> holds job.env (exports), command (the shell command), and optionally datasets
-# (name<TAB>path lines), inputs (srcdir<TAB>glob<TAB>name lines), .secrets.env, .registry.env and
-# cancel. The runner writes status.json, heartbeat and log there.
+# (name<TAB>path lines), inputs (srcdir<TAB>glob<TAB>name lines), .secrets.env and cancel.
+# The runner writes status.json, heartbeat and log there.
 #
 # With JOB_RUNTIME=docker or apptainer the command runs in JOB_IMAGE, with the snapshot at /work,
 # outputs at /out, inputs at /in and each dataset read-only at /data/<name>.
@@ -27,15 +27,29 @@ ended=null
 host=$(hostname)
 tab=$(printf '\t')
 
+note=""   # why a job failed, when the runner can tell (out of memory, out of disk)
 write_status() { # <state> [exit_code]
   local tmp="$jobdir/status.json.tmp.$$"
-  printf '{"state":"%s","pid":%s,"started":%s,"ended":%s,"exit_code":%s,"host":"%s"}\n' \
-    "$1" "$pid" "$started" "$ended" "${2:-null}" "$host" > "$tmp" && mv -f "$tmp" "$jobdir/status.json"
+  printf '{"state":"%s","pid":%s,"started":%s,"ended":%s,"exit_code":%s,"host":"%s","note":"%s"}\n' \
+    "$1" "$pid" "$started" "$ended" "${2:-null}" "$host" "$(printf %s "$note" | tr -d '"\\\n')" > "$tmp" && mv -f "$tmp" "$jobdir/status.json"
+}
+
+# Free MB on the filesystem holding <dir>.
+free_mb() { df -Pk "$1" 2>/dev/null | awk 'NR == 2 {print int($4 / 1024)}'; }
+
+# OOM kills recorded for this runner's cgroup (Linux cgroup v2; Slurm and systemd put jobs in
+# one). Native and Apptainer jobs run in it; Docker containers have their own.
+oom_kills() {
+  local cg
+  cg=$(sed -n 's/^0:://p' /proc/self/cgroup 2>/dev/null)
+  [ -n "$cg" ] && [ -r "/sys/fs/cgroup$cg/memory.events" ] || { echo 0; return; }
+  awk '$1 == "oom_kill" {print $2}' "/sys/fs/cgroup$cg/memory.events"
 }
 
 # The runner's own exit status is non-zero unless the job succeeded, so Slurm's afterok
 # dependencies hold back the jobs that need this one.
 fail() { # <message> [exit_code]
+  stop_setup_beat
   echo "compute: $1" >> "$jobdir/log"
   ended=$(date +%s)
   write_status failed "${2:-98}"
@@ -53,15 +67,19 @@ if [ -f "$jobdir/.secrets.env" ]; then
   set +a
   rm -f "$jobdir/.secrets.env"
 fi
-if [ -f "$jobdir/.registry.env" ]; then
-  set -a
-  # shellcheck disable=SC1091
-  . "$jobdir/.registry.env"
-  set +a
-  rm -f "$jobdir/.registry.env"
-fi
 
+# Setup (dataset links, input copies, an image pull) can take a while: report running and keep
+# the heartbeat fresh from the start, so the daemon doesn't take a slow setup for a lost job.
+setup_beat=0
+stop_setup_beat() {
+  [ "$setup_beat" -gt 0 ] && kill "$setup_beat" 2>/dev/null
+  setup_beat=0
+}
 touch "$jobdir/heartbeat"
+write_status running
+runner_pid=$$
+(while kill -0 "$runner_pid" 2>/dev/null; do touch "$jobdir/heartbeat"; sleep 30; done) &
+setup_beat=$!
 [ -d "$JOB_SNAPSHOT_DIR" ] || fail "snapshot dir $JOB_SNAPSHOT_DIR is missing"
 mkdir -p "$JOB_OUTPUT_DIR" "$JOB_INPUT_DIR" "$JOB_DATA_DIR"
 
@@ -81,16 +99,31 @@ if [ -f "$jobdir/datasets" ]; then
   done < "$jobdir/datasets"
 fi
 
-# Inputs from jobs that ran on this host: copy their outputs now that they exist.
+# Inputs from jobs that ran on this host (or were fetched into its shared input cache): link
+# them in rather than copying, so every task of an array shares one copy on disk: copy-on-write
+# clones on macOS, hard links on Linux, a plain copy only if neither works. Containers see
+# them read-only, so a job can't change its parent's outputs.
 export COPYFILE_DISABLE=1
 if [ -f "$jobdir/inputs" ]; then
   while IFS="$tab" read -r src glob name; do
     [ -n "$name" ] || continue
     [ -d "$src" ] || fail "outputs of the parent job are missing at $src"
-    mkdir -p "$JOB_INPUT_DIR/$name"
-    (cd "$src" && find . -type f -path "./$glob" -print0 | tar -c --null -T -) \
-      | tar -x -C "$JOB_INPUT_DIR/$name" || fail "copying inputs from $src failed"
+    dest="$JOB_INPUT_DIR/$name"
+    mkdir -p "$dest"
+    (cd "$src" && find . -type f -path "./$glob") | while IFS= read -r f; do
+      mkdir -p "$dest/$(dirname "$f")"
+      cp -c "$src/$f" "$dest/$f" 2>/dev/null || ln -f "$src/$f" "$dest/$f" 2>/dev/null || cp -p "$src/$f" "$dest/$f" || exit 1
+    done || fail "linking inputs from $src failed"
   done < "$jobdir/inputs"
+fi
+
+# Disk the job asked for (resources.disk_gb) must be free where its outputs go.
+if [ "${JOB_DISK_MB:-0}" -gt 0 ]; then
+  have=$(free_mb "$jobdir")
+  if [ -n "$have" ] && [ "$have" -lt "$JOB_DISK_MB" ]; then
+    note="not enough disk: $((have / 1024)) GB free on $host, the job asked for $((JOB_DISK_MB / 1024)) GB (resources.disk_gb)"
+    fail "$note"
+  fi
 fi
 
 cd "$JOB_SNAPSHOT_DIR" || fail "cannot enter $JOB_SNAPSHOT_DIR"
@@ -114,8 +147,9 @@ start_docker() {
   command -v docker >/dev/null 2>&1 || fail "docker not found on $host"
   docker rm -f "$container_name" >/dev/null 2>&1
   local args
-  args=(run --rm --init --name "$container_name" -w /work
-        -v "$JOB_SNAPSHOT_DIR:/work" -v "$jobdir/out:/out" -v "$JOB_INPUT_DIR:/in")
+  # No --rm: the container is kept until its exit has been checked for an OOM kill.
+  args=(run --init --name "$container_name" -w /work
+        -v "$JOB_SNAPSHOT_DIR:/work" -v "$jobdir/out:/out" -v "$JOB_INPUT_DIR:/in:ro")
   if [ -f "$jobdir/datasets" ]; then
     while IFS="$tab" read -r name path; do
       [ -n "$name" ] && args+=(-v "$path:/data/$name:ro")
@@ -123,7 +157,16 @@ start_docker() {
   fi
   [ "${JOB_CPUS:-0}" -gt 0 ] && args+=(--cpus "$JOB_CPUS")
   [ "${JOB_MEM_MB:-0}" -gt 0 ] && args+=(--memory "${JOB_MEM_MB}m")
-  [ "${JOB_GPUS:-0}" -gt 0 ] && args+=(--gpus all)
+  if [ "${JOB_GPUS:-0}" -gt 0 ]; then
+    args+=(--gpus all)
+    # Name the device nodes too. With cgroup v2 and Docker's systemd cgroup driver, a systemd
+    # reload on the host (snap refreshes, apt) drops the device access --gpus granted, and the
+    # container loses its GPUs ("Failed to initialize NVML: Unknown Error"). Explicit
+    # --device rules survive reloads.
+    for d in /dev/nvidia* /dev/nvidia-caps/*; do
+      [ -c "$d" ] && args+=(--device "$d")
+    done
+  fi
   [ -n "${NODE_RANK:-}" ] && args+=(--network host --ipc host)
   for n in $(pass_names); do args+=(-e "$n"); done
   args+=("$JOB_IMAGE" sh -c "$in_shell" "$cmd")
@@ -158,8 +201,7 @@ start_apptainer() {
     ) 9> "$sif.lock" >> "$jobdir/log" 2>&1
     [ -f "$sif" ] || fail "pulling $JOB_IMAGE failed"
   fi
-  unset APPTAINER_DOCKER_USERNAME APPTAINER_DOCKER_PASSWORD
-  local binds="$JOB_SNAPSHOT_DIR:/work,$jobdir/out:/out,$JOB_INPUT_DIR:/in"
+  local binds="$JOB_SNAPSHOT_DIR:/work,$jobdir/out:/out,$JOB_INPUT_DIR:/in:ro"
   if [ -f "$jobdir/datasets" ]; then
     while IFS="$tab" read -r name path; do
       [ -n "$name" ] && binds="$binds,$path:/data/$name:ro"
@@ -189,6 +231,8 @@ $cmd" >> "$jobdir/log" 2>&1 < /dev/null &
     set +m
     ;;
 esac
+oom_before=$(oom_kills)
+stop_setup_beat
 write_status running
 
 # Resource usage every 10 s: metrics.json (latest) and metrics.jsonl (history).
@@ -269,6 +313,25 @@ code=$?
 ended=$(date +%s)
 if [ -z "$final" ]; then
   if [ "$code" -eq 0 ]; then final=succeeded; else final=failed; fi
+fi
+
+# Why it failed, when it's one of the usual two: out of memory or out of disk.
+oomed=""
+if [ "$runtime" = docker ]; then
+  [ "$(docker inspect -f '{{.State.OOMKilled}}' "$container_name" 2>/dev/null)" = true ] && oomed=1
+  docker rm -f "$container_name" >/dev/null 2>&1
+fi
+[ "$(oom_kills)" -gt "${oom_before:-0}" ] 2>/dev/null && oomed=1
+if [ "$final" = failed ]; then
+  if [ -n "$oomed" ]; then
+    note="out of memory: the job was killed for using more than resources.mem_gb (${JOB_MEM_MB:-?} MB); raise it"
+  elif tail -c 200000 "$jobdir/log" 2>/dev/null | grep -qiE 'no space left on device|disk quota exceeded'; then
+    fm=$(free_mb "$jobdir")
+    note="out of disk: no space left on device ($(( ${fm:-0} / 1024 )) GB free now); raise resources.disk_gb or write less"
+  elif [ "$code" -eq 137 ]; then
+    note="killed (exit 137, SIGKILL), most often for running out of memory; check memory use with compute metrics and raise resources.mem_gb"
+  fi
+  [ -n "$note" ] && echo "compute: $note" >> "$jobdir/log"
 fi
 write_status "$final" "$code"
 [ "$final" = succeeded ] && exit 0

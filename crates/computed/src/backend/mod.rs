@@ -101,6 +101,10 @@ pub struct Capacity {
     pub mem_gb: u32,
     pub os: String,
     pub arch: String,
+    /// Free disk at the backend's root when last measured.
+    pub disk_free_mb: Option<u64>,
+    /// Memory Docker containers can use in total (a VM's limit on macOS).
+    pub docker_mem_mb: Option<u64>,
 }
 
 /// Resources held by an active job on a local backend.
@@ -109,6 +113,10 @@ pub struct Alloc {
     pub ends_at: DateTime<Utc>,
     pub cpus: u32,
     pub mem_mb: u64,
+    /// Disk the job said it needs (resources.disk_gb).
+    pub disk_mb: u64,
+    /// Runs in a Docker container (counts against the Docker VM's memory).
+    pub container: bool,
 }
 
 /// Extra files and settings for staging a job, worked out by the scheduler.
@@ -116,8 +124,6 @@ pub struct Alloc {
 pub struct StageFiles {
     /// `.secrets.env` contents (KEY='value' lines).
     pub secrets_env: Option<String>,
-    /// `.registry.env`: registry credentials for pulling a private image (Apptainer).
-    pub registry_env: Option<String>,
     /// `(name, path on the backend)` for each dataset.
     pub datasets: Vec<(String, String)>,
     /// `(source dir on the backend, glob, as)` for inputs whose parent ran on the same backend;
@@ -190,6 +196,56 @@ pub trait Backend: Send + Sync {
     fn pricing(&self) -> Option<serde_json::Value> {
         None
     }
+    /// Re-measures what changes between probes (a local host's free disk and Docker memory).
+    async fn refresh(&self) -> Result<()> {
+        Ok(())
+    }
+    /// The job's output files under `out/` (matching `glob`) with their sizes in bytes.
+    async fn list_outputs(&self, job: &Job, glob: Option<&str>) -> Result<Vec<(String, u64)>> {
+        let (shell, root) = self.shell_for(Some(job)).await?;
+        let out = shell.run(&list_dir_script(&format!("{}/out", Remote::jobdir(&root, job.id)), glob)).await?.text();
+        Ok(parse_listing(&out))
+    }
+    /// Deletes a finished job's linked inputs and dataset view (they're only for the run).
+    async fn delete_inputs(&self, job: &Job) -> Result<()> {
+        let (shell, root) = self.shell_for(Some(job)).await?;
+        let d = shell_quote(&Remote::jobdir(&root, job.id));
+        shell.run(&format!("rm -rf {d}/in {d}/data")).await.map(|_| ())
+    }
+    /// Deletes a finished job's outputs and copied inputs (keeping its log, status and
+    /// metrics), to free disk.
+    async fn delete_outputs(&self, job: &Job) -> Result<()> {
+        let (shell, root) = self.shell_for(Some(job)).await?;
+        let d = shell_quote(&Remote::jobdir(&root, job.id));
+        shell.run(&format!("rm -rf {d}/out {d}/in {d}/data")).await.map(|_| ())
+    }
+}
+
+/// Lists the files under `dir` (optionally matching `glob`, as in `tar_dir_script`) as
+/// `size<TAB>./path` lines; works with GNU and BSD stat.
+pub fn list_dir_script(dir: &str, glob: Option<&str>) -> String {
+    let d = shell_quote(dir);
+    let filter = glob.map(|g| format!(" -path {}", shell_quote(&format!("./{g}")))).unwrap_or_default();
+    // `%s<TAB>%n` (GNU) or `%z<TAB>%N` (BSD), with a real tab, quoted so it stays one word.
+    format!(
+        "cd {d} 2>/dev/null || exit 0\n\
+         t=$(printf '\\t')\n\
+         if stat -c %s . >/dev/null 2>&1; then\n\
+           find . -type f{filter} -print0 | xargs -0 stat -c \"%s$t%n\" 2>/dev/null | head -n 100000\n\
+         else\n\
+           find . -type f{filter} -print0 | xargs -0 stat -f \"%z$t%N\" 2>/dev/null | head -n 100000\n\
+         fi"
+    )
+}
+
+/// Parses `size<TAB>./path` lines.
+pub fn parse_listing(out: &str) -> Vec<(String, u64)> {
+    out.lines()
+        .filter_map(|l| {
+            let (size, path) = l.split_once('\t')?;
+            Some((path.trim_start_matches("./").to_string(), size.trim().parse().ok()?))
+        })
+        .collect()
 }
 
 /// How a backend's host is reached: the configured host, or a fixed shell (a cloud instance).
@@ -412,8 +468,8 @@ impl Remote {
         self.write_job_files(job.id, &env, &job.command, files).await
     }
 
-    /// Writes job.env, command, datasets, inputs, .secrets.env and .registry.env (0600) into a
-    /// fresh job directory.
+    /// Writes job.env, command, datasets, inputs and .secrets.env (0600) into a fresh job
+    /// directory.
     pub async fn write_job_files(&self, id: i64, job_env: &str, command: &str, files: &StageFiles) -> Result<()> {
         let root = self.root_or_err()?;
         let dir = shell_quote(&Self::jobdir(&root, id));
@@ -538,9 +594,6 @@ pub fn job_files_tar(job_env: &str, command: &str, files: &StageFiles) -> Result
     if let Some(s) = &files.secrets_env {
         add(".secrets.env", s.as_bytes(), 0o600)?;
     }
-    if let Some(s) = &files.registry_env {
-        add(".registry.env", s.as_bytes(), 0o600)?;
-    }
     Ok(builder.into_inner()?)
 }
 
@@ -558,6 +611,7 @@ pub fn job_env(root: &str, job: &Job, timeout_s: u64, files: &StageFiles) -> Str
         format!("export ARRAY_INDEX={}", job.array_index.map(|i| i.to_string()).unwrap_or_default()),
         format!("export JOB_CPUS={}", job.resources.cpus),
         format!("export JOB_MEM_MB={}", job.resources.mem_mb),
+        format!("export JOB_DISK_MB={}", job.resources.disk_mb),
         format!("export JOB_GPUS={}", job.resources.gpus),
     ];
     if let (Some(c), Some(rt)) = (&job.spec.container, &files.runtime) {
@@ -584,7 +638,8 @@ pub fn parse_status(id: i64, status: &serde_json::Value, beat: Option<DateTime<U
         started: ts("started"),
         ended: ts("ended"),
         est_start: None,
-        note: None,
+        // The runner's diagnosis of a failure (out of memory, out of disk).
+        note: status["note"].as_str().filter(|n| !n.is_empty()).map(str::to_string),
     }
 }
 

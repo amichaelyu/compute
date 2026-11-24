@@ -16,6 +16,9 @@ use std::time::{Duration, Instant};
 pub const NAMESPACE: &str = "compute";
 const NONCE_TTL: Duration = Duration::from_secs(60);
 const SESSION_TTL_HOURS: i64 = 12;
+/// Outstanding nonces are capped so anonymous `POST /v1/auth/challenge` calls can't grow memory
+/// without bound once the API is reachable from the internet.
+const MAX_NONCES: usize = 1024;
 
 pub struct Auth {
     allowed_signers: PathBuf,
@@ -59,12 +62,21 @@ impl Auth {
         Auth { allowed_signers, store, nonces: Mutex::new(HashMap::new()) }
     }
 
-    pub fn challenge(&self) -> (String, DateTime<Utc>) {
+    pub fn challenge(&self) -> Result<(String, DateTime<Utc>), ApiError> {
         let nonce = random_hex();
         let mut map = self.nonces.lock().unwrap_or_else(|e| e.into_inner());
         map.retain(|_, t| t.elapsed() < NONCE_TTL);
+        if map.len() >= MAX_NONCES {
+            tracing::warn!("refusing a login challenge: {} unused nonces outstanding", map.len());
+            return Err(ApiError::new(
+                axum::http::StatusCode::TOO_MANY_REQUESTS,
+                "rate_limited",
+                "too many logins in progress",
+                "retry in a minute",
+            ));
+        }
         map.insert(nonce.clone(), Instant::now());
-        (nonce, Utc::now() + chrono::Duration::from_std(NONCE_TTL).unwrap_or_default())
+        Ok((nonce, Utc::now() + chrono::Duration::from_std(NONCE_TTL).unwrap_or_default()))
     }
 
     /// Verifies a signed nonce and returns `(token, fingerprint, expires_at)`.

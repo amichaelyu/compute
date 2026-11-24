@@ -25,6 +25,10 @@ impl LocalBackend {
     fn cfg(&self) -> &BackendConfig {
         &self.remote.cfg
     }
+    /// The configured Docker memory, else what `docker info` reported (bytes).
+    fn docker_mem(&self, detected: Option<i64>) -> Option<u64> {
+        self.cfg().docker_mem_gb.map(|g| u64::from(g) * 1024).or(detected.filter(|b| *b > 0).map(|b| b as u64 / 1_048_576))
+    }
 }
 
 const HARDWARE: &str = r#"
@@ -37,6 +41,16 @@ else
     "$(grep -m1 'model name' /proc/cpuinfo | cut -d: -f2 | sed 's/^ *//')"
 fi
 printf 'disk_free_kb=%s\n' "$(df -k "$ROOT" | awk 'NR==2{print $4}')"
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  printf 'docker_mem_bytes=%s\n' "$(docker info --format '{{.MemTotal}}' 2>/dev/null)"
+fi
+"#;
+
+/// What changes between probes: free disk and the memory Docker can use.
+const RESOURCES: &str = r#"printf 'disk_free_kb=%s\n' "$(df -k "$ROOT" | awk 'NR==2{print $4}')"
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  printf 'docker_mem_bytes=%s\n' "$(docker info --format '{{.MemTotal}}' 2>/dev/null)"
+fi
 "#;
 
 pub fn parse_kv(text: &str) -> serde_json::Map<String, serde_json::Value> {
@@ -89,6 +103,8 @@ impl Backend for LocalBackend {
             mem_gb: c.mem_gb.unwrap_or_else(|| total_mem_gb.saturating_sub(c.reserve_mem_gb).max(1)),
             os: c.os.clone().unwrap_or_else(|| hw.get("os").and_then(|v| v.as_str()).unwrap_or("unknown").to_string()),
             arch: c.arch.clone().unwrap_or_else(|| normalize_arch(hw.get("arch").and_then(|v| v.as_str()).unwrap_or("unknown"))),
+            disk_free_mb: hw.get("disk_free_kb").and_then(|v| v.as_i64()).map(|k| k.max(0) as u64 / 1024),
+            docker_mem_mb: self.docker_mem(hw.get("docker_mem_bytes").and_then(|v| v.as_i64())),
         };
         hw.insert("schedulable".into(), json!({"cpus": cap.cpus, "mem_gb": cap.mem_gb, "gpus": 0}));
         hw.insert("runtimes".into(), json!(self.remote.runtimes()));
@@ -123,30 +139,70 @@ impl Backend for LocalBackend {
                 true,
             );
         }
+        // Containers share the Docker VM's memory (OrbStack / Docker Desktop on macOS), which
+        // can be well below the host's. Keep 1 GB of it for Docker itself.
+        let container = job.is_container();
+        let docker_cap = cap.docker_mem_mb.map(|m| m.saturating_sub(1024)).filter(|_| container);
+        if let Some(dc) = docker_cap
+            && r.mem_mb > dc
+        {
+            return Quote::no(format!("needs {} MB in a container; {}'s Docker VM has {} MB for containers (raise the VM's memory)", r.mem_mb, c.name, dc), true);
+        }
+        // Disk: what jobs said they need, against what was free when last measured, keeping
+        // disk_reserve_gb spare.
+        let reserve = u64::from(c.disk_reserve_gb) * 1024;
+        let disk_free = cap.disk_free_mb;
+        let fits = |cpus: u32, mem: u64, cmem: u64, disk: u64| {
+            cpus + r.cpus <= cap.cpus
+                && mem + r.mem_mb <= cap_mem
+                && docker_cap.is_none_or(|dc| cmem + r.mem_mb <= dc)
+                && disk_free.is_none_or(|f| disk + r.disk_mb + reserve <= f)
+        };
         let shape = Shape::simple(r.cpus, r.mem_mb, 0);
         let used_cpus: u32 = active.iter().map(|a| a.cpus).sum();
         let used_mem: u64 = active.iter().map(|a| a.mem_mb).sum();
+        let used_cmem: u64 = active.iter().filter(|a| a.container).map(|a| a.mem_mb).sum();
+        let used_disk: u64 = active.iter().map(|a| a.disk_mb).sum();
         let now = Utc::now();
-        if used_cpus + r.cpus <= cap.cpus && used_mem + r.mem_mb <= cap_mem {
+        if fits(used_cpus, used_mem, used_cmem, used_disk) {
             return Quote::Ok { start: now, source: "now".into(), reason: format!("{} has room now", c.name), shape, cost: None };
+        }
+        if let Some(f) = disk_free
+            && r.disk_mb + reserve > f
+        {
+            // Not enough disk even with nothing else running: wait for space to be freed.
+            return Quote::no(
+                format!(
+                    "{} has {:.0} GB free (keeping {} GB spare); the job needs {:.0} GB (resources.disk_gb). Old outputs are deleted after keep_outputs_days, or with DELETE /v1/jobs/<id>/outputs",
+                    c.name,
+                    f as f64 / 1024.0,
+                    c.disk_reserve_gb,
+                    r.disk_mb as f64 / 1024.0
+                ),
+                false,
+            );
         }
         // Free running jobs in order of their expected end until this one fits.
         let mut ends: Vec<&Alloc> = active.iter().collect();
         ends.sort_by_key(|a| a.ends_at);
-        let (mut cpus, mut mem) = (used_cpus, used_mem);
+        let (mut cpus, mut mem, mut cmem, mut disk) = (used_cpus, used_mem, used_cmem, used_disk);
         let mut start = now;
         for a in ends {
             cpus -= a.cpus;
             mem -= a.mem_mb;
+            if a.container {
+                cmem -= a.mem_mb;
+            }
+            disk -= a.disk_mb;
             start = a.ends_at.max(now + chrono::Duration::minutes(1));
-            if cpus + r.cpus <= cap.cpus && mem + r.mem_mb <= cap_mem {
+            if fits(cpus, mem, cmem, disk) {
                 break;
             }
         }
         Quote::Ok {
             start,
             source: "daemon".into(),
-            reason: format!("{} is busy; room expected when running jobs reach their time limits", c.name),
+            reason: format!("{} is busy; room expected when running jobs finish (estimated from similar past jobs, else their time limits)", c.name),
             shape,
             cost: None,
         }
@@ -205,6 +261,19 @@ impl Backend for LocalBackend {
 
     async fn cancel(&self, job: &Job) -> Result<()> {
         self.remote.touch_cancel(job.id).await
+    }
+
+    async fn refresh(&self) -> Result<()> {
+        let root = self.remote.root_or_err()?;
+        let out = self.remote.shell().await?.run(&format!("ROOT={}\n{RESOURCES}", shell_quote(&root))).await?.text();
+        let kv = parse_kv(&out);
+        let disk = kv.get("disk_free_kb").and_then(|v| v.as_i64()).map(|k| k.max(0) as u64 / 1024);
+        let docker = self.docker_mem(kv.get("docker_mem_bytes").and_then(|v| v.as_i64()));
+        if let Some(cap) = self.capacity.write().unwrap_or_else(|e| e.into_inner()).as_mut() {
+            cap.disk_free_mb = disk.or(cap.disk_free_mb);
+            cap.docker_mem_mb = docker.or(cap.docker_mem_mb);
+        }
+        Ok(())
     }
 
     async fn availability(&self) -> Result<serde_json::Value> {

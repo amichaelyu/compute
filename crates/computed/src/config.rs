@@ -84,8 +84,8 @@ pub struct RegistryConfig {
     /// The backend that runs `docker buildx` (a local backend with Docker).
     #[serde(default)]
     pub builder: Option<String>,
-    /// A named secret with `REGISTRY_USERNAME` and `REGISTRY_PASSWORD`, used to push builds and
-    /// to pull private images on backends.
+    /// A named secret with `REGISTRY_USERNAME` and `REGISTRY_PASSWORD`, used by the builder to
+    /// push. Images are public: backends pull without credentials.
     #[serde(default)]
     pub secret: Option<String>,
     #[serde(default = "platforms")]
@@ -110,9 +110,10 @@ impl RegistryConfig {
 #[derive(Deserialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct BudgetConfig {
-    /// Total cloud spend allowed per calendar month (in the daemon's time zone).
+    /// Combined USD per hour that running cloud instances may cost at once. A paid job starts
+    /// only if its rate fits under this beside the instances already up.
     #[serde(default)]
-    pub monthly_usd: f64,
+    pub hourly_usd: f64,
     /// Space on the coordinator for outputs copied off cloud instances.
     #[serde(default = "outputs_cap")]
     pub outputs_cap_gb: u64,
@@ -120,7 +121,7 @@ pub struct BudgetConfig {
 
 impl Default for BudgetConfig {
     fn default() -> Self {
-        BudgetConfig { monthly_usd: 0.0, outputs_cap_gb: outputs_cap() }
+        BudgetConfig { hourly_usd: 0.0, outputs_cap_gb: outputs_cap() }
     }
 }
 
@@ -220,6 +221,17 @@ pub struct BackendConfig {
     pub reserve_cpus: u32,
     #[serde(default = "four")]
     pub reserve_mem_gb: u32,
+    /// Memory Docker containers may use in total (e.g. OrbStack's or Docker Desktop's VM).
+    /// Detected from `docker info` when omitted.
+    #[serde(default)]
+    pub docker_mem_gb: Option<u32>,
+    /// Disk kept free on a local host: no job starts if it would leave less.
+    #[serde(default = "five")]
+    pub disk_reserve_gb: u32,
+    /// Days a finished job's outputs stay on a local or Slurm backend before they're deleted
+    /// (its log and status stay). Outputs a waiting job still needs as inputs are kept.
+    #[serde(default = "seven")]
+    pub keep_outputs_days: u32,
     #[serde(default)]
     pub gpus: u32,
     #[serde(default)]
@@ -253,6 +265,12 @@ fn yes() -> bool {
 }
 fn two() -> u32 {
     2
+}
+fn five() -> u32 {
+    5
+}
+fn seven() -> u32 {
+    7
 }
 fn four() -> u32 {
     4

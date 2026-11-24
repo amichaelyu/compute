@@ -87,7 +87,7 @@ enum Cmd {
         #[arg(long)]
         array: bool,
     },
-    /// Download a job's outputs into a directory
+    /// Download a job's outputs into a directory (--list shows the files and sizes instead)
     Outputs {
         id: i64,
         #[arg(long)]
@@ -95,7 +95,12 @@ enum Cmd {
         /// Destination (default ./outputs/<id>)
         #[arg(short, long)]
         out: Option<PathBuf>,
+        /// List the output files with their sizes; download nothing
+        #[arg(long)]
+        list: bool,
     },
+    /// Delete a finished job's outputs on its backend to free disk (its log stays)
+    DeleteOutputs { id: i64 },
     /// Upload the repo's files as a snapshot and print its id
     Snapshot {
         /// Repo directory (default: the current one)
@@ -229,7 +234,22 @@ fn real_main() -> Result<()> {
             let v = c.post(&format!("/v1/jobs/{id}/cancel{}", if array { "?array=1" } else { "" }), &Value::Null)?;
             print_json(&v)?;
         }
-        Cmd::Outputs { id, glob, out } => {
+        Cmd::Outputs { id, glob, out: _, list: true } => {
+            let path = match glob {
+                Some(g) => format!("/v1/jobs/{id}/outputs/list?glob={}", q(&g)),
+                None => format!("/v1/jobs/{id}/outputs/list"),
+            };
+            let v = c.get(&path)?;
+            for f in v["files"].as_array().into_iter().flatten() {
+                println!("{:>10}  {}", fmt::gb(f["bytes"].as_f64().unwrap_or(0.0) / 1_048_576.0), f["path"].as_str().unwrap_or(""));
+            }
+            println!("{} files, {}", v["count"], fmt::gb(v["total_bytes"].as_f64().unwrap_or(0.0) / 1_048_576.0));
+        }
+        Cmd::DeleteOutputs { id } => {
+            c.call("DELETE", &format!("/v1/jobs/{id}/outputs"), None)?;
+            println!("deleted the outputs of job {id}");
+        }
+        Cmd::Outputs { id, glob, out, list: false } => {
             let dest = out.unwrap_or_else(|| PathBuf::from(format!("outputs/{id}")));
             std::fs::create_dir_all(&dest)?;
             let path = match glob {
@@ -319,6 +339,16 @@ fn print_job(j: &Value) {
         println!("  {r}");
     }
     println!("  backend   {}", j["backend"].as_str().unwrap_or("not placed yet"));
+    let r = &j["resources"];
+    if r.is_object() {
+        println!(
+            "  asked     {} CPUs, {} RAM, {} disk, {} GPUs",
+            r["cpus"],
+            fmt::gb(r["mem_gb"].as_f64().unwrap_or(0.0) * 1024.0),
+            r["disk_gb"].as_f64().map(|d| fmt::gb(d * 1024.0)).unwrap_or_else(|| "unstated".into()),
+            r["gpus"]
+        );
+    }
     println!("  start     {:<16} finish     {}", t.start, t.finish);
     println!("  elapsed   {:<16} time left  {}", t.elapsed, t.left);
     if let Some(c) = j["exit_code"].as_i64() {
@@ -357,6 +387,19 @@ fn print_usage(j: &Value, m: &Value) {
         u.disk_free_gb.map(|g| format!("{g:.0} GB")).unwrap_or("—".into()),
         u.power_w.map(|p| format!("{p:.0} W")).unwrap_or("not measured".into())
     );
+    // Close to running out of memory or disk: say so before the job dies of it.
+    let mem_mb = r["mem_gb"].as_f64().unwrap_or(0.0) * 1024.0;
+    if let Some(rss) = u.rss_mb
+        && mem_mb > 0.0
+        && rss > 0.9 * mem_mb
+    {
+        println!("  warning: memory at {:.0}% of resources.mem_gb; it will be killed (out of memory) if it goes over", 100.0 * rss / mem_mb);
+    }
+    if let Some(free) = u.disk_free_gb
+        && free < 5.0
+    {
+        println!("  warning: only {free:.1} GB of disk left; writes will fail with \"no space left on device\"");
+    }
 }
 
 fn logs(c: &Client, id: i64, follow: bool, tail: Option<u64>) -> Result<()> {
@@ -463,6 +506,14 @@ fn submit(c: &Client, file: &str, dry_run: bool, rev: Option<&str>, no_watch: bo
         std::fs::read_to_string(file).with_context(|| format!("reading {file}"))?
     };
     let mut req: Value = serde_json::from_str(&text).context("the job request is not JSON")?;
+    // Undersized memory and disk are the usual reasons a job dies partway: ask for both.
+    let res = &req["resources"];
+    if res["mem_gb"].is_null() {
+        eprintln!("warning: resources.mem_gb is not set (default 4 GB); set it to the job's peak RAM plus headroom");
+    }
+    if res["disk_gb"].is_null() {
+        eprintln!("warning: resources.disk_gb is not set; set it to the disk the job writes (outputs, checkpoints, caches) plus headroom");
+    }
     let snap = req["snapshot"].as_str().unwrap_or("auto");
     if snap == "auto" || snap.is_empty() {
         req["snapshot"] = snapshot(c, None, rev)?.into();
