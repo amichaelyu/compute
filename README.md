@@ -74,6 +74,17 @@ COMPUTE_URL=http://<coordinator>:8765
 COMPUTE_KEY=$HOME/.ssh/id_ed25519.pub
 ```
 
+## Installing with Homebrew
+
+```bash
+brew install amichaelyu/tap/compute
+```
+
+This builds the daemon (with the dashboard), and installs the skill and `hosts.example.toml` under
+`$(brew --prefix)/share/compute`. Write `~/.config/compute/hosts.toml` and `allowed_signers`, then
+`brew services start compute`. The daemon reads `~/.config/compute/computed.env` itself, so put
+`COMPUTE_LISTEN` there (and `PATH=...:$PATH` if `rex` lives somewhere unusual).
+
 ## Running it
 
 ```bash

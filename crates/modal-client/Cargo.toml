@@ -1,6 +1,6 @@
 [package]
 name = "modal-client"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Minimal client for Modal's gRPC API: apps, registry images, secrets and Sandboxes"
 license = "Apache-2.0"

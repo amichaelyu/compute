@@ -24,8 +24,7 @@ use backend::slurm::SlurmBackend;
 use config::{BackendKind, Config, Paths};
 use std::sync::Arc;
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "computed=info".into()),
@@ -34,13 +33,81 @@ async fn main() -> Result<()> {
 
     let arg = std::env::args().nth(1).unwrap_or_else(|| "serve".into());
     match arg.as_str() {
-        "serve" => serve().await,
+        "serve" => {
+            // Before any threads exist: the environment is only safe to change here.
+            load_env()?;
+            tokio::runtime::Builder::new_multi_thread().enable_all().build()?.block_on(serve())
+        }
         "--version" | "version" => {
             println!("computed {}", env!("CARGO_PKG_VERSION"));
             Ok(())
         }
         other => anyhow::bail!("unknown command {other:?}; usage: computed [serve|version]"),
     }
+}
+
+/// Puts common user tool directories on PATH (services start with a bare one), then applies
+/// `<config dir>/computed.env`: `KEY=value` lines, `#` comments, `$VAR`/`${VAR}` expanded, so
+/// `PATH=/some/dir:$PATH` works. Under systemd the same file is also the EnvironmentFile.
+fn load_env() -> Result<()> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let path = std::env::var("PATH").unwrap_or_default();
+    let mut dirs: Vec<String> = path.split(':').filter(|d| !d.is_empty()).map(str::to_string).collect();
+    for d in [format!("{home}/.local/bin"), "/opt/homebrew/bin".into(), "/usr/local/bin".into(), "/usr/bin".into(), "/bin".into()] {
+        if !dirs.contains(&d) {
+            dirs.push(d);
+        }
+    }
+    // SAFETY: called from main before the runtime and any other thread start.
+    unsafe { std::env::set_var("PATH", dirs.join(":")) };
+    let file = Paths::from_env()?.config_dir.join("computed.env");
+    let Ok(text) = std::fs::read_to_string(&file) else { return Ok(()) };
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let v = v.trim().trim_matches('"').trim_matches('\'');
+        // SAFETY: as above, still single-threaded.
+        unsafe { std::env::set_var(k.trim(), expand(v)) };
+    }
+    Ok(())
+}
+
+/// Expands `$VAR` and `${VAR}` from the current environment.
+fn expand(v: &str) -> String {
+    let mut out = String::new();
+    let mut chars = v.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c != '$' {
+            out.push(c);
+            continue;
+        }
+        let braced = chars.peek() == Some(&'{');
+        if braced {
+            chars.next();
+        }
+        let mut name = String::new();
+        while let Some(&n) = chars.peek() {
+            if n.is_ascii_alphanumeric() || n == '_' {
+                name.push(n);
+                chars.next();
+            } else {
+                break;
+            }
+        }
+        if braced && chars.peek() == Some(&'}') {
+            chars.next();
+        }
+        if name.is_empty() {
+            out.push('$');
+        } else {
+            out.push_str(&std::env::var(&name).unwrap_or_default());
+        }
+    }
+    out
 }
 
 async fn serve() -> Result<()> {
