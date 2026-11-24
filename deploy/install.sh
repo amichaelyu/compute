@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Deploys computed to the coordinator over Rex (`rex forward` to its sshd).
 #
-#   COMPUTE_SSH_USER=<user> deploy/install.sh          build, install binary + unit, restart
-#   COMPUTE_SSH_USER=<user> deploy/install.sh config   push hosts.toml (and allowed_signers), restart
+#   deploy/install.sh          build the dashboard and daemon, install binary + unit, restart
+#   deploy/install.sh config   push hosts.toml (and allowed_signers), restart
 #
-# Environment:
+# Settings come from ~/.config/compute/deploy.env (or $COMPUTE_DEPLOY_CONFIG), KEY=value lines;
+# environment variables of the same names override the file:
+#   COMPUTE_REX_HOST          Rex label of the coordinator (required)
 #   COMPUTE_SSH_USER          login user on the coordinator (required)
-#   COMPUTE_REX_HOST          Rex label of the coordinator (default: Wesley)
 #   COMPUTE_PORT              API port (default: 8765)
 #   COMPUTE_FORWARD           local port for the temporary sshd tunnel (default: 52299)
 #   COMPUTE_ALLOWED_SIGNERS   a local allowed_signers file to install as well (optional)
@@ -15,9 +16,20 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
+deploy_config="${COMPUTE_DEPLOY_CONFIG:-$HOME/.config/compute/deploy.env}"
+if [ -f "$deploy_config" ]; then
+  # The environment wins over the file: remember COMPUTE_* already set, source, then restore.
+  saved=$(env | grep -E '^COMPUTE_[A-Z_]+=' || true)
+  set -a
+  # shellcheck disable=SC1090
+  . "$deploy_config"
+  set +a
+  while IFS= read -r kv; do [ -n "$kv" ] && export "$kv"; done <<< "$saved"
+fi
+
 mode="${1:-install}"
-host="${COMPUTE_REX_HOST:-Wesley}"
-user="${COMPUTE_SSH_USER:?set COMPUTE_SSH_USER to your login user on the coordinator}"
+host="${COMPUTE_REX_HOST:?set COMPUTE_REX_HOST (Rex label of the coordinator) in $deploy_config}"
+user="${COMPUTE_SSH_USER:?set COMPUTE_SSH_USER (login user on the coordinator) in $deploy_config}"
 api_port="${COMPUTE_PORT:-8765}"
 fwd="${COMPUTE_FORWARD:-52299}"
 target=x86_64-unknown-linux-gnu
