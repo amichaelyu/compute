@@ -1,0 +1,95 @@
+#!/usr/bin/env bash
+# compute-run: runs one compute job from its job directory and records the outcome.
+#
+#   compute-run <jobdir>             run the job in <jobdir>
+#   compute-run --tasks <tasksfile>  Slurm array task: pick line SLURM_ARRAY_TASK_ID+1 as <jobdir>
+#
+# <jobdir> holds job.env (exports), command (the shell command), and optionally .secrets.env and
+# cancel. The runner writes status.json, heartbeat and log there. Works with bash 3.2 (macOS) and
+# bash 5; needs no timeout, setsid or jq.
+set -u
+
+if [ "${1:-}" = "--tasks" ]; then
+  jobdir=$(sed -n "$((SLURM_ARRAY_TASK_ID + 1))p" "$2")
+else
+  jobdir=${1:?usage: compute-run <jobdir>}
+fi
+cd "$jobdir" || exit 97
+
+pid=0
+started=$(date +%s)
+ended=null
+host=$(hostname)
+
+write_status() { # <state> [exit_code]
+  local tmp="$jobdir/status.json.tmp.$$"
+  printf '{"state":"%s","pid":%s,"started":%s,"ended":%s,"exit_code":%s,"host":"%s"}\n' \
+    "$1" "$pid" "$started" "$ended" "${2:-null}" "$host" > "$tmp" && mv -f "$tmp" "$jobdir/status.json"
+}
+
+# shellcheck disable=SC1091
+. "$jobdir/job.env"
+if [ -f "$jobdir/.secrets.env" ]; then
+  set -a
+  # shellcheck disable=SC1091
+  . "$jobdir/.secrets.env"
+  set +a
+  rm -f "$jobdir/.secrets.env"
+fi
+
+touch "$jobdir/heartbeat"
+if ! cd "$JOB_SNAPSHOT_DIR"; then
+  echo "compute: snapshot dir $JOB_SNAPSHOT_DIR is missing" >> "$jobdir/log"
+  ended=$(date +%s)
+  write_status failed 98
+  exit 0
+fi
+
+prelude='export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"'
+set -m   # the job gets its own process group, so cancel/timeout can kill all of it
+bash -lc "$prelude
+$(cat "$jobdir/command")" >> "$jobdir/log" 2>&1 < /dev/null &
+pid=$!
+set +m
+write_status running
+
+kill_job() {
+  kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+  for _ in 1 2 3 4 5; do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 2
+  done
+  kill -KILL -- "-$pid" 2>/dev/null || kill -KILL "$pid" 2>/dev/null
+}
+
+final=""
+last_beat=$started
+while kill -0 "$pid" 2>/dev/null; do
+  now=$(date +%s)
+  if [ -f "$jobdir/cancel" ]; then
+    final=cancelled
+    echo "compute: cancelled" >> "$jobdir/log"
+    kill_job
+    break
+  fi
+  if [ "${JOB_TIMEOUT_S:-0}" -gt 0 ] && [ $((now - started)) -ge "$JOB_TIMEOUT_S" ]; then
+    final=timeout
+    echo "compute: time limit of ${JOB_TIMEOUT_S}s reached" >> "$jobdir/log"
+    kill_job
+    break
+  fi
+  if [ $((now - last_beat)) -ge 30 ]; then
+    touch "$jobdir/heartbeat"
+    last_beat=$now
+  fi
+  sleep 2
+done
+
+wait "$pid"
+code=$?
+ended=$(date +%s)
+if [ -z "$final" ]; then
+  if [ "$code" -eq 0 ]; then final=succeeded; else final=failed; fi
+fi
+write_status "$final" "$code"
+exit 0

@@ -1,0 +1,14 @@
+[Unit]
+Description=compute scheduler daemon
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+# COMPUTE_LISTEN (the tailnet address to bind) and any other overrides live here.
+EnvironmentFile=-%h/.config/compute/computed.env
+ExecStart=%h/.local/bin/computed serve
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
