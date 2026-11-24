@@ -24,12 +24,13 @@ pub struct SlurmBackend {
     scfg: SlurmConfig,
     tz: Tz,
     quotes: Mutex<HashMap<String, (Instant, Quote)>>,
+    queue_cache: Mutex<Option<(Instant, serde_json::Value)>>,
 }
 
 impl SlurmBackend {
     pub fn new(cfg: BackendConfig, tz: Tz, tunnels: Arc<Tunnels>) -> SlurmBackend {
         let scfg = cfg.slurm.clone().expect("filled in by Config::load");
-        SlurmBackend { remote: Remote::new(cfg, tunnels), scfg, tz, quotes: Mutex::new(HashMap::new()) }
+        SlurmBackend { remote: Remote::new(cfg, tunnels), scfg, tz, quotes: Mutex::new(HashMap::new()), queue_cache: Mutex::new(None) }
     }
     fn cfg(&self) -> &BackendConfig {
         &self.remote.cfg
@@ -124,6 +125,9 @@ impl SlurmBackend {
         let r = &job.resources;
         if r.nodes > c.max_nodes {
             return Quote::no(format!("nodes={}; {} runs single-node jobs", r.nodes, c.name), true);
+        }
+        if job.local_build() {
+            return Quote::no("the image is built locally (no registry), so only Docker hosts can run it", true);
         }
         if job.is_container() && !self.remote.runtimes().iter().any(|x| x == "apptainer" || x == "docker") {
             return Quote::no(format!("container job; {} has no Apptainer or Docker", c.name), true);
@@ -502,17 +506,67 @@ impl Backend for SlurmBackend {
         Ok((self.remote.shell().await?, self.remote.root_or_err()?))
     }
 
+    /// Every job of the user's in the Slurm queue, including ones submitted outside compute.
+    async fn queue(&self) -> Result<Option<serde_json::Value>> {
+        if let Some((at, v)) = self.queue_cache.lock().await.clone()
+            && at.elapsed() < Duration::from_secs(20)
+        {
+            return Ok(Some(v));
+        }
+        let out = self
+            .remote
+            .shell()
+            .await?
+            .run("squeue -h --me -o '%i|%j|%T|%P|%S|%e|%l|%M|%b|%C|%m|%r'")
+            .await?
+            .text();
+        let jobs: Vec<serde_json::Value> = out
+            .lines()
+            .filter_map(|l| {
+                let f: Vec<&str> = l.split('|').collect();
+                if f.len() < 12 {
+                    return None;
+                }
+                let t = |s: &str| self.parse_local(s).map(|t| t.to_rfc3339());
+                // Jobs compute submitted are named c<job id>_<title>.
+                let compute_job = f[1].strip_prefix('c').and_then(|r| r.split('_').next()).and_then(|n| n.parse::<i64>().ok());
+                Some(json!({
+                    "slurm_id": f[0],
+                    "name": f[1],
+                    "state": f[2].to_ascii_lowercase(),
+                    "partition": f[3],
+                    "start": t(f[4]),
+                    "end": t(f[5]),
+                    "time_limit_s": parse_slurm_duration(f[6]).map(|d| d.as_secs()),
+                    "elapsed_s": parse_slurm_duration(f[7]).map(|d| d.as_secs()),
+                    "gres": (f[8] != "N/A").then(|| f[8]),
+                    "cpus": f[9].parse::<u32>().ok(),
+                    "mem": f[10],
+                    "reason": f[11],
+                    "compute_job": compute_job,
+                }))
+            })
+            .collect();
+        let v = json!({"jobs": jobs});
+        *self.queue_cache.lock().await = Some((Instant::now(), v.clone()));
+        Ok(Some(v))
+    }
+
     async fn availability(&self) -> Result<serde_json::Value> {
         let s = &self.scfg;
         let script = format!(
             "sinfo -h -p {gp} -N -O 'NodeHost:30,Gres:60,GresUsed:80,StateCompact:20'\necho MINE\n\
-             squeue -h --me -o '%T|%P'\necho LEFT\nsqueue -h -p {gp} -t R -o '%L'\n",
+             squeue -h --me -o '%T|%P'\necho LEFT\nsqueue -h -p {gp} -t R -o '%L'\necho CPUS\nsinfo -h -p {gp} -o '%C'\n",
             gp = shell_quote(&s.gpu_partition)
         );
         let out = self.remote.shell().await?.run(&script).await?.text();
         let (nodes, rest) = out.split_once("MINE").unwrap_or((&out, ""));
-        let (mine, left) = rest.split_once("LEFT").unwrap_or((rest, ""));
+        let (mine, rest) = rest.split_once("LEFT").unwrap_or((rest, ""));
+        let (left, cpus) = rest.split_once("CPUS").unwrap_or((rest, ""));
+        // sinfo %C is allocated/idle/other/total.
+        let cpu: Vec<u64> = cpus.trim().split('/').filter_map(|x| x.trim().parse().ok()).collect();
         let mut free = 0;
+        let mut total_gpus = 0;
         let mut per_node = serde_json::Map::new();
         for line in nodes.lines() {
             let f: Vec<&str> = line.split_whitespace().collect();
@@ -522,6 +576,9 @@ impl Backend for SlurmBackend {
             let (total, used) = (gres_gpus(f[1]), gres_gpus(f[2]));
             let usable = !["down", "drain", "drng", "fail", "maint"].iter().any(|x| f[3].contains(x));
             let n = if usable { total.saturating_sub(used) } else { 0 };
+            if usable {
+                total_gpus += total;
+            }
             free += n;
             per_node.insert(f[0].to_string(), json!({"gpus_free": n, "state": f[3]}));
         }
@@ -543,6 +600,9 @@ impl Backend for SlurmBackend {
         };
         Ok(json!({
             "gpus_free_now": free,
+            "gpus_total": total_gpus,
+            "cpus_allocated": cpu.first(),
+            "cpus_total": cpu.get(3),
             "nodes": per_node,
             "my_running": running,
             "my_pending": pending,

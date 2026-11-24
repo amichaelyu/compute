@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/computed", "crates/modal-client"]
+members = ["crates/computed", "crates/modal-client", "crates/compute"]
 
 [profile.release]
 strip = true

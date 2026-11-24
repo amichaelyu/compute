@@ -1080,6 +1080,7 @@ impl Scheduler {
             let files = self.stage_files(backend, j).await?;
             backend.stage(j, &path, &files).await.with_context(|| format!("staging job {}", j.id))?;
             self.copy_inputs(backend, j).await?;
+            self.local_build(backend, j).await?;
         }
         let handles = backend.launch(&live, shape).await?;
         let kind = backend.config().kind;

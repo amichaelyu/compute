@@ -1,5 +1,7 @@
 import { useState } from "react";
+import type { ReactNode } from "react";
 import { ApiError, type BackendDetail, disableBackend, enableBackend, getBackend, listBackends } from "./api";
+import { Meter } from "./Meter";
 import { ago, clock, label, ms, usePoll } from "./util";
 
 /** Renders the daemon's hardware/availability objects as a readable list. */
@@ -36,7 +38,7 @@ function KV({ value }: { value: unknown }) {
   );
 }
 
-type Rows = [string, string][];
+type Rows = [string, ReactNode][];
 type Obj = Record<string, unknown>;
 const num = (v: unknown) => (typeof v === "number" ? v : Number(v));
 const obj = (v: unknown): Obj => (v && typeof v === "object" ? (v as Obj) : {});
@@ -91,12 +93,25 @@ function availabilityRows(b: BackendDetail): Rows | null {
   const a = b.availability;
   if (!a) return null;
   if (b.kind === "local") {
-    return [
+    const h = obj(b.hardware);
+    const sched = obj(h.schedulable);
+    const cpus = num(sched.cpus);
+    const mem = num(sched.mem_gb);
+    const usedMem = num(a.mem_gb_in_use ?? 0);
+    const cores = num(a.cores ?? h.cpus);
+    const load = num(a.load_1m ?? NaN);
+    const rows: Rows = [
       ["Jobs running", String(a.running_jobs ?? 0)],
-      ["CPUs in use", `${a.cpus_in_use ?? 0}, ${a.cpus_free ?? "?"} free`],
-      ["Memory in use", `${Math.round(num(a.mem_gb_in_use ?? 0) * 10) / 10} GB`],
-      ["Load", String(a.load_average ?? "unknown")],
+      ["CPUs", <Meter used={num(a.cpus_in_use ?? 0)} total={cpus} text={`${a.cpus_in_use ?? 0} of ${cpus} reserved`} />],
+      ["Memory", <Meter used={usedMem} total={mem} text={`${Math.round(usedMem * 10) / 10} of ${mem} GB reserved`} />],
     ];
+    if (Number.isFinite(load) && cores > 0)
+      rows.push(["Load", <Meter used={load} total={cores} text={`${load.toFixed(2)} on ${cores} cores`} />]);
+    const total = num(a.disk_total_gb ?? NaN);
+    const free = num(a.disk_free_gb ?? NaN);
+    if (Number.isFinite(total) && Number.isFinite(free))
+      rows.push(["Disk", <Meter used={total - free} total={total} text={`${Math.round(free)} GB free of ${Math.round(total)}`} />]);
+    return rows;
   }
   if (b.kind !== "slurm") {
     return [
@@ -109,10 +124,16 @@ function availabilityRows(b: BackendDetail): Rows | null {
     .filter(([, free]) => free > 0)
     .map(([n, free]) => `${n} (${free})`);
   const next = typeof a.next_gpu_free_estimate === "string" ? ms(a.next_gpu_free_estimate) : NaN;
-  const rows: Rows = [
-    ["GPUs free", `${a.gpus_free_now ?? 0}${nodes.length ? ` on ${nodes.join(", ")}` : ""}`],
-    ["Your jobs", `${a.my_running ?? 0} running, ${a.my_pending ?? 0} waiting`],
-  ];
+  const gpus = num(a.gpus_total ?? NaN);
+  const freeGpus = num(a.gpus_free_now ?? 0);
+  const rows: Rows = [];
+  if (Number.isFinite(gpus) && gpus > 0)
+    rows.push(["GPUs", <Meter tone="gpu" used={gpus - freeGpus} total={gpus} text={`${gpus - freeGpus} of ${gpus} in use`} />]);
+  if (nodes.length) rows.push(["Free GPUs on", nodes.join(", ")]);
+  const cpus = num(a.cpus_total ?? NaN);
+  if (Number.isFinite(cpus) && cpus > 0)
+    rows.push(["GPU-node CPUs", <Meter used={num(a.cpus_allocated ?? 0)} total={cpus} text={`${a.cpus_allocated ?? 0} of ${cpus} allocated`} />]);
+  rows.push(["Your jobs", `${a.my_running ?? 0} running, ${a.my_pending ?? 0} waiting`]);
   if (Number.isFinite(next) && num(a.gpus_free_now) === 0) rows.push(["Next GPU frees", `around ${clock(next)}`]);
   return rows;
 }

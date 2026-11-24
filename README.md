@@ -53,7 +53,8 @@ The daemon reads `$COMPUTE_CONFIG_DIR` (default `~/.config/compute`):
   pushing builds and pulling private images, and secrets with `HF_TOKEN` named by Hugging Face
   datasets.
 - Cloud API keys, one 0600 file each: `runpod.key`, `lambda.key`, and `modal.toml` (with
-  `token_id` and `token_secret`). Cloud instances authorize the coordinator's own
+  `token_id` and `token_secret`). `deploy/install.sh` copies any of these it finds in your
+  local config dir to the coordinator. Cloud instances authorize the coordinator's own
   `~/.ssh/id_ed25519.pub`.
 - `computed.env`: environment for the service.
   - `COMPUTE_LISTEN` sets the address to listen on.

@@ -1,0 +1,18 @@
+[package]
+name = "compute"
+version = "0.3.0"
+edition = "2024"
+description = "Command-line client and Rex-native monitor for the compute scheduler"
+
+[[bin]]
+name = "compute"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.105"
+base64 = "0.22"
+chrono = { version = "0.4.45", features = ["serde"] }
+clap = { version = "4.6", features = ["derive"] }
+ratatui = "0.30"
+serde_json = "1.0.154"
+ureq = { version = "3.5", features = ["json"] }

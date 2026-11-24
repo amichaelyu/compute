@@ -1,4 +1,4 @@
-import type { BackendSummary, JobRow } from "./api";
+import type { BackendSummary, JobRow, QueuedJob } from "./api";
 import { ms, when } from "./util";
 
 /** "22:00", or "Tue 00:00" where a new day starts. */
@@ -43,14 +43,14 @@ function barFor(j: JobRow, now: number): Bar | null {
     default: {
       if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
       const failed = j.state === "failed" || j.state === "timeout" || j.state === "lost" || j.state === "dependency_failed";
-      return { job: j, from: start, to: Math.max(end, start + 30_000), kind: failed ? "failed" : "done" };
+      return { job: j, from: start, to: end, kind: failed ? "failed" : "done" };
     }
   }
 }
 
 /** Packs bars into rows so overlapping jobs stack instead of hiding each other. */
-function pack(bars: Bar[]): Bar[][] {
-  const rows: Bar[][] = [];
+function pack<T extends { from: number; to: number }>(bars: T[]): T[][] {
+  const rows: T[][] = [];
   const ends: number[] = [];
   for (const b of [...bars].sort((a, c) => a.from - c.from)) {
     const i = ends.findIndex((e) => e <= b.from);
@@ -74,7 +74,32 @@ function laneNote(b: BackendSummary | undefined, bars: Bar[]) {
   return [running && `${running} running`, waiting && `${waiting} waiting`].filter(Boolean).join(", ");
 }
 
-export function Lanes({ jobs, backends, now }: { jobs: JobRow[]; backends: BackendSummary[]; now: number }) {
+/** A Slurm job of the user's that compute didn't submit, as a bar: running from its start,
+ * pending from its estimated start, for its time limit. */
+type Ext = { q: QueuedJob; from: number; to: number; running: boolean };
+
+function extBar(q: QueuedJob, now: number): Ext | null {
+  if (q.compute_job !== null) return null;
+  const running = q.state === "running";
+  const start = ms(q.start);
+  const limit = (q.time_limit_s ?? 3600) * 1000;
+  const from = running ? (Number.isFinite(start) ? start : now - (q.elapsed_s ?? 0) * 1000) : Number.isFinite(start) ? Math.max(start, now) : now;
+  const end = ms(q.end);
+  const to = Number.isFinite(end) && end > from ? end : from + limit;
+  return { q, from, to, running };
+}
+
+export function Lanes({
+  jobs,
+  backends,
+  queues,
+  now,
+}: {
+  jobs: JobRow[];
+  backends: BackendSummary[];
+  queues: Record<string, QueuedJob[]>;
+  now: number;
+}) {
   const start = now - BEFORE;
   const end = now + AFTER;
   const pct = (t: number) => ((Math.min(Math.max(t, start), end) - start) / (end - start)) * 100;
@@ -110,21 +135,60 @@ export function Lanes({ jobs, backends, now }: { jobs: JobRow[]; backends: Backe
       </div>
       {[...byLane.entries()].map(([name, bars]) => {
         const backend = backends.find((b) => b.name === name);
-        const rows = pack(bars);
+        const past = bars.filter((b) => b.kind === "done" || b.kind === "failed");
+        const ext = (queues[name] ?? []).map((q) => extBar(q, now)).filter((x): x is Ext => x !== null && x.to >= start && x.from <= end);
+        // Rows of compute's own active jobs, then rows of the user's other Slurm jobs.
+        const rows: (Bar | Ext)[][] = [...pack(bars.filter((b) => b.kind === "running" || b.kind === "waiting")), ...pack(ext)];
         const hidden = rows.slice(MAX_ROWS).reduce((n, r) => n + r.length, 0);
+        // Finished jobs take a thin strip at the top; active bars sit below it.
+        const offset = past.length ? 1.1 : 0.25;
         return (
           <div key={name} className={`lane${backend && !backend.enabled ? " lane-off" : ""}`}>
             <div className="lane-name">
               <a href="#/backends">{name}</a>
               <span>{laneNote(backend, bars)}</span>
+              {ext.length > 0 && (
+                <span>
+                  {ext.length} of yours outside compute
+                </span>
+              )}
             </div>
-            <div className="lane-track" style={{ minHeight: `${Math.max(1, Math.min(rows.length, MAX_ROWS)) * 1.75 + 0.5}rem` }}>
+            <div className="lane-track" style={{ minHeight: `${Math.max(1, Math.min(rows.length, MAX_ROWS)) * 1.75 + offset + 0.25}rem` }}>
               {ticks.map((t) => (
                 <span key={t} className="gridline" style={{ left: `${pct(t)}%` }} />
               ))}
               <span className="nowline" style={{ left: `${pct(now)}%` }} />
+              {past.map((b) => {
+                const left = pct(b.from);
+                return (
+                  <a
+                    key={b.job.id}
+                    href={`#/jobs/${b.job.id}`}
+                    className={`bar bar-past bar-${b.kind}`}
+                    style={{ left: `${left}%`, width: `${Math.max(0, pct(b.to) - left)}%` }}
+                    title={`#${b.job.id} ${b.job.title}\n${b.job.state}, ${when(b.job, now)}`}
+                    aria-label={`job ${b.job.id}, ${b.job.state}`}
+                  />
+                );
+              })}
               {rows.slice(0, MAX_ROWS).map((row, r) =>
                 row.map((b) => {
+                  if ("q" in b) {
+                    const x = b;
+                    const left = pct(x.from);
+                    const width = Math.max(0.6, pct(x.to) - left);
+                    const gres = x.q.gres ? `, ${x.q.gres.replace("gres/", "")}` : "";
+                    return (
+                      <span
+                        key={`s${x.q.slurm_id}`}
+                        className={`bar bar-external${x.running ? " bar-ext-running" : ""}`}
+                        style={{ left: `${left}%`, width: `${width}%`, top: `${r * 1.75 + offset}rem` }}
+                        title={`Slurm ${x.q.slurm_id} ${x.q.name} (not from compute)\n${x.q.state}${gres}${x.running ? "" : `, ${x.q.reason}`}`}
+                      >
+                        {width > 2.5 && <span>{x.q.name}</span>}
+                      </span>
+                    );
+                  }
                   const left = pct(b.from);
                   const width = Math.max(0.6, pct(b.to) - left);
                   const elapsed = b.split !== undefined ? ((pct(b.split) - left) / width) * 100 : 0;
@@ -136,7 +200,7 @@ export function Lanes({ jobs, backends, now }: { jobs: JobRow[]; backends: Backe
                       style={{
                         left: `${left}%`,
                         width: `${width}%`,
-                        top: `${r * 1.75 + 0.25}rem`,
+                        top: `${r * 1.75 + offset}rem`,
                         ...(b.split !== undefined ? { ["--elapsed" as string]: `${Math.max(0, Math.min(100, elapsed))}%` } : {}),
                       }}
                       title={`#${b.job.id} ${b.job.title}\n${b.job.state}, ${when(b.job, now)}`}

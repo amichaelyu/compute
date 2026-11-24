@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
-import { ApiError, type Job, cancelJob, getJob, getLogs, isActive, outputsUrl } from "./api";
+import { ApiError, type Job, cancelJob, getJob, getLogs, getMetrics, isActive, outputsUrl } from "./api";
+import { Meter } from "./Meter";
 import { State } from "./State";
 import { clock, dur, ms, usePoll, when, who } from "./util";
 
@@ -187,6 +188,66 @@ function CancelButton({ job, onDone }: { job: Job; onDone: () => void }) {
   );
 }
 
+/** Live resource use of a running job, as bars of used against what it asked for. */
+function Usage({ job }: { job: Job }) {
+  const { data } = usePoll(() => getMetrics(job.id), 10_000, [job.id]);
+  const s = data?.latest;
+  if (!s) return <p className="muted usage-wait">Waiting for the first usage sample…</p>;
+  const r = job.resources;
+  const memMb = r.mem_gb * 1024;
+  const gb = (mb: number) => (mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${Math.round(mb)} MB`);
+  const power = s.gpus.reduce((p, g) => p + (g.power_w ?? 0), 0);
+  return (
+    <dl className="facts usage">
+      <div>
+        <dt>CPU</dt>
+        <dd>
+          <Meter used={s.cpu_pct} total={r.cpus * 100} text={`${(s.cpu_pct / 100).toFixed(1)} of ${r.cpus} cores`} />
+        </dd>
+      </div>
+      <div>
+        <dt>Memory</dt>
+        <dd>
+          <Meter used={s.rss_mb} total={memMb} text={`${gb(s.rss_mb)} of ${gb(memMb)}`} />
+        </dd>
+      </div>
+      {s.gpus.map((g) => (
+        <div key={g.index}>
+          <dt>GPU {g.index}</dt>
+          <dd>
+            <Meter tone="gpu" used={g.util_pct ?? 0} total={100} text={`${g.util_pct ?? "?"}%, ${gb(g.mem_used_mb ?? 0)} of ${gb(g.mem_total_mb ?? 0)}${g.power_w != null ? `, ${Math.round(g.power_w)} W` : ""}`} />
+          </dd>
+        </div>
+      ))}
+      {s.gpus.length > 0 && (
+        <div>
+          <dt>Power</dt>
+          <dd>{Math.round(power)} W across GPUs</dd>
+        </div>
+      )}
+      {s.disk_free_gb != null && (
+        <div>
+          <dt>Disk free</dt>
+          <dd>{Math.round(s.disk_free_gb)} GB on {s.host}</dd>
+        </div>
+      )}
+    </dl>
+  );
+}
+
+/** Time used against the job's limit. */
+function TimeMeter({ job, now }: { job: Job; now: number }) {
+  const started = ms(job.started_at);
+  if (job.state !== "running" || !Number.isFinite(started)) return null;
+  const used = (now - started) / 1000;
+  const limit = job.resources.time_s;
+  return (
+    <div className="time-meter">
+      <Meter tone="time" used={used} total={limit} text={`${dur(used)} of ${dur(limit)}, ${dur(Math.max(0, limit - used))} left`} />
+    </div>
+  );
+}
+
 export function JobPanel({ id, now }: { id: number; now: number }) {
   const { data: job, error, refresh } = usePoll(() => getJob(id), 3000, [id]);
   const close = () => (location.hash = "#/");
@@ -226,6 +287,8 @@ export function JobPanel({ id, now }: { id: number; now: number }) {
             )}
             {job.array_id !== null && <span className="muted">Task {job.array_index} of array {job.array_id}</span>}
           </div>
+          <TimeMeter job={job} now={now} />
+          {job.state === "running" && <Usage job={job} />}
           <Facts job={job} now={now} />
           <Log id={job.id} active={isActive(job.state)} />
         </>

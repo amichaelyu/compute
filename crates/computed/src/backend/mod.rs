@@ -169,6 +169,18 @@ pub trait Backend: Send + Sync {
         let dir = shell_quote(&format!("{}/{sub}", Remote::jobdir(&root, job.id)));
         shell.pipe_in(&format!("set -e\nmkdir -p {dir}\ntar -x --exclude='._*' -C {dir}"), data).await
     }
+    /// A batch scheduler's queue of the user's jobs (Slurm), including ones submitted outside
+    /// compute; None for other backends.
+    async fn queue(&self) -> Result<Option<serde_json::Value>> {
+        Ok(None)
+    }
+    /// Resource samples written by the runner (`{"latest", "history"}`).
+    async fn metrics(&self, job: &Job, history: u32) -> Result<serde_json::Value> {
+        let (shell, root) = self.shell_for(None).await?;
+        let d = shell_quote(&Remote::jobdir(&root, job.id));
+        let script = format!("cat {d}/metrics.json 2>/dev/null || echo null\necho ---\ntail -n {history} {d}/metrics.jsonl 2>/dev/null || true");
+        Ok(parse_metrics(&shell.run(&script).await?.text()))
+    }
     /// Cloud backends: tear down instances with no live job behind them. `live` maps each live
     /// job to its stored handle.
     async fn sweep(&self, _live: &HashMap<i64, Option<serde_json::Value>>) -> Result<()> {
@@ -347,24 +359,30 @@ impl Remote {
         let root = self.root_or_err()?;
         let dir = shell_quote(&Self::snapshot_dir(&root, snapshot));
         let shell = self.shell().await?;
-        let state = shell
+        let probe = shell
             .run(&format!(
-                "if [ -f {dir}/.compute-ready ]; then echo ready; elif [ -f {dir}/.compute-unpacked ]; then echo unpacked; else echo none; fi"
+                "if [ -f {dir}/.compute-ready ]; then echo ready; elif [ -f {dir}/.compute-unpacked ]; then echo unpacked; else echo none; fi\n\
+                 command -v zstd >/dev/null 2>&1 && echo zstd || echo nozstd"
             ))
             .await?
             .text();
-        let state = state.trim();
+        let state = probe.lines().next().unwrap_or("none").trim().to_string();
+        let state = state.as_str();
         if state == "none" {
+            // Send the compressed snapshot when the host can decompress it: several times fewer
+            // bytes over slow links (Rex tunnels).
+            let zstd = probe.lines().any(|l| l.trim() == "zstd");
+            let unpack = if zstd { "zstd -dcq | tar -x --exclude='._*' -C \"$t\"" } else { "tar -x --exclude='._*' -C \"$t\"" };
             let script = format!(
-                "set -e\nd={dir}\nt=\"$d.tmp.$$\"\nrm -rf \"$t\" \"$d\"\nmkdir -p \"$t\"\n\
-                 tar -x --exclude='._*' -C \"$t\"\ntouch \"$t/.compute-unpacked\"\nmv \"$t\" \"$d\""
+                "set -e\nset -o pipefail\nd={dir}\nt=\"$d.tmp.$$\"\nrm -rf \"$t\" \"$d\"\nmkdir -p \"$t\"\n\
+                 {unpack}\ntouch \"$t/.compute-unpacked\"\nmv \"$t\" \"$d\""
             );
             let file = tokio::fs::File::open(path)
                 .await
                 .with_context(|| format!("opening snapshot {}", path.display()))?;
-            let decoder: Reader = Box::new(ZstdDecoder::new(BufReader::new(file)));
+            let data: Reader = if zstd { Box::new(file) } else { Box::new(ZstdDecoder::new(BufReader::new(file))) };
             shell
-                .pipe_in(&script, decoder)
+                .pipe_in(&script, data)
                 .await
                 .with_context(|| format!("unpacking snapshot on {}", self.cfg.name))?;
         }
@@ -457,12 +475,29 @@ impl Remote {
         self.shell().await?.pipe_out(&tar_dir_script(&out, glob)).await
     }
 
+    /// The latest resource sample and the last `history` samples of a job.
+    pub async fn metrics(&self, id: i64, history: u32) -> Result<serde_json::Value> {
+        let root = self.root_or_err()?;
+        let d = shell_quote(&Self::jobdir(&root, id));
+        let script = format!("cat {d}/metrics.json 2>/dev/null || echo null\necho ---\ntail -n {history} {d}/metrics.jsonl 2>/dev/null || true");
+        let out = self.shell().await?.run(&script).await?.text();
+        Ok(parse_metrics(&out))
+    }
+
     pub async fn touch_cancel(&self, id: i64) -> Result<()> {
         let root = self.root_or_err()?;
         let d = shell_quote(&Self::jobdir(&root, id));
         self.shell().await?.run(&format!("mkdir -p {d} && touch {d}/cancel")).await?;
         Ok(())
     }
+}
+
+/// Parses `latest\n---\nhistory lines` into `{"latest": ..., "history": [...]}`.
+pub fn parse_metrics(out: &str) -> serde_json::Value {
+    let (latest, hist) = out.split_once("---").unwrap_or((out, ""));
+    let latest: serde_json::Value = serde_json::from_str(latest.trim()).unwrap_or(serde_json::Value::Null);
+    let history: Vec<serde_json::Value> = hist.lines().filter_map(|l| serde_json::from_str(l.trim()).ok()).collect();
+    serde_json::json!({"latest": latest, "history": history})
 }
 
 /// A script that writes a tar of `dir` (or the files in it matching `glob`) to stdout.
@@ -521,13 +556,13 @@ pub fn job_env(root: &str, job: &Job, timeout_s: u64, files: &StageFiles) -> Str
         format!("export JOB_SNAPSHOT_DIR={}", shell_quote(&Remote::snapshot_dir(root, &job.snapshot))),
         format!("export JOB_TIMEOUT_S={timeout_s}"),
         format!("export ARRAY_INDEX={}", job.array_index.map(|i| i.to_string()).unwrap_or_default()),
+        format!("export JOB_CPUS={}", job.resources.cpus),
+        format!("export JOB_MEM_MB={}", job.resources.mem_mb),
+        format!("export JOB_GPUS={}", job.resources.gpus),
     ];
     if let (Some(c), Some(rt)) = (&job.spec.container, &files.runtime) {
         lines.push(format!("export JOB_RUNTIME={}", shell_quote(rt)));
         lines.push(format!("export JOB_IMAGE={}", shell_quote(&c.image)));
-        lines.push(format!("export JOB_CPUS={}", job.resources.cpus));
-        lines.push(format!("export JOB_MEM_MB={}", job.resources.mem_mb));
-        lines.push(format!("export JOB_GPUS={}", job.resources.gpus));
     }
     let pairs = files.env.iter().map(|(k, v)| (k.as_str(), v.as_str()));
     let user = job.env.iter().map(|(k, v)| (k.as_str(), v.as_str()));

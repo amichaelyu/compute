@@ -37,6 +37,7 @@
 #   gpu_types = ["L40S", "H100"]
 #   default_image = "..."       # for jobs without `container`
 #   regions = []
+#   authorized_keys = ["ssh-ed25519 AAAA... me"]  # also let these log in (not Modal)
 #   # Modal only (no price API): gpu_rates = {L40S = 1.95}, cpu_rate, mem_gb_rate, rates_date
 
 listen = "127.0.0.1:8765"   # COMPUTE_LISTEN overrides this (deploy sets the tailnet address)

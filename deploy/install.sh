@@ -2,7 +2,7 @@
 # Deploys computed to the coordinator over Rex (`rex forward` to its sshd).
 #
 #   deploy/install.sh          build the dashboard and daemon, install binary + unit, restart
-#   deploy/install.sh config   push hosts.toml (and allowed_signers), restart
+#   deploy/install.sh config   push hosts.toml (and allowed_signers, cloud API keys), restart
 #
 # Settings come from ~/.config/compute/deploy.env (or $COMPUTE_DEPLOY_CONFIG), KEY=value lines;
 # environment variables of the same names override the file:
@@ -79,6 +79,14 @@ case "$mode" in
     ;;
   *) echo "usage: $0 [install|config]" >&2; exit 2 ;;
 esac
+# Cloud API keys from the local config dir, when present.
+local_config=${COMPUTE_CONFIG_DIR:-${XDG_CONFIG_HOME:-$HOME/.config}/compute}
+for f in runpod.key lambda.key modal.toml; do
+  if [ -f "$local_config/$f" ]; then
+    put "$local_config/$f" ".config/compute/$f"
+    rsh "chmod 600 ~/.config/compute/$f"
+  fi
+done
 if [ -n "${COMPUTE_ALLOWED_SIGNERS:-}" ]; then
   put "$COMPUTE_ALLOWED_SIGNERS" .config/compute/allowed_signers
 fi

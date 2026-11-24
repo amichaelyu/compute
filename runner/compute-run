@@ -65,12 +65,19 @@ touch "$jobdir/heartbeat"
 [ -d "$JOB_SNAPSHOT_DIR" ] || fail "snapshot dir $JOB_SNAPSHOT_DIR is missing"
 mkdir -p "$JOB_OUTPUT_DIR" "$JOB_INPUT_DIR" "$JOB_DATA_DIR"
 
-# Datasets: $JOB_DATA_DIR/<name> links to this host's copy.
+# Datasets: $JOB_DATA_DIR/<name> is a real directory tree of this host's copy, made of hard
+# links (Linux) or copy-on-write clones (macOS), so it costs no space and `cp -a` or a Docker
+# bind mount of it gets the data, not a link. A symlink is the last resort.
 if [ -f "$jobdir/datasets" ]; then
   while IFS="$tab" read -r name path; do
     [ -n "$name" ] || continue
     [ -d "$path" ] || fail "dataset $name is missing at $path"
-    ln -sfn "$path" "$JOB_DATA_DIR/$name"
+    dest="$JOB_DATA_DIR/$name"
+    rm -rf "$dest"
+    cp -al "$path" "$dest" 2>/dev/null || cp -cR "$path" "$dest" 2>/dev/null || {
+      rm -rf "$dest"
+      ln -sfn "$path" "$dest"
+    }
   done < "$jobdir/datasets"
 fi
 
@@ -184,6 +191,41 @@ $cmd" >> "$jobdir/log" 2>&1 < /dev/null &
 esac
 write_status running
 
+# Resource usage every 10 s: metrics.json (latest) and metrics.jsonl (history).
+sample_metrics() {
+  local now cpu rss gpus disk stats ids
+  now=$(date +%s)
+  if [ "$runtime" = docker ]; then
+    stats=$(docker stats --no-stream --format '{{.CPUPerc}}|{{.MemUsage}}' "$container_name" 2>/dev/null)
+    cpu=$(printf '%s' "$stats" | awk -F'|' '{gsub(/%/, "", $1); print ($1 == "" ? 0 : $1)}')
+    rss=$(printf '%s' "$stats" | awk -F'|' '{split($2, m, " / "); v = m[1]; n = v + 0;
+      if (v ~ /GiB|GB/) n *= 1024; else if (v ~ /KiB|kB/) n /= 1024; else if (v ~ /[0-9]B$/) n /= 1048576;
+      printf "%d", n}')
+  else
+    # The job is its own process group (pgid = $pid): sum over it.
+    # shellcheck disable=SC2046  # two numbers, split on purpose
+    set -- $(ps -A -o pgid= -o pcpu= -o rss= 2>/dev/null | awk -v g="$pid" '$1 == g {c += $2; r += $3} END {printf "%.1f %d", c, r / 1024}')
+    cpu=${1:-0}
+    rss=${2:-0}
+  fi
+  gpus=""
+  if [ "${JOB_GPUS:-0}" -gt 0 ] && command -v nvidia-smi >/dev/null 2>&1; then
+    ids=""
+    [ -n "${CUDA_VISIBLE_DEVICES:-}" ] && ids="-i $CUDA_VISIBLE_DEVICES"
+    # shellcheck disable=SC2086
+    gpus=$(nvidia-smi $ids --query-gpu=index,utilization.gpu,memory.used,memory.total,power.draw \
+        --format=csv,noheader,nounits 2>/dev/null \
+      | awk -F', *' 'function num(x) { return (x ~ /^[0-9.]+$/) ? x : "null" }
+          { printf "%s{\"index\":%s,\"util_pct\":%s,\"mem_used_mb\":%s,\"mem_total_mb\":%s,\"power_w\":%s}",
+            (NR > 1 ? "," : ""), num($1), num($2), num($3), num($4), num($5) }')
+  fi
+  disk=$(df -k "$jobdir" 2>/dev/null | awk 'NR == 2 {printf "%.1f", $4 / 1048576}')
+  printf '{"t":%s,"cpu_pct":%s,"rss_mb":%s,"gpus":[%s],"disk_free_gb":%s,"host":"%s"}\n' \
+    "$now" "${cpu:-0}" "${rss:-0}" "$gpus" "${disk:-null}" "$host" > "$jobdir/metrics.json.tmp" &&
+    mv -f "$jobdir/metrics.json.tmp" "$jobdir/metrics.json" &&
+    cat "$jobdir/metrics.json" >> "$jobdir/metrics.jsonl"
+}
+
 kill_job() {
   [ "$runtime" = docker ] && docker rm -f "$container_name" >/dev/null 2>&1
   kill -TERM -- "-$pid" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
@@ -196,8 +238,13 @@ kill_job() {
 
 final=""
 last_beat=$started
+last_sample=0
 while kill -0 "$pid" 2>/dev/null; do
   now=$(date +%s)
+  if [ $((now - last_sample)) -ge 10 ]; then
+    sample_metrics
+    last_sample=$now
+  fi
   if [ -f "$jobdir/cancel" ]; then
     final=cancelled
     echo "compute: cancelled" >> "$jobdir/log"
@@ -225,4 +272,6 @@ if [ -z "$final" ]; then
 fi
 write_status "$final" "$code"
 [ "$final" = succeeded ] && exit 0
+# Outside Slurm a cancel isn't a failure (Rex shows the pane's exit status).
+[ "$final" = cancelled ] && [ -z "${SLURM_JOB_ID:-}" ] && exit 0
 exit 1

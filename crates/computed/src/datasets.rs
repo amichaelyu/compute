@@ -30,8 +30,15 @@ const DEFAULT_RATE: f64 = 30.0 * 1024.0 * 1024.0;
 pub enum Source {
     /// A directory on one of the backends.
     HostPath { backend: String, path: String },
-    /// A finished job's outputs (all of them, or the files matching `glob`).
-    JobOutputs { job: i64, #[serde(default)] glob: Option<String> },
+    /// A finished job's outputs (all of them, or the files matching `glob`). `allow_failed`
+    /// also accepts a job that failed, timed out or was cancelled.
+    JobOutputs {
+        job: i64,
+        #[serde(default)]
+        glob: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        allow_failed: bool,
+    },
     /// A tar.zst uploaded to the daemon (`PUT /v1/datasets/{name}/upload`).
     Upload { sha256: String },
     /// A Hugging Face repo at a revision; `secret` names a secret with HF_TOKEN for private repos.
@@ -136,18 +143,23 @@ impl Scheduler {
                 })?;
                 (version, size, files, Source::HostPath { backend, path: real })
             }
-            Source::JobOutputs { job, glob } => {
+            Source::JobOutputs { job, glob, allow_failed } => {
                 if glob.as_deref().is_some_and(|g| !valid_glob(g)) {
                     return Err(ApiError::bad_request("glob has characters that aren't allowed", "use letters, digits and _ . * ? / - [ ] only"));
                 }
                 let j = self.store.get_job(job)?.ok_or_else(|| ApiError::not_found(format!("job {job} not found")))?;
-                if j.state != JobState::Succeeded {
-                    return Err(ApiError::bad_request(format!("job {job} is {}", j.state.as_str()), "register outputs of a job that succeeded"));
+                if j.state != JobState::Succeeded && !(allow_failed && j.state.is_terminal()) {
+                    let hint = if j.state.is_terminal() {
+                        "pass \"allow_failed\": true to use the outputs of a job that didn't succeed"
+                    } else {
+                        "wait until the job has ended"
+                    };
+                    return Err(ApiError::bad_request(format!("job {job} is {}", j.state.as_str()), hint));
                 }
                 let (shell, path, _) = self.outputs_location(&j).await?;
                 let (_, size, files) = listing(shell.as_ref(), &path, glob.as_deref()).await?;
                 let version = short(&Sha256::digest(format!("job {job} glob {}", glob.clone().unwrap_or_default())));
-                (version, size, files, Source::JobOutputs { job, glob })
+                (version, size, files, Source::JobOutputs { job, glob, allow_failed })
             }
             Source::Upload { .. } => {
                 return Err(ApiError::bad_request("upload sources are created with PUT /v1/datasets/{name}/upload", "send the tar.zst there"));
@@ -329,7 +341,8 @@ impl Scheduler {
             && let Some(copy) = self.store.dataset_copies(Some(&bname), Some(&d.name))?.into_iter().find(|c| c.version == d.version)
         {
             let p = shell_quote(&copy.path);
-            let check = if copy.owned { format!("test -f {p}/.compute-ready && echo ok") } else { format!("test -d {p} && echo ok") };
+            // The ready marker sits beside the copy (older copies have it inside).
+            let check = if copy.owned { format!("{{ test -f {p}.ready || test -f {p}/.compute-ready; }} && echo ok") } else { format!("test -d {p} && echo ok") };
             if shell.run(&format!("{check} || true")).await?.text().trim() == "ok" {
                 self.store.touch_copy(&d.name, &d.version, &bname)?;
                 return Ok(copy.path);
@@ -344,8 +357,8 @@ impl Scheduler {
         let started = Instant::now();
         let origin = self.origin(&row).await?;
         let q = shell_quote(&dest);
-        let prep = format!("set -e\nd={q}\nchmod -R u+w \"$d\" 2>/dev/null || true\nrm -rf \"$d\" \"$d.tmp\"\nmkdir -p \"$d.tmp\"\n");
-        let finish = "\ntouch \"$d.tmp/.compute-ready\"\nmv \"$d.tmp\" \"$d\"\nchmod -R a-w \"$d\" 2>/dev/null || true\n";
+        let prep = format!("set -e\nd={q}\nchmod -R u+w \"$d\" 2>/dev/null || true\nrm -rf \"$d\" \"$d.tmp\" \"$d.ready\"\nmkdir -p \"$d.tmp\"\n");
+        let finish = "\nmv \"$d.tmp\" \"$d\"\nchmod -R a-w \"$d\" 2>/dev/null || true\ntouch \"$d.ready\"\n";
         match origin {
             Origin::Dir { shell: src, path, glob, backend: src_backend } => {
                 if !cloud && src_backend.as_deref() == Some(bname.as_str()) && glob.is_none() {
@@ -448,7 +461,7 @@ impl Scheduler {
                     _ => self.any_copy(row).await?,
                 }
             }
-            Source::JobOutputs { job, glob } => {
+            Source::JobOutputs { job, glob, .. } => {
                 let j = self.store.get_job(job)?.with_context(|| format!("job {job} is gone"))?;
                 let (shell, path, backend) = self.outputs_location(&j).await.map_err(|e| anyhow::anyhow!(e.message))?;
                 Origin::Dir { shell, path, glob, backend }
@@ -505,7 +518,7 @@ impl Scheduler {
                 continue;
             }
             let p = shell_quote(&c.path);
-            shell.run(&format!("chmod -R u+w {p} 2>/dev/null || true; rm -rf {p}")).await?;
+            shell.run(&format!("chmod -R u+w {p} 2>/dev/null || true; rm -rf {p} {p}.ready")).await?;
             self.store.delete_copy(&c.name, &c.version, bname)?;
             used = used.saturating_sub(c.size);
             tracing::info!("evicted dataset {}@{} from {bname} ({} MB)", c.name, c.version, c.size >> 20);
@@ -528,7 +541,7 @@ impl Scheduler {
         for c in &copies {
             if c.owned {
                 let p = shell_quote(&c.path);
-                shell.run(&format!("chmod -R u+w {p} 2>/dev/null || true; rm -rf {p}")).await?;
+                shell.run(&format!("chmod -R u+w {p} 2>/dev/null || true; rm -rf {p} {p}.ready")).await?;
             }
             self.store.delete_copy(&c.name, &c.version, backend)?;
         }

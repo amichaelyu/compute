@@ -292,6 +292,13 @@ impl CloudBackend {
         for node in &inst.nodes {
             let shell = self.provider.shell(node)?;
             self.provider.prepare(shell.as_ref(), registry.as_ref()).await?;
+            if node.ssh.is_some() && !self.ccfg.authorized_keys.is_empty() {
+                let keys: String = self.ccfg.authorized_keys.iter().map(|k| format!("{}\n", k.trim())).collect();
+                shell
+                    .run_input("mkdir -p ~/.ssh && chmod 700 ~/.ssh && cat >> ~/.ssh/authorized_keys", Some(keys.into_bytes()))
+                    .await
+                    .context("authorizing extra ssh keys")?;
+            }
         }
         self.instances.lock().await.insert(job.id, inst.clone());
         Ok(inst)
@@ -329,6 +336,11 @@ impl CloudBackend {
                     let _ = tokio::io::copy(&mut r, &mut f).await;
                 }
                 if rank == 0 {
+                    if let Ok(mut r) = shell.pipe_out(&format!("cat {} 2>/dev/null || true", shell_quote(&format!("{jobdir}/metrics.jsonl")))).await
+                        && let Ok(mut f) = tokio::fs::File::create(local.join("metrics.jsonl")).await
+                    {
+                        let _ = tokio::io::copy(&mut r, &mut f).await;
+                    }
                     let glob = job.spec.keep_outputs.clone().filter(|g| g != "**" && g != "*");
                     if let Ok(data) = shell.pipe_out(&tar_dir_script(&format!("{jobdir}/out"), glob.as_deref())).await {
                         let dest = shell_quote(&local.join("out").to_string_lossy());
@@ -457,6 +469,9 @@ impl Backend for Cloud {
         }
         if r.nodes > b.cfg.max_nodes {
             return Quote::no(format!("nodes={}; {} allows at most {}", r.nodes, b.cfg.name, b.cfg.max_nodes), true);
+        }
+        if job.local_build() {
+            return Quote::no("the image is built locally (no registry), so cloud instances can't pull it", true);
         }
         if b.image_for(job).is_none() {
             return Quote::no("cloud jobs run in a container: set container.image or container.build", true);
@@ -694,6 +709,20 @@ impl Backend for Cloud {
             .collect();
         let running = b.instances.lock().await.len();
         Ok(json!({"in_stock": available, "my_instances": running, "boot_estimate_s": b.boot().round()}))
+    }
+
+    async fn metrics(&self, job: &Job, history: u32) -> Result<Value> {
+        let b = &self.0;
+        let local = b.job_dir_local(job.id).join("metrics.jsonl");
+        if b.collected_locally(job.id) {
+            let text = tokio::fs::read_to_string(&local).await.unwrap_or_default();
+            let lines: Vec<&str> = text.lines().collect();
+            let tail = lines[lines.len().saturating_sub(history as usize)..].join("\n");
+            let latest = lines.last().copied().unwrap_or("null");
+            return Ok(super::parse_metrics(&format!("{latest}\n---\n{tail}")));
+        }
+        let inst = b.instance(job, false).await?;
+        b.remote(&inst, 0)?.metrics(job.id, history).await
     }
 
     async fn shell_for(&self, job: Option<&Job>) -> Result<(Arc<dyn Shell>, String)> {
@@ -1071,14 +1100,27 @@ pub struct Lambda {
     key_name: Mutex<Option<String>>,
 }
 
-const LAMBDA: &str = "https://cloud.lambda.ai/api/v1";
+const LAMBDA: &str = "https://cloud.lambda.com/api/v1";
 
 impl Lambda {
     fn new(key_file: &Path, c: &CloudConfig) -> Lambda {
         Lambda { key_file: key_file.to_path_buf(), regions: c.regions.clone(), key_name: Mutex::new(None) }
     }
+    /// Retries rate-limited calls: Lambda allows about one request a second, and one launch
+    /// every 12 seconds.
     async fn call(&self, method: &str, path: &str, body: Option<&Value>) -> Result<Value> {
-        http(method, &format!("{LAMBDA}{path}"), &format!("Authorization: Bearer {}", read_key(&self.key_file)?), body).await
+        let auth = format!("Authorization: Bearer {}", read_key(&self.key_file)?);
+        let mut attempt = 0;
+        loop {
+            match http(method, &format!("{LAMBDA}{path}"), &auth, body).await {
+                Err(e) if attempt < 5 && format!("{e}").contains("HTTP 429") => {
+                    attempt += 1;
+                    let wait = if path.ends_with("/launch") { 13 } else { 2 * attempt };
+                    tokio::time::sleep(Duration::from_secs(wait)).await;
+                }
+                r => return r,
+            }
+        }
     }
     /// The name of a registered ssh key matching the coordinator's, registering it if needed.
     async fn ssh_key_name(&self, pubkey: &str) -> Result<String> {
@@ -1111,7 +1153,8 @@ impl Provider for Lambda {
             let it = &t["instance_type"];
             let specs = &it["specs"];
             let n = specs["gpus"].as_u64().unwrap_or(0) as u32;
-            if n != gpus.max(1) {
+            // GH200 types are arm64, and job images are built for amd64.
+            if n != gpus.max(1) || it["architecture"].as_str().is_some_and(|a| a != "x86_64") {
                 continue;
             }
             let regions: Vec<String> = t["regions_with_capacity_available"].as_array().into_iter().flatten().filter_map(|r| r["name"].as_str().map(str::to_string)).collect();
@@ -1137,7 +1180,7 @@ impl Provider for Lambda {
             .call(
                 "POST",
                 "/instance-operations/launch",
-                Some(&json!({"region_name": region, "instance_type_name": req.offer.id, "ssh_key_names": [key], "name": req.name, "quantity": 1})),
+                Some(&json!({"region_name": region, "instance_type_name": req.offer.id, "ssh_key_names": [key], "name": req.name})),
             )
             .await?;
         let id = r["data"]["instance_ids"][0].as_str().context("Lambda returned no instance id")?.to_string();
@@ -1171,7 +1214,7 @@ impl Provider for Lambda {
                         return Ok(());
                     }
                 }
-                Some("terminated" | "terminating" | "unhealthy") => bail!("instance is {}", d["status"]),
+                Some("terminated" | "terminating" | "preempted" | "unhealthy") => bail!("instance is {}", d["status"]),
                 _ => {}
             }
             tokio::time::sleep(Duration::from_secs(10)).await;
@@ -1180,7 +1223,7 @@ impl Provider for Lambda {
 
     async fn alive(&self, inst: &Instance) -> Result<bool> {
         match self.call("GET", &format!("/instances/{}", inst.provider_id), None).await {
-            Ok(v) => Ok(!matches!(v["data"]["status"].as_str(), Some("terminated" | "terminating"))),
+            Ok(v) => Ok(!matches!(v["data"]["status"].as_str(), Some("terminated" | "terminating" | "preempted"))),
             Err(e) if format!("{e}").contains("HTTP 404") => Ok(false),
             Err(e) => Err(e),
         }
@@ -1196,7 +1239,7 @@ impl Provider for Lambda {
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|i| !matches!(i["status"].as_str(), Some("terminated" | "terminating")))
+            .filter(|i| !matches!(i["status"].as_str(), Some("terminated" | "terminating" | "preempted")))
             .filter_map(|i| Some((i["id"].as_str()?.to_string(), i["name"].as_str()?.to_string(), false)))
             .filter(|(_, n, _)| n.starts_with("compute-"))
             .collect())

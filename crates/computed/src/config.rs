@@ -310,6 +310,10 @@ pub struct CloudConfig {
     /// When the rate table was copied from the provider's pricing page.
     #[serde(default)]
     pub rates_date: Option<String>,
+    /// Extra ssh public keys to authorize on instances (yours, to log in), beside the
+    /// coordinator's own. Ignored by Modal.
+    #[serde(default)]
+    pub authorized_keys: Vec<String>,
     /// Modal environment and app name.
     #[serde(default)]
     pub environment: Option<String>,

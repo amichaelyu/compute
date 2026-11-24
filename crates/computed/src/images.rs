@@ -38,20 +38,16 @@ impl Scheduler {
             Some((dir, _)) => dir.to_string(),
             None => ".".to_string(),
         });
-        let prefix = self.registry.prefix().ok_or_else(|| {
-            ApiError::bad_request(
-                "image builds are not set up on this daemon (no registry prefix)",
-                "use a prebuilt image with {\"image\": \"...\"}, or ask the user to configure [registry]",
-            )
-        })?;
+        let prefix = self.registry.prefix();
         let path = self.snapshots.path(snapshot);
         let (df, ctx) = (dockerfile.clone(), context.clone());
         let hash = tokio::task::spawn_blocking(move || build_hash(&path, &df, &ctx))
             .await
             .map_err(anyhow::Error::from)??;
-        Ok(ContainerSpec {
-            image: format!("{prefix}:{}", &hash[..16]),
-            build: Some(BuildSpec { dockerfile, context }),
+        Ok(match prefix {
+            Some(prefix) => ContainerSpec { image: format!("{prefix}:{}", &hash[..16]), build: Some(BuildSpec { dockerfile, context, local: false }) },
+            // No registry: build where the job runs, under a tag no other build can reuse.
+            None => ContainerSpec { image: format!("compute-local:{}", &hash[..16]), build: Some(BuildSpec { dockerfile, context, local: true }) },
         })
     }
 
@@ -60,6 +56,9 @@ impl Scheduler {
         let Some(ContainerSpec { image, build: Some(build) }) = &job.spec.container else {
             return Ok(ImageStatus::Ready);
         };
+        if build.local {
+            return Ok(ImageStatus::Ready); // built while staging, on the job's host
+        }
         match self.store.image(image)? {
             Some(row) if row.state == "ready" => return Ok(ImageStatus::Ready),
             Some(row) if row.state == "failed" && row.snapshot == job.snapshot => {
@@ -110,6 +109,40 @@ impl Scheduler {
             me.mark_build(&tag, false);
             me.kick();
         });
+    }
+
+    /// Builds a job's local image on its Docker host (once per tag; output goes to the job's
+    /// log). Called while staging, after the snapshot is unpacked.
+    pub async fn local_build(&self, backend: &Arc<dyn Backend>, job: &Job) -> Result<()> {
+        let Some(ContainerSpec { image, build: Some(b) }) = &job.spec.container else { return Ok(()) };
+        if !b.local {
+            return Ok(());
+        }
+        let lock = self.dataset_lock(&format!("build:{}:{image}", backend.name()));
+        let _guard = lock.lock().await;
+        let (shell, root) = backend.shell_for(Some(job)).await?;
+        let snap = shell_quote(&crate::backend::Remote::snapshot_dir(&root, &job.snapshot));
+        let log = shell_quote(&format!("{}/log", crate::backend::Remote::jobdir(&root, job.id)));
+        let t = shell_quote(image);
+        let script = format!(
+            "cd {snap} || exit 1\n\
+             if docker image inspect {t} >/dev/null 2>&1; then echo \"compute: image {image} is already built here\" >> {log}; echo '__compute_exit 0'; exit 0; fi\n\
+             echo \"compute: building {image} from {df} (context {ctx})\" >> {log}\n\
+             docker build --progress plain -f {dfq} -t {t} {ctxq} >> {log} 2>&1\n\
+             echo \"__compute_exit $?\"",
+            df = b.dockerfile,
+            ctx = b.context,
+            dfq = shell_quote(&b.dockerfile),
+            ctxq = shell_quote(&b.context),
+        );
+        let mut out = shell.pipe_out(&script).await?;
+        let mut text = String::new();
+        tokio::io::AsyncReadExt::read_to_string(&mut out, &mut text).await?;
+        match text.lines().rev().find_map(|l| l.strip_prefix("__compute_exit ")).and_then(|c| c.trim().parse::<i32>().ok()) {
+            Some(0) => Ok(()),
+            Some(c) => bail!("build_failed: docker build exited with {c}; the build output is in the job's log"),
+            None => bail!("build_failed: the build stopped early; see the job's log"),
+        }
     }
 
     /// The backend that builds images: `[registry] builder`, else the first reachable local

@@ -46,10 +46,12 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/jobs/{id}", get(get_job))
         .route("/v1/jobs/{id}/wait", get(wait_job))
         .route("/v1/jobs/{id}/logs", get(job_logs))
+        .route("/v1/jobs/{id}/metrics", get(job_metrics))
         .route("/v1/jobs/{id}/outputs", get(job_outputs))
         .route("/v1/jobs/{id}/cancel", post(cancel_job))
         .route("/v1/backends", get(list_backends))
         .route("/v1/backends/{name}", get(get_backend))
+        .route("/v1/backends/{name}/queue", get(backend_queue))
         .route("/v1/backends/{name}/enable", post(enable_backend))
         .route("/v1/backends/{name}/disable", post(disable_backend))
         .route("/v1/secrets", get(list_secrets))
@@ -128,8 +130,24 @@ async fn whoami(sess: Session) -> Json<Value> {
     }))
 }
 
+/// Changes within v1 that a running agent should know about, newest first.
+const CHANGES: &[(&str, &str)] = &[
+    ("2026-11-24", "GET /v1/backends/{name}/queue: your jobs in a Slurm queue, including ones submitted outside compute."),
+    ("2026-11-24", "GET /v1/jobs/{id}/metrics: CPU, memory, GPU, power and disk samples every 10 s."),
+    ("2026-11-24", "inputs[].allow_failed and job_outputs.allow_failed reuse outputs of a job that didn't succeed."),
+    ("2026-11-24", "container.build works without a registry: built with docker on the Docker host that runs the job."),
+    ("2026-11-24", "Datasets in $JOB_DATA_DIR are real directories (hard links or clones), not symlinks."),
+    ("2026-11-24", "$JOB_DATA_DIR holds only the job's declared datasets, one directory each; the backend's shared data directory is no longer exposed."),
+    ("2026-11-24", "New: after_ok/after_any/inputs, datasets, container, max_cost_usd/quote_id/keep_outputs, nodes > 1; /v1/datasets, /v1/images, /v1/budget."),
+];
+
 async fn root() -> Json<Value> {
-    Json(json!({"name": "computed", "build": env!("CARGO_PKG_VERSION"), "api_versions": ["v1"]}))
+    Json(json!({
+        "name": "computed",
+        "build": env!("CARGO_PKG_VERSION"),
+        "api_versions": ["v1"],
+        "changes": CHANGES.iter().map(|(d, c)| json!({"date": d, "change": c})).collect::<Vec<_>>(),
+    }))
 }
 
 async fn challenge(State(s): State<AppState>) -> Json<Value> {
@@ -224,7 +242,13 @@ async fn build_spec(s: &AppState, req: &JobRequest) -> ApiResult<JobSpec> {
             return Err(ApiError::bad_request(format!("input job {} does not exist", inp.from_job), "check the id"));
         }
         let r = DepRef::Job(inp.from_job);
-        if !spec.after_ok.contains(&r) && !spec.after_any.contains(&r) {
+        if inp.allow_failed {
+            // Any end state is fine; only wait for it to finish.
+            spec.after_ok.retain(|x| x != &r);
+            if !spec.after_any.contains(&r) {
+                spec.after_any.push(r);
+            }
+        } else if !spec.after_ok.contains(&r) && !spec.after_any.contains(&r) {
             spec.after_ok.push(r);
         }
     }
@@ -649,6 +673,32 @@ async fn job_logs(State(s): State<AppState>, _sess: Session, Path(id): Path<i64>
 }
 
 #[derive(Deserialize)]
+struct MetricsQuery {
+    history: Option<u32>,
+}
+
+/// Resource usage sampled by the runner every 10 s: CPU (percent of one core, summed), memory
+/// (MB resident), per-GPU utilization, memory and power, and free disk where the job runs.
+async fn job_metrics(State(s): State<AppState>, _sess: Session, Path(id): Path<i64>, Query(q): Query<MetricsQuery>) -> ApiResult<Json<Value>> {
+    let j = load_job(&s, id)?;
+    let requested = json!({"cpus": j.resources.cpus, "mem_mb": j.resources.mem_mb, "gpus": j.resources.gpus});
+    let backend = j.backend.as_deref().and_then(|n| s.sched.backend(n)).filter(|b| b.root().is_some());
+    let empty = json!({"latest": null, "history": [], "requested": requested, "state": j.state});
+    let Some(backend) = backend else { return Ok(Json(empty)) };
+    if matches!(j.state, JobState::Waiting | JobState::Queued | JobState::Staging) {
+        return Ok(Json(empty));
+    }
+    let mut v = match tokio::time::timeout(Duration::from_secs(20), backend.metrics(&j, q.history.unwrap_or(0).min(2000))).await {
+        Ok(Ok(v)) => v,
+        Ok(Err(e)) => return Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "backend_unreachable", format!("{e:#}"), "try again shortly")),
+        Err(_) => return Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "backend_unreachable", "reading metrics timed out", "try again shortly")),
+    };
+    v["requested"] = requested;
+    v["state"] = serde_json::to_value(j.state).unwrap_or_default();
+    Ok(Json(v))
+}
+
+#[derive(Deserialize)]
 struct OutputsQuery {
     glob: Option<String>,
 }
@@ -823,6 +873,21 @@ async fn get_backend(State(s): State<AppState>, _sess: Session, Path(name): Path
             "availability": fmt_opt(&s.tz, rt.availability_at),
         },
     })))
+}
+
+/// The user's jobs in a Slurm backend's queue, with their start estimates; jobs compute
+/// submitted carry `compute_job`.
+async fn backend_queue(State(s): State<AppState>, _sess: Session, Path(name): Path<String>) -> ApiResult<Json<Value>> {
+    let b = s.sched.backend(&name).ok_or_else(|| ApiError::not_found(format!("backend {name} not found")))?;
+    if b.root().is_none() {
+        return Ok(Json(json!({"jobs": [], "note": "not probed yet"})));
+    }
+    match tokio::time::timeout(Duration::from_secs(30), b.queue()).await {
+        Ok(Ok(Some(v))) => Ok(Json(v)),
+        Ok(Ok(None)) => Err(ApiError::bad_request(format!("{name} has no batch queue"), "only Slurm backends have one")),
+        Ok(Err(e)) => Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "backend_unreachable", format!("{e:#}"), "try again shortly")),
+        Err(_) => Err(ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "backend_unreachable", "squeue timed out", "try again shortly")),
+    }
 }
 
 #[derive(Deserialize, Default)]

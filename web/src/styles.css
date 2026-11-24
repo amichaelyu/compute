@@ -168,7 +168,6 @@ button {
 
 .main {
   padding: 1.25rem 1.5rem 3rem;
-  max-width: 96rem;
 }
 
 .has-panel .main {
@@ -800,9 +799,28 @@ input[type="search"] {
   transform: none;
 }
 
-/* Short jobs still get a bar you can see and click. */
-.bar {
+/* Short active jobs still get a bar you can see and click. */
+.bar-running,
+.bar-waiting {
   min-width: 0.85rem;
+}
+
+/* Finished jobs: a thin strip at the top of the lane, drawn at their real length. They may
+   overlap; a run of short jobs reads as one block, and hovering one names it. */
+.bar-past {
+  height: 0.5rem;
+  border-radius: 0.15rem;
+  min-width: 3px;
+  top: 0.3rem;
+  overflow: visible;
+}
+.bar-past.bar-done {
+  background: color-mix(in srgb, var(--done) 55%, var(--paper));
+}
+.bar-past.bar-failed {
+  background: color-mix(in srgb, var(--failed) 70%, var(--paper));
+  box-shadow: none;
+  z-index: 2;
 }
 
 /* The list lays itself out by its own width, so it stays readable beside the job panel. */
@@ -819,4 +837,78 @@ input[type="search"] {
   .row-when {
     grid-column: 2 / -1;
   }
+}
+/* ---------------------------------------------------------------- meters */
+
+.meter-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.6rem;
+  min-width: 0;
+}
+
+.meter {
+  flex: none;
+  display: inline-block;
+  width: 8rem;
+  height: 0.55rem;
+  border-radius: 0.3rem;
+  background: color-mix(in srgb, var(--rule) 70%, transparent);
+  overflow: hidden;
+}
+
+.meter > span {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--running);
+}
+
+.meter-gpu > span {
+  background: var(--waiting);
+}
+
+.meter-time > span {
+  background: var(--graphite);
+}
+
+.meter-high > span {
+  background: var(--failed);
+}
+
+.meter-time.meter-high > span {
+  background: var(--failed);
+}
+
+.meter-text {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.time-meter {
+  margin: 0.25rem 0 0.75rem;
+}
+
+.usage {
+  margin-bottom: 0.75rem;
+}
+
+.usage-wait {
+  margin: 0 0 0.75rem;
+  font-size: 0.875rem;
+}
+
+/* Slurm jobs submitted outside compute: outlined, not filled. */
+.bar-external {
+  color: var(--graphite);
+  border: 1.5px dashed var(--graphite);
+  background: none;
+  line-height: calc(1.4rem - 3px);
+  cursor: default;
+}
+
+.bar-external.bar-ext-running {
+  border-style: solid;
+  background: color-mix(in srgb, var(--graphite) 18%, transparent);
 }

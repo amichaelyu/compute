@@ -142,3 +142,43 @@ export const disableBackend = (name: string) =>
   api<BackendSummary>(`/v1/backends/${encodeURIComponent(name)}/disable`, { method: "POST" });
 
 export const outputsUrl = (id: number) => `/v1/jobs/${id}/outputs`;
+
+export interface GpuSample {
+  index: number;
+  util_pct: number | null;
+  mem_used_mb: number | null;
+  mem_total_mb: number | null;
+  power_w: number | null;
+}
+export interface Sample {
+  t: number;
+  cpu_pct: number;
+  rss_mb: number;
+  gpus: GpuSample[];
+  disk_free_gb: number | null;
+  host: string;
+}
+export interface Metrics {
+  latest: Sample | null;
+  history: Sample[];
+  requested: { cpus: number; mem_mb: number; gpus: number };
+}
+export const getMetrics = (id: number) => api<Metrics>(`/v1/jobs/${id}/metrics`);
+
+/** A job in a Slurm backend's queue; `compute_job` is set when compute submitted it. */
+export interface QueuedJob {
+  slurm_id: string;
+  name: string;
+  state: string;
+  partition: string;
+  start: string | null;
+  end: string | null;
+  time_limit_s: number | null;
+  elapsed_s: number | null;
+  gres: string | null;
+  cpus: number | null;
+  reason: string;
+  compute_job: number | null;
+}
+export const getQueue = (name: string) =>
+  api<{ jobs: QueuedJob[] }>(`/v1/backends/${encodeURIComponent(name)}/queue`).then((r) => r.jobs);

@@ -122,6 +122,9 @@ pub struct InputSpec {
     pub glob: Option<String>,
     #[serde(rename = "as")]
     pub as_: String,
+    /// Also take the outputs if that job failed (it becomes an `after_any` dependency).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub allow_failed: bool,
 }
 
 /// `container` in a request: a registry image, or a Dockerfile in the snapshot to build.
@@ -194,6 +197,9 @@ pub struct DatasetUse {
 pub struct BuildSpec {
     pub dockerfile: String,
     pub context: String,
+    /// No registry: built with `docker build` on the Docker host that runs the job.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub local: bool,
 }
 
 /// The image a job runs in. For builds, `image` is the tag the build pushes.
@@ -543,6 +549,11 @@ impl Job {
 
     pub fn is_container(&self) -> bool {
         self.spec.container.is_some()
+    }
+
+    /// An image built on the Docker host that runs the job (no registry to share it).
+    pub fn local_build(&self) -> bool {
+        self.spec.container.as_ref().and_then(|c| c.build.as_ref()).is_some_and(|b| b.local)
     }
 
     /// The key used to group array tasks that can share one quote and one Slurm array.

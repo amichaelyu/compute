@@ -229,6 +229,13 @@ The instance is deleted when the job ends. Before that, its log and the outputs 
 set `keep_outputs` (for example `"checkpoints/final/**"`) when outputs are large.
 `GET /v1/jobs/<id>` shows `usd_per_hour` and, once it ends, `cost_usd`.
 
+The quote picks the cheapest GPU type with capacity, across every paid backend. To pin a
+provider or a GPU, set `"backends": ["lambda"]` (names from `GET /v1/backends`) or
+`resources.gpu_type`. Each instance is named `compute-<job id>-<hex>` in the provider's
+console. Keys listed in the backend's `authorized_keys` (hosts.toml) can ssh in while the job
+runs (Lambda: `ubuntu@<ip>`, with the IP shown in the Lambda console). The job's files are
+under `~/compute`.
+
 ### 3e. Multi-node jobs
 
 `"resources": {"nodes": 2, "gpus": 8, ...}` asks for 2 nodes with 8 GPUs each (cpus, mem_gb

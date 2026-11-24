@@ -1,12 +1,12 @@
 import { createRoot } from "react-dom/client";
 import "./styles.css";
-import { ApiError, listBackends, listJobs, token, whoami } from "./api";
+import { ApiError, type QueuedJob, getQueue, listBackends, listJobs, token, whoami } from "./api";
 import { Backends } from "./Backends";
 import { JobList } from "./JobList";
 import { JobPanel } from "./JobPanel";
 import { Lanes } from "./Lanes";
 import { SignIn } from "./SignIn";
-import { useNow, usePoll, useRoute, who } from "./util";
+import { useNow, usePoll, useRoute } from "./util";
 
 /** Reloads the page when the daemon serves a newer dashboard build, so an open tab never runs
  * old code against a new API. */
@@ -32,6 +32,16 @@ function App() {
   const me = usePoll(whoami, 300_000, []);
   const jobs = usePoll(() => listJobs({ limit: 300 }), 5000, []);
   const backends = usePoll(listBackends, 30_000, []);
+  const slurm = (backends.data ?? []).filter((b) => b.kind === "slurm" && b.enabled && b.reachable).map((b) => b.name);
+  const queues = usePoll(
+    async () => {
+      const out: Record<string, QueuedJob[]> = {};
+      await Promise.all(slurm.map(async (n) => (out[n] = await getQueue(n).catch(() => []))));
+      return out;
+    },
+    30_000,
+    [slurm.join(",")],
+  );
 
   const unauthorized = [me.error, jobs.error].some((e) => e instanceof ApiError && e.status === 401);
   if (unauthorized) {
@@ -46,7 +56,6 @@ function App() {
     );
   }
 
-  const identity = me.data ? who(me.data.identity) : "";
   const offline = jobs.error && !(jobs.error instanceof ApiError);
 
   return (
@@ -64,7 +73,6 @@ function App() {
           </a>
         </nav>
         <span className="who">
-          {identity}
           {token.get() && (
             <button
               className="link"
@@ -84,7 +92,7 @@ function App() {
           <Backends />
         ) : (
           <>
-            <Lanes jobs={jobs.data ?? []} backends={backends.data ?? []} now={now} />
+            <Lanes jobs={jobs.data ?? []} backends={backends.data ?? []} queues={queues.data ?? {}} now={now} />
             <JobList jobs={jobs.data ?? []} now={now} />
           </>
         )}

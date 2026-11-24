@@ -208,14 +208,30 @@ impl Backend for LocalBackend {
     }
 
     async fn availability(&self) -> Result<serde_json::Value> {
+        let root = shell_quote(&self.remote.root_or_err()?);
         let out = self
             .remote
             .shell()
             .await?
-            .run("uptime | sed 's/.*load average[s]*: //'")
+            .run(&format!(
+                "uptime | sed 's/.*load average[s]*: //'\n\
+                 (nproc 2>/dev/null || sysctl -n hw.ncpu)\n\
+                 df -k {root} | awk 'NR==2 {{print $2, $4}}'"
+            ))
             .await?
             .text();
-        Ok(json!({"load_average": out.trim()}))
+        let mut lines = out.lines();
+        let load = lines.next().unwrap_or("").trim().to_string();
+        let cores: u32 = lines.next().and_then(|l| l.trim().parse().ok()).unwrap_or(0);
+        let disk: Vec<u64> = lines.next().unwrap_or("").split_whitespace().filter_map(|x| x.parse().ok()).collect();
+        let load1: f64 = load.split([',', ' ']).find(|x| !x.is_empty()).and_then(|x| x.parse().ok()).unwrap_or(0.0);
+        Ok(json!({
+            "load_average": load,
+            "load_1m": load1,
+            "cores": cores,
+            "disk_total_gb": disk.first().map(|k| *k as f64 / 1_048_576.0),
+            "disk_free_gb": disk.get(1).map(|k| *k as f64 / 1_048_576.0),
+        }))
     }
 
     async fn unpack_snapshot(&self, snapshot: &str, path: &Path) -> Result<String> {
