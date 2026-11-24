@@ -1,5 +1,12 @@
 import type { BackendSummary, JobRow } from "./api";
-import { clock, ms, when } from "./util";
+import { ms, when } from "./util";
+
+/** "22:00", or "Tue 00:00" where a new day starts. */
+function tickLabel(t: number) {
+  const d = new Date(t);
+  const hh = `${String(d.getHours()).padStart(2, "0")}:00`;
+  return d.getHours() === 0 ? `${d.toLocaleDateString(undefined, { weekday: "short" })} ${hh}` : hh;
+}
 
 // The schedule: one lane per backend, from 2 h ago to 6 h ahead, with a now line.
 const BEFORE = 2 * 3600_000;
@@ -90,8 +97,12 @@ export function Lanes({ jobs, backends, now }: { jobs: JobRow[]; backends: Backe
         {ticks
           .filter((t) => Math.abs(pct(t) - pct(now)) > 4.5)
           .map((t) => (
-            <span key={t} className={`tick${new Date(t).getHours() % 2 ? " tick-odd" : ""}`} style={{ left: `${pct(t)}%` }}>
-              <span className="t-long">{clock(t, now)}</span>
+            <span
+              key={t}
+              className={`tick${new Date(t).getHours() % 2 ? " tick-odd" : ""}${pct(t) > 93 ? " tick-end" : pct(t) < 5 ? " tick-start" : ""}`}
+              style={{ left: `${pct(t)}%` }}
+            >
+              <span className="t-long">{tickLabel(t)}</span>
               <span className="t-short">{String(new Date(t).getHours()).padStart(2, "0")}:00</span>
             </span>
           ))}

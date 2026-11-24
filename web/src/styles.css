@@ -195,6 +195,7 @@ pre,
 .tick {
   position: absolute;
   transform: translateX(-50%);
+  white-space: nowrap;
   font-size: 0.75rem;
   color: var(--graphite);
 }
@@ -787,6 +788,14 @@ input[type="search"] {
   .t-short {
     display: inline;
   }
+}
+
+/* Labels at the edges align inward instead of centring past the edge. */
+.tick-end {
+  transform: translateX(-100%);
+}
+.tick-start {
+  transform: none;
 }
 
 /* Short jobs still get a bar you can see and click. */
