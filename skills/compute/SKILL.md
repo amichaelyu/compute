@@ -9,7 +9,6 @@ The daemon places each job on the backend that can start it soonest:
 
 - **farm**: FarmShare Slurm. The only GPUs (L40S, at most 4 per user) and lots of CPU.
 - **mini**: the Mac Mini, macOS/arm64. CPU only.
-- **macbook**: only when the user has enabled it.
 
 You describe a job as JSON. The daemon uploads code, picks a backend, runs the job and keeps
 its logs and outputs. This skill targets **API v1**: `GET $COMPUTE_URL/v1/` must list `"v1"`
@@ -175,14 +174,7 @@ secret only with a value the user gave you, and only after they asked:
 
 ## 7. The MacBook
 
-The MacBook is off unless the user turns it on. Don't enable it yourself; long jobs don't belong
-on it. If the user asks you to:
-
-```bash
-cx -X POST --json '{"until":"18:00"}' "$COMPUTE_URL/v1/backends/macbook/enable"
-```
-
-`disable` drains it: running jobs finish, and no new ones start.
+The MacBook is not a backend. Long jobs never run there: send them through this API instead.
 
 ## Errors
 

@@ -1,4 +1,4 @@
-//! Local hosts (Mac Mini, MacBook, any Linux box): with transport `rex`, jobs start as Rex blocks
+//! Local hosts (the Mac Mini, any other Mac or Linux box): with transport `rex`, jobs start as Rex blocks
 //! in the host's `compute` session and files go over ssh through a `rex forward` tunnel; with
 //! transport `ssh`, everything goes over direct ssh and jobs start detached with nohup.
 
