@@ -132,6 +132,21 @@ CREATE TABLE IF NOT EXISTS ownership (
   created_at TEXT NOT NULL,
   PRIMARY KEY (kind, id, fingerprint)
 );
+CREATE TABLE IF NOT EXISTS reports (
+  id INTEGER PRIMARY KEY,
+  kind TEXT NOT NULL,
+  title TEXT NOT NULL,
+  body TEXT NOT NULL,
+  job_id INTEGER,
+  reporter TEXT NOT NULL,
+  fingerprint TEXT NOT NULL,
+  state TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  closed_at TEXT,
+  closed_by TEXT,
+  note TEXT
+);
+CREATE INDEX IF NOT EXISTS reports_state ON reports(state);
 CREATE TABLE IF NOT EXISTS cloud_costs (
   job_id INTEGER PRIMARY KEY,
   backend TEXT NOT NULL,
@@ -517,6 +532,58 @@ impl Store {
         tx.execute("UPDATE cancels SET by_name = ?1, by_key = 'dashboard' WHERE by_key LIKE 'cf:%'", params![display])?;
         tx.commit()?;
         Ok(rows.len())
+    }
+
+    pub fn insert_report(&self, r: &NewReport) -> Result<(i64, DateTime<Utc>)> {
+        let c = self.conn();
+        let now = Utc::now();
+        c.execute(
+            "INSERT INTO reports(kind, title, body, job_id, reporter, fingerprint, state, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'open', ?7)",
+            params![r.kind, r.title, r.body, r.job_id, r.reporter, r.fingerprint, ts(now)],
+        )?;
+        Ok((c.last_insert_rowid(), now))
+    }
+
+    /// Reports newest first: `state` "open", "closed" or None for both; `fingerprint` limits
+    /// them to one key's.
+    pub fn reports(&self, state: Option<&str>, fingerprint: Option<&str>, limit: u32) -> Result<Vec<ReportRow>> {
+        let c = self.conn();
+        let mut st = c.prepare(
+            "SELECT id, kind, title, body, job_id, reporter, fingerprint, state, created_at, closed_at, closed_by, note \
+             FROM reports WHERE (?1 IS NULL OR state = ?1) AND (?2 IS NULL OR fingerprint = ?2) ORDER BY id DESC LIMIT ?3",
+        )?;
+        let rows = st.query_map(params![state, fingerprint, limit], report_row)?.collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    }
+
+    pub fn report(&self, id: i64) -> Result<Option<ReportRow>> {
+        let c = self.conn();
+        Ok(c.query_row(
+            "SELECT id, kind, title, body, job_id, reporter, fingerprint, state, created_at, closed_at, closed_by, note \
+             FROM reports WHERE id = ?1",
+            params![id],
+            report_row,
+        )
+        .optional()?)
+    }
+
+    /// Reports one key filed since `since` (the daily cap).
+    pub fn reports_since(&self, fingerprint: &str, since: DateTime<Utc>) -> Result<u32> {
+        let c = self.conn();
+        Ok(c.query_row(
+            "SELECT COUNT(*) FROM reports WHERE fingerprint = ?1 AND created_at >= ?2",
+            params![fingerprint, ts(since)],
+            |r| r.get(0),
+        )?)
+    }
+
+    pub fn close_report(&self, id: i64, by: &str, note: Option<&str>) -> Result<bool> {
+        let n = self.conn().execute(
+            "UPDATE reports SET state = 'closed', closed_at = ?2, closed_by = ?3, note = ?4 WHERE id = ?1 AND state = 'open'",
+            params![id, ts(Utc::now()), by, note],
+        )?;
+        Ok(n > 0)
     }
 
     /// Records who cancelled a job (the first cancel counts).
@@ -929,5 +996,46 @@ fn row_to_image(r: &Row) -> rusqlite::Result<ImageRow> {
         error: r.get(6)?,
         created_at: parse_ts(r.get(7)?).unwrap_or_else(Utc::now),
         finished_at: parse_ts(r.get(8)?),
+    })
+}
+
+pub struct NewReport {
+    pub kind: String,
+    pub title: String,
+    pub body: String,
+    pub job_id: Option<i64>,
+    pub reporter: String,
+    pub fingerprint: String,
+}
+
+pub struct ReportRow {
+    pub id: i64,
+    pub kind: String,
+    pub title: String,
+    pub body: String,
+    pub job_id: Option<i64>,
+    pub reporter: String,
+    pub fingerprint: String,
+    pub state: String,
+    pub created_at: DateTime<Utc>,
+    pub closed_at: Option<DateTime<Utc>>,
+    pub closed_by: Option<String>,
+    pub note: Option<String>,
+}
+
+fn report_row(r: &Row) -> rusqlite::Result<ReportRow> {
+    Ok(ReportRow {
+        id: r.get(0)?,
+        kind: r.get(1)?,
+        title: r.get(2)?,
+        body: r.get(3)?,
+        job_id: r.get(4)?,
+        reporter: r.get(5)?,
+        fingerprint: r.get(6)?,
+        state: r.get(7)?,
+        created_at: parse_ts(r.get(8)?).unwrap_or_else(Utc::now),
+        closed_at: parse_ts(r.get(9)?),
+        closed_by: r.get(10)?,
+        note: r.get(11)?,
     })
 }

@@ -372,6 +372,45 @@ secret only with a value the user gave you, and only after they asked:
 Don't run long jobs on the machine you're working from; submit them here. Only the backends
 listed by `GET /v1/backends` run jobs.
 
+## 8. Report problems with compute itself
+
+When compute (the daemon, its API or this skill) is wrong, file a report so the network's owner
+sees it. Report:
+
+- an `internal` error or another HTTP 5xx from the daemon that repeats after one retry
+  (`backend_unreachable` is a backend being down, not a bug, unless it lasts for hours),
+- a response that contradicts this skill, or a `hint` that doesn't work when followed,
+- a job stuck in a state it can't be in (running long past its time limit, `lost` while the
+  backend shows it running, outputs missing from a job that succeeded),
+- a gap in this skill that made you guess.
+
+Don't report the user's own code failing, queue waits, `over_budget`, or a refusal that the
+hint or the guest rules explain: those work as designed.
+
+One report per problem. Check the open ones first (`cx "$COMPUTE_URL/v1/reports"`) and don't
+file one that's already there. Make the body something the owner can act on without asking:
+what you were doing, the exact request (method, path, body), what came back (status, error
+code and message), what you expected, and when. **Never include a token, a session, a secret's
+value or a private key**; describe them by name.
+
+```bash
+body=$(cat <<'TXT'
+Doing: waiting for job 812 (array task) with GET /v1/jobs/812/wait?until=done
+Got: HTTP 500 {"error":{"code":"internal","message":"..."}} three times, 1 min apart
+Expected: the job's state; GET /v1/jobs/812 works and says running
+When: 2026-11-24 15:40 PT
+TXT
+)
+jq -n --arg t "wait returns 500 for array task 812" --arg b "$body" \
+  '{kind: "bug", title: $t, body: $b, job_id: 812}' | cx --json @- "$COMPUTE_URL/v1/reports"
+# -> {"id": 7, "state": "open", ...}; tell the user the report's id
+cx "$COMPUTE_URL/v1/reports/7"    # its state, and the owner's note once closed
+```
+
+`kind` is `bug` (default), `docs` (this skill is wrong or unclear) or `feature` (something
+compute should do). `job_id` is optional and must be one of your jobs. Each key may file 30
+reports a day.
+
 ## Errors
 
 Every error is `{"error": {"code", "message", "hint"}}`. Follow the `hint`.
@@ -391,3 +430,5 @@ Every error is `{"error": {"code", "message", "hint"}}`. Follow the `hint`.
   request goes past what guests may do (see `GET /v1/whoami` and the guest rules). Don't
   retry; tell the user.
 - `disk_full` (HTTP 507): the coordinator is short of disk; upload less or ask the owner.
+- `internal` (HTTP 500): retry once; if it happens again, file a report (section 8) and tell
+  the user.

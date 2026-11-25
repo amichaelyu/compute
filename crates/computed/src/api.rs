@@ -69,6 +69,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/images/{key}/logs", get(image_logs))
         .route("/v1/budget", get(budget))
         .route("/v1/whoami", get(whoami))
+        .route("/v1/reports", post(file_report).get(list_reports))
+        .route("/v1/reports/{id}", get(get_report))
+        .route("/v1/reports/{id}/close", post(close_report))
         .route("/v1/users", get(list_users).post(add_user).delete(remove_user))
         .route("/v1/install", get(install_script))
         .route("/v1/skill", get(guest_skill));
@@ -221,6 +224,7 @@ async fn whoami(sess: Session) -> Json<Value> {
 
 /// Changes within v1 that a running agent should know about, newest first.
 const CHANGES: &[(&str, &str)] = &[
+    ("2026-11-24", "POST /v1/reports files a bug report about compute itself ({kind: bug|docs|feature, title, body, job_id?}); GET /v1/reports and /v1/reports/{id} read them (guests see their own), POST /v1/reports/{id}/close is the owner's. 30 reports per key per day."),
     ("2026-11-24", "Guest keys (any key not in `owners` in hosts.toml; whoami scope \"guest\"): jobs need container.image and run sandboxed (private code copy, no tailnet/LAN, one node, no paid backends, no builds); logs/metrics/outputs/cancel only on their own jobs; secrets, datasets and snapshots only their own (HEAD /v1/snapshots/{id} is 404 until they upload it). Errors: guest_sandbox, not_yours."),
     ("2026-11-24", "Login nonces are signed, so /v1/auth/challenge no longer returns rate_limited (Cloudflare may still 429). A session stops working as soon as its key leaves allowed_signers. allowed_signers options: namespaces, valid-after and valid-before are honoured; lines with other options (cert-authority) can't log in. Uploads answer 507 disk_full when the coordinator would keep under 10 GB free."),
     ("2026-11-24", "submitted_by is the submitting key's nickname (its allowed_signers principal; submitted_by_key is the fingerprint), and cancelled jobs have cancelled_by {name, key, at}. GET /v1/whoami shows your name."),
@@ -1559,6 +1563,131 @@ async fn image_logs(State(s): State<AppState>, sess: Session, Path(key): Path<St
         "eof": state.as_deref() != Some("building") && end >= data.len(),
         "state": state,
     })))
+}
+
+// ------------------------------------------------------------------ reports
+
+const REPORT_KINDS: &[&str] = &["bug", "docs", "feature"];
+const REPORTS_PER_DAY: u32 = 30;
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReportReq {
+    #[serde(default)]
+    kind: Option<String>,
+    title: String,
+    body: String,
+    #[serde(default)]
+    job_id: Option<i64>,
+}
+
+fn report_json(tz: &Tz, r: &crate::store::ReportRow, sess: &Session) -> Value {
+    let mut v = json!({
+        "id": r.id,
+        "kind": r.kind,
+        "title": r.title,
+        "body": r.body,
+        "job_id": r.job_id,
+        "reported_by": r.reporter,
+        "state": r.state,
+        "created_at": fmt(tz, r.created_at),
+        "closed_at": fmt_opt(tz, r.closed_at),
+        "closed_by": r.closed_by,
+        "note": r.note,
+    });
+    if !sess.guest {
+        v["reported_by_key"] = r.fingerprint.clone().into();
+    }
+    v
+}
+
+/// A report about compute itself (the daemon, the API, the skill), for the network's owner.
+async fn file_report(State(s): State<AppState>, sess: Session, body: Result<Json<ReportReq>, JsonRejection>) -> ApiResult<Response> {
+    let Json(req) = body.map_err(json_err)?;
+    let kind = req.kind.unwrap_or_else(|| "bug".into());
+    if !REPORT_KINDS.contains(&kind.as_str()) {
+        return Err(ApiError::bad_request(format!("unknown kind {kind:?}"), "use bug, docs or feature"));
+    }
+    let title = req.title.trim().to_string();
+    let text = req.body.trim().to_string();
+    if title.is_empty() || title.chars().count() > 200 {
+        return Err(ApiError::bad_request("`title` must be 1-200 characters", "one line saying what's wrong"));
+    }
+    if text.is_empty() || text.chars().count() > 20_000 {
+        return Err(ApiError::bad_request(
+            "`body` must be 1-20000 characters",
+            "what you did (the request, without secrets), what came back, what you expected",
+        ));
+    }
+    if let Some(id) = req.job_id {
+        sess.require_job(&load_job(&s, id)?)?;
+    }
+    let filed = s.sched.store.reports_since(&sess.fingerprint, Utc::now() - chrono::Duration::days(1))?;
+    if filed >= REPORTS_PER_DAY {
+        return Err(ApiError::new(
+            StatusCode::TOO_MANY_REQUESTS,
+            "rate_limited",
+            format!("this key filed {filed} reports in the last day"),
+            "tell the user about the problem instead; the owner reads the open reports",
+        ));
+    }
+    let reporter = sess.public_name();
+    let (id, at) = s.sched.store.insert_report(&crate::store::NewReport {
+        kind: kind.clone(),
+        title: title.clone(),
+        body: text,
+        job_id: req.job_id,
+        reporter: reporter.clone(),
+        fingerprint: sess.fingerprint.clone(),
+    })?;
+    tracing::info!("report {id} ({kind}) from {reporter}: {title}");
+    Ok((StatusCode::CREATED, Json(json!({"id": id, "state": "open", "created_at": fmt(&s.tz, at)}))).into_response())
+}
+
+#[derive(Deserialize)]
+struct ReportsQuery {
+    state: Option<String>,
+    limit: Option<u32>,
+}
+
+/// Owners and the dashboard see every report; a guest sees its own.
+async fn list_reports(State(s): State<AppState>, sess: Session, Query(q): Query<ReportsQuery>) -> ApiResult<Json<Value>> {
+    let state = match q.state.as_deref().unwrap_or("open") {
+        "all" => None,
+        st @ ("open" | "closed") => Some(st),
+        other => return Err(ApiError::bad_request(format!("unknown state {other:?}"), "open, closed or all")),
+    };
+    let mine = sess.guest.then_some(sess.fingerprint.as_str());
+    let rows = s.sched.store.reports(state, mine, q.limit.unwrap_or(50).min(500))?;
+    Ok(Json(json!({"reports": rows.iter().map(|r| report_json(&s.tz, r, &sess)).collect::<Vec<_>>()})))
+}
+
+fn load_report(s: &AppState, sess: &Session, id: i64) -> ApiResult<crate::store::ReportRow> {
+    match s.sched.store.report(id)? {
+        Some(r) if !sess.guest || r.fingerprint == sess.fingerprint => Ok(r),
+        _ => Err(ApiError::not_found(format!("report {id} not found"))),
+    }
+}
+
+async fn get_report(State(s): State<AppState>, sess: Session, Path(id): Path<i64>) -> ApiResult<Json<Value>> {
+    let r = load_report(&s, &sess, id)?;
+    Ok(Json(report_json(&s.tz, &r, &sess)))
+}
+
+#[derive(Deserialize, Default)]
+struct CloseReq {
+    note: Option<String>,
+}
+
+async fn close_report(State(s): State<AppState>, sess: Session, Path(id): Path<i64>, body: Option<Json<CloseReq>>) -> ApiResult<Json<Value>> {
+    sess.require_not_guest("close reports")?;
+    load_report(&s, &sess, id)?;
+    let note = body.and_then(|Json(b)| b.note).map(|n| n.trim().chars().take(2000).collect::<String>()).filter(|n| !n.is_empty());
+    if !s.sched.store.close_report(id, &sess.public_name(), note.as_deref())? {
+        return Err(ApiError::bad_request(format!("report {id} is already closed"), ""));
+    }
+    let r = load_report(&s, &sess, id)?;
+    Ok(Json(report_json(&s.tz, &r, &sess)))
 }
 
 // ------------------------------------------------------------------ budget
