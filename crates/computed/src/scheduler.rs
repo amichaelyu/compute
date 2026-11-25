@@ -29,6 +29,13 @@ const LAUNCHED: &[JobState] = &[JobState::Pending, JobState::Running];
 const NO_STATUS_AFTER: i64 = 10 * 60;
 const STAGE_ATTEMPTS: u32 = 3;
 
+/// Room a queued job holds on a busy local backend from its estimated start.
+pub struct Reserved {
+    job: i64,
+    start: DateTime<Utc>,
+    alloc: Alloc,
+}
+
 #[derive(Clone, Default)]
 pub struct BackendRuntime {
     pub reachable: bool,
@@ -923,6 +930,50 @@ impl Scheduler {
 
     /// Quotes from every backend, with the reason each one can't take the job.
     pub async fn plan(&self, job: &Job) -> Result<Placement> {
+        self.plan_with(job, &HashMap::new()).await
+    }
+
+    /// A local backend's quote for `job` while queued jobs ahead of it hold reservations
+    /// there (backfill): it may start now only if it fits beside every reservation, or if it
+    /// is sure to end (its time limit) before the first reservation starts. Otherwise it
+    /// waits until there is room beside them.
+    async fn quote_around(&self, b: &Arc<dyn Backend>, job: &Job, active: Vec<Alloc>, held: &[Reserved]) -> Quote {
+        if held.is_empty() {
+            return b.quote(job, &active).await;
+        }
+        let now = Utc::now();
+        let starts_now = |q: &Quote| matches!(q, Quote::Ok { start, .. } if *start <= now + chrono::Duration::seconds(5));
+        let mut beside = active.clone();
+        beside.extend(held.iter().map(|r| r.alloc.clone()));
+        let around = b.quote(job, &beside).await;
+        if starts_now(&around) {
+            return around;
+        }
+        let first = held.iter().map(|r| r.start).min().unwrap_or(now);
+        let ends = now + chrono::Duration::seconds(job.resources.time_s as i64);
+        if ends <= first {
+            let alone = b.quote(job, &active).await;
+            if starts_now(&alone) {
+                return alone;
+            }
+        }
+        match around {
+            Quote::Ok { start, source, reason, shape, cost } => {
+                let ids: Vec<String> = held.iter().map(|r| r.job.to_string()).collect();
+                Quote::Ok {
+                    start,
+                    source,
+                    reason: format!("{reason}; room is held for queued job(s) {} ahead of it", ids.join(", ")),
+                    shape,
+                    cost,
+                }
+            }
+            no => no,
+        }
+    }
+
+    /// `plan`, with the reservations queued jobs ahead of `job` hold on local backends.
+    async fn plan_with(&self, job: &Job, reserved: &HashMap<String, Vec<Reserved>>) -> Result<Placement> {
         let mut quotes = Vec::new();
         let limit = self.budget.hourly_usd;
         let in_use = self.hourly_in_use()?;
@@ -938,7 +989,8 @@ impl Scheduler {
                 let err = self.runtime(&name).last_error.unwrap_or_else(|| "not probed yet".into());
                 Quote::no(format!("unreachable: {err}"), false)
             } else {
-                match b.quote(job, &self.allocs(&name)?).await {
+                let held = reserved.get(&name).map(Vec::as_slice).unwrap_or_default();
+                match self.quote_around(b, job, self.allocs(&name)?, held).await {
                     Quote::Ok { start, source, mut reason, shape, cost } => {
                         let rate = shape.usd_per_hour.unwrap_or(0.0);
                         if b.is_paid() && rate > limit {
@@ -1005,6 +1057,9 @@ impl Scheduler {
         queued.sort_by_key(|j| (-j.priority, j.id));
         let in_flight = lock(&self.in_flight).clone();
         let mut batches: HashMap<(String, String), (Shape, Vec<Job>)> = HashMap::new();
+        // Room on busy local hosts held for queued jobs (in priority order) that wait there, so
+        // smaller jobs behind them can't take every gap that opens and starve them.
+        let mut reserved: HashMap<String, Vec<Reserved>> = HashMap::new();
         let now = Utc::now();
         // Batches collected so far are launched even if a later job errors.
         let placed: Result<()> = async {
@@ -1035,7 +1090,7 @@ impl Scheduler {
                     continue;
                 }
             }
-            let plan = self.plan(&job).await?;
+            let plan = self.plan_with(&job, &reserved).await?;
             let Some(best) = plan.best else {
                 let why: Vec<String> = plan
                     .quotes
@@ -1057,6 +1112,17 @@ impl Scheduler {
             let kind = backend.config().kind;
             if kind == BackendKind::Local && start > now + chrono::Duration::seconds(5) {
                 // Best option is a busy local host: keep waiting here, and keep the estimate fresh.
+                reserved.entry(name.clone()).or_default().push(Reserved {
+                    job: job.id,
+                    start,
+                    alloc: Alloc {
+                        ends_at: finish,
+                        cpus: job.resources.cpus,
+                        mem_mb: job.resources.mem_mb,
+                        disk_mb: job.resources.disk_mb,
+                        container: job.is_container(),
+                    },
+                });
                 if job.est_start.map(|t| t.timestamp() / 60) != Some(start.timestamp() / 60) || job.backend.is_some() {
                     self.update_if(
                         job.id,
