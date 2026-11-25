@@ -13,7 +13,7 @@
 //! A sweep every 5 minutes tears down `compute-*` instances that no live job owns, and live
 //! ones past their time limit plus 10 minutes.
 
-use super::{Alloc, Backend, PollResult, Probe, Quote, Remote, Shape, StageFiles, parse_status, tar_dir_script};
+use super::{Alloc, Backend, NoCapacity, PollResult, Probe, Quote, Remote, Shape, StageFiles, parse_status, tar_dir_script};
 use crate::config::{BackendConfig, BackendKind, CloudConfig, Paths};
 use crate::model::{Job, JobState};
 use crate::store::{JobUpdate, Store};
@@ -30,6 +30,11 @@ use std::time::{Duration, Instant};
 use tokio::sync::Mutex;
 
 const OFFERS_TTL: Duration = Duration::from_secs(120);
+/// How long an offer that refused a launch for lack of capacity counts as unavailable, whatever
+/// the provider's listing says (Lambda's capacity list lags behind its launches).
+const FULL_TTL: Duration = Duration::from_secs(600);
+/// Offers tried per staging attempt before the job goes back to the queue.
+const CREATE_TRIES: usize = 4;
 /// Room on a new instance's provider-side timeout for staging (dataset and input copies).
 const STAGING_ALLOWANCE_S: u64 = 1800;
 /// Room after the time limit for the runner to stop and the outputs to be copied off.
@@ -226,6 +231,8 @@ pub struct CloudBackend {
     boot_secs: RwLock<Option<f64>>,
     /// The offer each job was last quoted, so the instance rented is the one priced.
     quoted: Mutex<HashMap<i64, Offer>>,
+    /// `(offer id, region)` of offers that recently refused a launch for lack of capacity.
+    full: Mutex<HashMap<(String, Option<String>), Instant>>,
 }
 
 /// What the outputs directory records about how a job ended (survives a daemon restart
@@ -283,6 +290,7 @@ impl CloudBackend {
             collecting: Mutex::new(HashSet::new()),
             collected: Mutex::new(HashMap::new()),
             boot_secs: RwLock::new(None),
+            full: Mutex::new(HashMap::new()),
         })
     }
 
@@ -295,17 +303,26 @@ impl CloudBackend {
     }
 
     async fn cached_offers(&self, need: &Need) -> Result<Vec<Offer>> {
-        if let Some((at, o)) = self.offers.lock().await.get(need)
-            && at.elapsed() < OFFERS_TTL
-        {
-            return Ok(o.clone());
+        let cached = self.offers.lock().await.get(need).filter(|(at, _)| at.elapsed() < OFFERS_TTL).map(|(_, o)| o.clone());
+        let mut o = match cached {
+            Some(o) => o,
+            None => {
+                let mut o = self.provider.offers(need).await?;
+                if !self.ccfg.gpu_types.is_empty() {
+                    o.retain(|x| self.ccfg.gpu_types.iter().any(|t| contains_ci(&x.gpu_type, t) || contains_ci(&x.id, t)));
+                }
+                o.sort_by(|a, b| a.usd_per_hour.total_cmp(&b.usd_per_hour));
+                self.offers.lock().await.insert(need.clone(), (Instant::now(), o.clone()));
+                o
+            }
+        };
+        let mut full = self.full.lock().await;
+        full.retain(|_, at| at.elapsed() < FULL_TTL);
+        for x in o.iter_mut() {
+            if full.contains_key(&(x.id.clone(), x.region.clone())) {
+                x.available = false;
+            }
         }
-        let mut o = self.provider.offers(need).await?;
-        if !self.ccfg.gpu_types.is_empty() {
-            o.retain(|x| self.ccfg.gpu_types.iter().any(|t| contains_ci(&x.gpu_type, t) || contains_ci(&x.id, t)));
-        }
-        o.sort_by(|a, b| a.usd_per_hour.total_cmp(&b.usd_per_hour));
-        self.offers.lock().await.insert(need.clone(), (Instant::now(), o.clone()));
         Ok(o)
     }
 
@@ -361,8 +378,10 @@ impl CloudBackend {
                 .find(|o| o.available && o.id == q.id && o.region == q.region)
                 .or_else(|| offers.iter().find(|o| o.available && offer_fits(o, job) && o.usd_per_hour <= q.usd_per_hour))
                 .cloned()
-                .with_context(|| format!("the quoted {} (${:.2}/h) has no capacity any more, and nothing as cheap does", q.gpu_type, q.usd_per_hour))?,
-            None => offers.into_iter().find(|o| o.available && offer_fits(o, job)).context("no offer with capacity right now")?,
+                .ok_or_else(|| {
+                    NoCapacity(format!("the quoted {} (${:.2}/h) has no capacity any more, and nothing as cheap does", q.gpu_type, q.usd_per_hour))
+                })?,
+            None => offers.into_iter().find(|o| o.available && offer_fits(o, job)).ok_or_else(|| NoCapacity("no offer with capacity right now".into()))?,
         };
         if let Some(max) = job.spec.max_cost_usd {
             let cost = self.rate(&offer, job) * (r.time_s as f64 + self.boot()) / 3600.0;
@@ -383,25 +402,49 @@ impl CloudBackend {
     async fn create_instance(&self, job: &Job) -> Result<Instance> {
         let image = self.image_for(job).context("no image: set container.image (this backend has no default_image)")?;
         let r = &job.resources;
-        let offer = self.pick_offer(job).await?;
         if self.pubkey.is_empty() {
             bail!("the coordinator has no ssh public key (~/.ssh/id_ed25519.pub) for cloud instances");
         }
-        let name = format!("compute-{}-{}", job.id, hex::encode(rand::random::<[u8; 3]>()));
-        let req = CreateReq {
-            name,
-            job,
-            image,
-            offer,
-            nodes: r.nodes,
-            pubkey: self.pubkey.clone(),
-            extra_keys: self.ccfg.authorized_keys.clone(),
-            timeout_s: r.time_s + COLLECT_ALLOWANCE_S + STAGING_ALLOWANCE_S + self.boot() as u64,
-        };
         // A new attempt: what an earlier attempt of this job left locally is stale now.
         let _ = tokio::fs::remove_dir_all(self.job_dir_local(job.id)).await;
         let started = Instant::now();
-        let mut inst = self.provider.create(&req).await?;
+        // Providers list capacity they no longer have; when a launch is refused for that, mark
+        // the offer full and try the next fitting one (pick_offer keeps to the quoted price).
+        let mut refused = Vec::new();
+        let (req, mut inst) = loop {
+            let offer = match self.pick_offer(job).await {
+                Err(e) if !refused.is_empty() && e.is::<NoCapacity>() => {
+                    return Err(NoCapacity(format!("{e}; launches refused for lack of capacity: {}", refused.join(", "))).into());
+                }
+                o => o?,
+            };
+            let req = CreateReq {
+                name: format!("compute-{}-{}", job.id, hex::encode(rand::random::<[u8; 3]>())),
+                job,
+                image: image.clone(),
+                offer,
+                nodes: r.nodes,
+                pubkey: self.pubkey.clone(),
+                extra_keys: self.ccfg.authorized_keys.clone(),
+                timeout_s: r.time_s + COLLECT_ALLOWANCE_S + STAGING_ALLOWANCE_S + self.boot() as u64,
+            };
+            match self.provider.create(&req).await {
+                Ok(inst) => break (req, inst),
+                Err(e) if is_capacity_error(&e) => {
+                    let o = &req.offer;
+                    tracing::warn!("{}: no capacity for {} in {:?} (job {}): {e:#}", self.cfg.name, o.id, o.region, job.id);
+                    self.full.lock().await.insert((o.id.clone(), o.region.clone()), Instant::now());
+                    refused.push(match &o.region {
+                        Some(reg) => format!("{} in {reg}", o.gpu_type),
+                        None => o.gpu_type.clone(),
+                    });
+                    if refused.len() >= CREATE_TRIES {
+                        return Err(NoCapacity(format!("launches refused for lack of capacity: {}", refused.join(", "))).into());
+                    }
+                }
+                Err(e) => return Err(e),
+            }
+        };
         tracing::info!("{}: created {} ({}) for job {}", self.cfg.name, inst.name, inst.provider_id, job.id);
         // Billing starts now. Record the instance with the job too, so a daemon restart while
         // staging resumes with it instead of leaving it to the sweep.
@@ -598,6 +641,20 @@ impl CloudBackend {
 
 fn contains_ci(hay: &str, needle: &str) -> bool {
     hay.to_ascii_lowercase().contains(&needle.to_ascii_lowercase())
+}
+
+/// Whether a provider refused to create an instance because it has none of that type free.
+fn is_capacity_error(e: &anyhow::Error) -> bool {
+    let msg = format!("{e:#}").to_ascii_lowercase();
+    [
+        "insufficient-capacity",
+        "insufficient capacity",
+        "no longer any instances available",
+        "not have the resources to deploy",
+        "out of capacity",
+    ]
+    .iter()
+    .any(|m| msg.contains(m))
 }
 
 fn offer_fits(o: &Offer, job: &Job) -> bool {

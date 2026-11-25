@@ -1195,6 +1195,7 @@ impl Scheduler {
             let ids: Vec<i64> = jobs.iter().map(|j| j.id).collect();
             let mut last_err = String::new();
             let mut done = false;
+            let mut no_capacity = false;
             // A paid launch is not retried blindly: one attempt, then the job fails with the reason.
             let attempts = if backend.is_paid() { 1 } else { STAGE_ATTEMPTS };
             for attempt in 1..=attempts {
@@ -1206,13 +1207,35 @@ impl Scheduler {
                     Err(e) => {
                         last_err = format!("{e:#}");
                         tracing::warn!("staging {:?} on {} (attempt {attempt}): {last_err}", ids, backend.name());
+                        // Nothing was rented: back to the queue, where placement tries again.
+                        if e.chain().any(|c| c.is::<crate::backend::NoCapacity>()) {
+                            no_capacity = true;
+                            break;
+                        }
                         if attempt < attempts {
                             tokio::time::sleep(Duration::from_secs(5 * u64::from(attempt))).await;
                         }
                     }
                 }
             }
-            if !done {
+            if no_capacity {
+                for id in &ids {
+                    let _ = me.update_if(
+                        *id,
+                        &[JobState::Staging],
+                        JobUpdate {
+                            state: Some(JobState::Queued),
+                            backend: Some(None),
+                            handle: Some(None),
+                            reason: Some(Some(format!("waiting: {}: {}", backend.name(), crate::backend::tail(&last_err, 1500)))),
+                            est_start: Some(None),
+                            est_finish: Some(None),
+                            est_source: Some(None),
+                            ..Default::default()
+                        },
+                    );
+                }
+            } else if !done {
                 for id in &ids {
                     if let Ok(Some(j)) = me.store.get_job(*id) {
                         if backend.is_paid() {

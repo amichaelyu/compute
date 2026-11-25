@@ -667,6 +667,20 @@ pub fn parse_status(id: i64, status: &serde_json::Value, beat: Option<DateTime<U
     }
 }
 
+/// Staging found no capacity before anything was rented. The scheduler puts the job back in
+/// the queue instead of failing it, so placement tries again (another offer, another backend,
+/// or the same one later).
+#[derive(Debug)]
+pub struct NoCapacity(pub String);
+
+impl std::fmt::Display for NoCapacity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for NoCapacity {}
+
 pub fn tail(s: &str, max: usize) -> String {
     let s = s.trim();
     if s.len() <= max {
