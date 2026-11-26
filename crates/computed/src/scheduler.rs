@@ -73,7 +73,10 @@ pub struct Scheduler {
 #[derive(Clone)]
 pub struct Best {
     pub backend: String,
+    /// When the job is expected to start, after copying its datasets there.
     pub start: DateTime<Utc>,
+    /// When the backend has room for it: staging (and the copy) may begin then.
+    pub ready: DateTime<Utc>,
     pub source: String,
     pub reason: String,
     pub shape: Shape,
@@ -975,6 +978,8 @@ impl Scheduler {
     /// `plan`, with the reservations queued jobs ahead of `job` hold on local backends.
     async fn plan_with(&self, job: &Job, reserved: &HashMap<String, Vec<Reserved>>) -> Result<Placement> {
         let mut quotes = Vec::new();
+        // Backends whose start was pushed back for copying datasets: when they have room.
+        let mut ready_at: HashMap<String, DateTime<Utc>> = HashMap::new();
         let limit = self.budget.hourly_usd;
         let in_use = self.hourly_in_use()?;
         for b in &self.backends {
@@ -1001,6 +1006,7 @@ impl Scheduler {
                             let stage = self.staging_seconds(job, &name);
                             let mut start = start;
                             if stage >= 60.0 {
+                                ready_at.insert(name.clone(), start);
                                 start = start.max(Utc::now() + chrono::Duration::seconds(stage as i64));
                                 reason = format!("{reason}; ~{:.0} min to copy datasets", stage / 60.0);
                             }
@@ -1035,6 +1041,7 @@ impl Scheduler {
                 Quote::Ok { start, source, reason, shape, cost } => Some(Best {
                     backend: n.clone(),
                     start: *start,
+                    ready: ready_at.get(n).copied().unwrap_or(*start),
                     source: source.clone(),
                     reason: reason.clone(),
                     shape: shape.clone(),
@@ -1106,11 +1113,13 @@ impl Scheduler {
                 }
                 continue;
             };
-            let Best { backend: name, start, source, reason, shape, cost } = best;
+            let Best { backend: name, start, ready, source, reason, shape, cost } = best;
             let Some(backend) = self.backend(&name) else { continue };
             let finish = start + chrono::Duration::seconds(self.expected_secs(&job));
             let kind = backend.config().kind;
-            if kind == BackendKind::Local && start > now + chrono::Duration::seconds(5) {
+            // `ready`, not `start`: the dataset copy is part of staging, so a job that only waits
+            // for its copy must start staging now, or it waits for the copy forever.
+            if kind == BackendKind::Local && ready > now + chrono::Duration::seconds(5) {
                 // Best option is a busy local host: keep waiting here, and keep the estimate fresh.
                 reserved.entry(name.clone()).or_default().push(Reserved {
                     job: job.id,

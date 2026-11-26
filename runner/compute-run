@@ -103,6 +103,8 @@ if [ -f "$jobdir/datasets" ]; then
     [ -n "$name" ] || continue
     [ -d "$path" ] || fail "dataset $name is missing at $path"
     dest="$JOB_DATA_DIR/$name"
+    # An earlier attempt's view has read-only dirs (the files may be hard links: leave them).
+    if [ -d "$dest" ] && [ ! -L "$dest" ]; then find "$dest" -type d ! -perm -u+w -exec chmod u+w {} + 2>/dev/null || true; fi
     rm -rf "$dest"
     cp -al "$path" "$dest" 2>/dev/null || cp -cR "$path" "$dest" 2>/dev/null || {
       rm -rf "$dest"

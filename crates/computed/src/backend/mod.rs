@@ -213,15 +213,23 @@ pub trait Backend: Send + Sync {
     async fn delete_inputs(&self, job: &Job) -> Result<()> {
         let (shell, root) = self.shell_for(Some(job)).await?;
         let d = shell_quote(&Remote::jobdir(&root, job.id));
-        shell.run(&format!("rm -rf {d}/in {d}/data")).await.map(|_| ())
+        shell.run(&rm_run_dirs(&[format!("{d}/in"), format!("{d}/data")])).await.map(|_| ())
     }
     /// Deletes a finished job's outputs and copied inputs (keeping its log, status and
     /// metrics), to free disk.
     async fn delete_outputs(&self, job: &Job) -> Result<()> {
         let (shell, root) = self.shell_for(Some(job)).await?;
         let d = shell_quote(&Remote::jobdir(&root, job.id));
-        shell.run(&format!("rm -rf {d}/out {d}/in {d}/data")).await.map(|_| ())
+        shell.run(&rm_run_dirs(&[format!("{d}/out"), format!("{d}/in"), format!("{d}/data")])).await.map(|_| ())
     }
+}
+
+/// `rm -rf` of a run's (shell-quoted) dirs. A dataset view holds read-only directories, which
+/// `rm` can't empty, so make the directories writable first. Directories only: the files may
+/// be hard links to the dataset itself, whose mode must not change.
+fn rm_run_dirs(dirs: &[String]) -> String {
+    let dirs = dirs.join(" ");
+    format!("for p in {dirs}; do if [ -d \"$p\" ]; then find \"$p\" -type d ! -perm -u+w -exec chmod u+w {{}} + 2>/dev/null || true; fi; done; rm -rf {dirs}")
 }
 
 /// Lists the files under `dir` (optionally matching `glob`, as in `tar_dir_script`) as
