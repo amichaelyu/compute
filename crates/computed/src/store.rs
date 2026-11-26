@@ -147,6 +147,11 @@ CREATE TABLE IF NOT EXISTS reports (
   note TEXT
 );
 CREATE INDEX IF NOT EXISTS reports_state ON reports(state);
+CREATE TABLE IF NOT EXISTS key_policies (
+  fingerprint TEXT PRIMARY KEY,
+  policy TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS cloud_costs (
   job_id INTEGER PRIMARY KEY,
   backend TEXT NOT NULL,
@@ -273,6 +278,14 @@ impl Store {
             .collect::<rusqlite::Result<_>>()?;
         if !cost_cols.iter().any(|c| c == "prior_usd") {
             conn.execute_batch("ALTER TABLE cloud_costs ADD COLUMN prior_usd REAL NOT NULL DEFAULT 0")?;
+        }
+        // How a closed report was resolved (fixed, wont_fix, duplicate, not_a_bug).
+        let report_cols: Vec<String> = conn
+            .prepare("SELECT name FROM pragma_table_info('reports')")?
+            .query_map([], |r| r.get::<_, String>(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        if !report_cols.iter().any(|c| c == "resolution") {
+            conn.execute_batch("ALTER TABLE reports ADD COLUMN resolution TEXT")?;
         }
         Ok(Store { conn: Mutex::new(conn) })
     }
@@ -497,6 +510,32 @@ impl Store {
         Ok(c.query_row("SELECT name FROM key_names WHERE fingerprint = ?1", params![fingerprint], |r| r.get(0)).optional()?)
     }
 
+    /// A key's access policy (the default when the owner never set one).
+    pub fn key_policy(&self, fingerprint: &str) -> Result<crate::policy::KeyPolicy> {
+        let c = self.conn();
+        let text: Option<String> =
+            c.query_row("SELECT policy FROM key_policies WHERE fingerprint = ?1", params![fingerprint], |r| r.get(0)).optional()?;
+        Ok(match text {
+            Some(t) => serde_json::from_str(&t).with_context(|| format!("reading the access policy of {fingerprint}"))?,
+            None => Default::default(),
+        })
+    }
+
+    /// Stores a key's policy; the default one is stored as no row.
+    pub fn set_key_policy(&self, fingerprint: &str, policy: &crate::policy::KeyPolicy) -> Result<()> {
+        let c = self.conn();
+        if policy.is_default() {
+            c.execute("DELETE FROM key_policies WHERE fingerprint = ?1", params![fingerprint])?;
+        } else {
+            c.execute(
+                "INSERT INTO key_policies(fingerprint, policy, updated_at) VALUES (?1, ?2, ?3) \
+                 ON CONFLICT(fingerprint) DO UPDATE SET policy = excluded.policy, updated_at = excluded.updated_at",
+                params![fingerprint, serde_json::to_string(policy)?, ts(Utc::now())],
+            )?;
+        }
+        Ok(())
+    }
+
     /// Records that `fingerprint` created (or, for content-addressed snapshots, uploaded) the
     /// `kind` object `id`: `snapshot`, `secret` or `dataset`.
     pub fn claim(&self, kind: &str, id: &str, fingerprint: &str) -> Result<()> {
@@ -556,7 +595,7 @@ impl Store {
     pub fn reports(&self, state: Option<&str>, fingerprint: Option<&str>, limit: u32) -> Result<Vec<ReportRow>> {
         let c = self.conn();
         let mut st = c.prepare(
-            "SELECT id, kind, title, body, job_id, reporter, fingerprint, state, created_at, closed_at, closed_by, note \
+            "SELECT id, kind, title, body, job_id, reporter, fingerprint, state, created_at, closed_at, closed_by, note, resolution \
              FROM reports WHERE (?1 IS NULL OR state = ?1) AND (?2 IS NULL OR fingerprint = ?2) ORDER BY id DESC LIMIT ?3",
         )?;
         let rows = st.query_map(params![state, fingerprint, limit], report_row)?.collect::<rusqlite::Result<_>>()?;
@@ -566,7 +605,7 @@ impl Store {
     pub fn report(&self, id: i64) -> Result<Option<ReportRow>> {
         let c = self.conn();
         Ok(c.query_row(
-            "SELECT id, kind, title, body, job_id, reporter, fingerprint, state, created_at, closed_at, closed_by, note \
+            "SELECT id, kind, title, body, job_id, reporter, fingerprint, state, created_at, closed_at, closed_by, note, resolution \
              FROM reports WHERE id = ?1",
             params![id],
             report_row,
@@ -584,10 +623,10 @@ impl Store {
         )?)
     }
 
-    pub fn close_report(&self, id: i64, by: &str, note: Option<&str>) -> Result<bool> {
+    pub fn close_report(&self, id: i64, by: &str, note: Option<&str>, resolution: &str) -> Result<bool> {
         let n = self.conn().execute(
-            "UPDATE reports SET state = 'closed', closed_at = ?2, closed_by = ?3, note = ?4 WHERE id = ?1 AND state = 'open'",
-            params![id, ts(Utc::now()), by, note],
+            "UPDATE reports SET state = 'closed', closed_at = ?2, closed_by = ?3, note = ?4, resolution = ?5 WHERE id = ?1 AND state = 'open'",
+            params![id, ts(Utc::now()), by, note, resolution],
         )?;
         Ok(n > 0)
     }
@@ -929,6 +968,28 @@ impl Store {
             .optional()?)
     }
 
+    /// `costs_since`, limited to the jobs one key submitted.
+    pub fn key_costs_since(&self, fingerprint: &str, since: DateTime<Utc>) -> Result<Vec<CostRow>> {
+        let c = self.conn();
+        let mut stmt = c.prepare(
+            "SELECT k.job_id, k.backend, k.rate_usd_h, k.started_at, k.ended_at, \
+             CASE WHEN k.ended_at IS NULL AND k.prior_usd > 0 THEN k.prior_usd ELSE k.cost_usd END \
+             FROM cloud_costs k JOIN jobs j ON j.id = k.job_id \
+             WHERE j.key_fingerprint = ?1 AND (k.ended_at IS NULL OR k.ended_at >= ?2) ORDER BY k.started_at",
+        )?;
+        let rows = stmt.query_map(params![fingerprint, ts(since)], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                parse_ts(r.get(3)?).unwrap_or_else(Utc::now),
+                parse_ts(r.get(4)?),
+                r.get(5)?,
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
     /// Rows since `since`: `(job_id, backend, rate, started, ended, cost)`. For an open row,
     /// `cost` is what earlier attempts of the job cost (None when there were none).
     pub fn costs_since(&self, since: DateTime<Utc>) -> Result<Vec<CostRow>> {
@@ -1027,6 +1088,7 @@ pub struct ReportRow {
     pub closed_at: Option<DateTime<Utc>>,
     pub closed_by: Option<String>,
     pub note: Option<String>,
+    pub resolution: Option<String>,
 }
 
 fn report_row(r: &Row) -> rusqlite::Result<ReportRow> {
@@ -1043,5 +1105,6 @@ fn report_row(r: &Row) -> rusqlite::Result<ReportRow> {
         closed_at: parse_ts(r.get(9)?),
         closed_by: r.get(10)?,
         note: r.get(11)?,
+        resolution: r.get(12)?,
     })
 }

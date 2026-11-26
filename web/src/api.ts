@@ -130,8 +130,51 @@ export interface User {
   comment: string;
   /** Why this key can't sign in (an unsupported option, or outside its validity window). */
   note?: string;
+  /** Not a guest: a principal in `owners` (or no owners are set). */
+  owner?: boolean;
+  access?: UserAccess;
 }
-export const listUsers = () => api<{ users: User[] }>("/v1/users").then((r) => r.users);
+
+/** Caps on one paid backend; null or missing: no cap of that kind. */
+export interface SpendLimit {
+  usd_per_hour?: number | null;
+  usd_per_month?: number | null;
+}
+
+/** What the owner set for a key. `backends: null` is the default: owners every backend, guests the free ones. */
+export interface KeyPolicy {
+  backends: string[] | null;
+  limits?: Record<string, SpendLimit>;
+}
+
+export interface UserAccess {
+  policy: KeyPolicy;
+  /** The backends the key may use now. */
+  allowed: string[];
+  /** For each paid backend it may use: its caps and this month's spend. */
+  limits: Record<
+    string,
+    {
+      usd_per_hour: number | null;
+      usd_per_month: number | null;
+      in_use_usd_per_hour: number;
+      spent_this_month_usd: number;
+      committed_this_month_usd: number;
+    }
+  >;
+}
+
+export interface BackendRef {
+  name: string;
+  paid: boolean;
+}
+
+export const listUsers = () => api<{ users: User[]; backends: BackendRef[] }>("/v1/users");
+export const setUserAccess = (fingerprint: string, policy: KeyPolicy) =>
+  api<User>(`/v1/users/access?fingerprint=${encodeURIComponent(fingerprint)}`, {
+    method: "PUT",
+    body: JSON.stringify(policy),
+  });
 export const addUser = (name: string, public_key: string) =>
   api<User>("/v1/users", { method: "POST", body: JSON.stringify({ name, public_key }) });
 export const removeUser = (fingerprint: string) =>

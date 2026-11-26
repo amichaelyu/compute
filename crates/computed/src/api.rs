@@ -72,7 +72,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/reports", post(file_report).get(list_reports))
         .route("/v1/reports/{id}", get(get_report))
         .route("/v1/reports/{id}/close", post(close_report))
+        .route("/v1/reports/{id}/wait", get(wait_report))
         .route("/v1/users", get(list_users).post(add_user).delete(remove_user))
+        .route("/v1/users/access", put(set_user_access))
         .route("/v1/install", get(install_script))
         .route("/v1/skill", get(guest_skill));
     Router::new()
@@ -214,16 +216,24 @@ fn same_origin(parts: &Parts) -> ApiResult<()> {
     Err(ApiError::new(StatusCode::FORBIDDEN, "cross_site", "cross-site requests can't change anything", "use the dashboard itself"))
 }
 
-async fn whoami(sess: Session) -> Json<Value> {
-    Json(json!({
+async fn whoami(State(s): State<AppState>, sess: Session) -> ApiResult<Json<Value>> {
+    let mut v = json!({
         "identity": sess.fingerprint,
         "name": sess.name,
         "scope": if !sess.full { "dashboard" } else if sess.guest { "guest" } else { "full" },
-    }))
+    });
+    if sess.full {
+        let a = key_access(&s, &sess.fingerprint, sess.guest)?;
+        v["backends"] = a["allowed"].clone();
+        v["limits"] = a["limits"].clone();
+    }
+    Ok(Json(v))
 }
 
 /// Changes within v1 that a running agent should know about, newest first.
 const CHANGES: &[(&str, &str)] = &[
+    ("2026-11-26", "GET /v1/reports/{id}/wait?timeout=<s> returns once the report is closed, or after the timeout (at most 90 s through Cloudflare) with timed_out: true; repeat it to watch a report you filed. Closed reports carry `resolution` (fixed, wont_fix, duplicate, not_a_bug) and the owner's `note`. POST /v1/reports/{id}/close takes {note?, resolution?} (default fixed)."),
+    ("2026-11-26", "Per-key access: the owner sets which backends each key may use and, per paid backend, caps in $/h and $/month. GET /v1/whoami lists `backends` (what your key may use) and `limits` (per paid backend: usd_per_hour, usd_per_month, in_use_usd_per_hour, spent_this_month_usd, committed_this_month_usd). Naming a backend you may not use answers 403 backend_not_allowed; a job over a cap waits (reason says which). Guest keys may use paid backends when the owner allows it (max_cost_usd is no longer refused)."),
     ("2026-11-25", "GET /v1/ lists `changes` only when signed in; without a session it has name, build and api_versions."),
     ("2026-11-25", "GET /v1/jobs rows of cloud jobs carry usd_per_hour and cost_usd (so far, while the instance runs)."),
     ("2026-11-25", "GET /v1/jobs takes `before=<id>` to page back past the newest `limit` (at most 1000) jobs: pass the smallest id of the previous page."),
@@ -407,6 +417,7 @@ async fn submit(State(s): State<AppState>, sess: Session, body: Result<Json<Valu
     if sess.guest {
         guest_request(&s, &sess, &req)?;
     }
+    backend_allowed(&s, &sess, &req)?;
     if !s.sched.snapshots.exists(&req.snapshot) || !sess.may_use(&s, "snapshot", &req.snapshot)? {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -616,8 +627,8 @@ async fn submit(State(s): State<AppState>, sess: Session, body: Result<Json<Valu
     Ok((StatusCode::CREATED, Json(body)).into_response())
 }
 
-/// What a guest's job may ask for: a public image (no builds), no paid backends, and only its
-/// own secrets and jobs' outputs. Snapshots and datasets are checked where they're resolved.
+/// What a guest's job may ask for: a public image (no builds), one node, and only its own
+/// secrets and jobs' outputs. Which backends it may use is the key's policy (`backend_allowed`). Snapshots and datasets are checked where they're resolved.
 fn guest_request(s: &AppState, sess: &Session, req: &JobRequest) -> ApiResult<()> {
     let forbid = |m: String, hint: &str| ApiError::new(StatusCode::FORBIDDEN, "guest_sandbox", m, hint);
     match &req.container {
@@ -632,9 +643,6 @@ fn guest_request(s: &AppState, sess: &Session, req: &JobRequest) -> ApiResult<()
         }
         _ => {}
     }
-    if req.max_cost_usd.is_some() {
-        return Err(forbid("guest keys can't use paid cloud backends".into(), "drop max_cost_usd, or ask the network's owner"));
-    }
     if req.resources.nodes > 1 {
         return Err(forbid("guest jobs run on one node".into(), "set resources.nodes to 1"));
     }
@@ -648,6 +656,26 @@ fn guest_request(s: &AppState, sess: &Session, req: &JobRequest) -> ApiResult<()
             && !sess.owns_job(&j)
         {
             return Err(forbid(format!("job {} isn't yours", j.id), "guest keys reuse only their own jobs' outputs"));
+        }
+    }
+    Ok(())
+}
+
+/// Refuses a request naming a backend the key's policy doesn't allow (placement skips those
+/// anyway; this says so up front).
+fn backend_allowed(s: &AppState, sess: &Session, req: &JobRequest) -> ApiResult<()> {
+    let policy = s.sched.store.key_policy(&sess.fingerprint)?;
+    let allowed: Vec<&str> =
+        s.sched.backends.iter().filter(|b| policy.allows(b.name(), b.is_paid(), sess.guest)).map(|b| b.name()).collect();
+    if let Some(list) = &req.backends {
+        let denied: Vec<&str> = list.iter().map(String::as_str).filter(|n| !allowed.contains(n)).collect();
+        if !denied.is_empty() {
+            return Err(ApiError::new(
+                StatusCode::FORBIDDEN,
+                "backend_not_allowed",
+                format!("your key may not use {}", denied.join(", ")),
+                format!("backends your key may use: {} (GET /v1/whoami); ask the network's owner for more", allowed.join(", ")),
+            ));
         }
     }
     Ok(())
@@ -1318,10 +1346,102 @@ impl Session {
     }
 }
 
+/// Whether a key named `name` (its allowed_signers principal) is a guest.
+fn is_guest(s: &AppState, name: &str) -> bool {
+    !s.owners.is_empty() && !s.owners.iter().any(|o| o == name)
+}
+
+/// A key's access: its stored policy, the backends it may use, and for each paid backend it may
+/// use, its caps and what it has spent there this month.
+fn key_access(s: &AppState, fingerprint: &str, guest: bool) -> ApiResult<Value> {
+    let policy = s.sched.store.key_policy(fingerprint)?;
+    let mut allowed = Vec::new();
+    let mut limits = serde_json::Map::new();
+    for b in &s.sched.backends {
+        if !policy.allows(b.name(), b.is_paid(), guest) {
+            continue;
+        }
+        allowed.push(b.name().to_string());
+        if b.is_paid() {
+            let l = policy.limits.get(b.name()).cloned().unwrap_or_default();
+            let u = s.sched.key_usage(fingerprint, b.name(), 0)?;
+            limits.insert(
+                b.name().to_string(),
+                json!({
+                    "usd_per_hour": l.usd_per_hour,
+                    "usd_per_month": l.usd_per_month,
+                    "in_use_usd_per_hour": round2(u.usd_per_hour),
+                    "spent_this_month_usd": round2(u.spent),
+                    "committed_this_month_usd": round2(u.committed),
+                }),
+            );
+        }
+    }
+    Ok(json!({"policy": policy, "allowed": allowed, "limits": limits}))
+}
+
 async fn list_users(State(s): State<AppState>, sess: Session) -> ApiResult<Json<Value>> {
     sess.require_owner()?;
     let users = crate::users::list(s.auth.allowed_signers())?;
-    Ok(Json(json!({"users": users})))
+    let mut out = Vec::with_capacity(users.len());
+    for u in users {
+        let guest = is_guest(&s, &u.name);
+        let access = key_access(&s, &u.fingerprint, guest)?;
+        let mut v = json!(u);
+        v["owner"] = (!guest).into();
+        v["access"] = access;
+        out.push(v);
+    }
+    let backends: Vec<Value> = s.sched.backends.iter().map(|b| json!({"name": b.name(), "paid": b.is_paid()})).collect();
+    Ok(Json(json!({"users": out, "backends": backends})))
+}
+
+/// Sets which backends a key may use and its spend caps on paid ones. `backends: null` goes
+/// back to the default (owners every backend, guests the free ones).
+async fn set_user_access(
+    State(s): State<AppState>,
+    sess: Session,
+    Query(q): Query<FingerprintQuery>,
+    body: Result<Json<crate::policy::KeyPolicy>, JsonRejection>,
+) -> ApiResult<Json<Value>> {
+    sess.require_owner()?;
+    let Json(mut policy) = body.map_err(json_err)?;
+    let users = crate::users::list(s.auth.allowed_signers())?;
+    let Some(user) = users.iter().find(|u| u.fingerprint == q.fingerprint) else {
+        return Err(ApiError::not_found(format!("no user with key {}", q.fingerprint)));
+    };
+    let known = |n: &str| s.sched.backend(n);
+    if let Some(list) = &mut policy.backends {
+        if let Some(bad) = list.iter().find(|n| known(n).is_none()) {
+            return Err(ApiError::bad_request(format!("unknown backend {bad:?}"), "use names from GET /v1/backends"));
+        }
+        list.sort();
+        list.dedup();
+    }
+    for (name, l) in &policy.limits {
+        match known(name) {
+            None => return Err(ApiError::bad_request(format!("unknown backend {name:?}"), "use names from GET /v1/backends")),
+            Some(b) if !b.is_paid() => {
+                return Err(ApiError::bad_request(format!("{name} is free"), "spend limits apply to paid backends only"));
+            }
+            _ => {}
+        }
+        for v in [l.usd_per_hour, l.usd_per_month].into_iter().flatten() {
+            if !v.is_finite() || v < 0.0 {
+                return Err(ApiError::bad_request(format!("limit {v} on {name} must be a number of dollars, 0 or more"), "leave it out for no limit"));
+            }
+        }
+    }
+    policy.limits.retain(|_, l| !l.is_empty());
+    s.sched.store.set_key_policy(&user.fingerprint, &policy)?;
+    tracing::info!("access of {} ({}) set to {}", user.name, user.fingerprint, serde_json::to_string(&policy).unwrap_or_default());
+    // Queued jobs may fit now (or not any more).
+    s.sched.kick();
+    let guest = is_guest(&s, &user.name);
+    let mut v = json!(user);
+    v["owner"] = (!guest).into();
+    v["access"] = key_access(&s, &user.fingerprint, guest)?;
+    Ok(Json(v))
 }
 
 #[derive(Deserialize)]
@@ -1348,6 +1468,7 @@ async fn remove_user(State(s): State<AppState>, sess: Session, Query(q): Query<F
     sess.require_owner()?;
     let removed = crate::users::remove(s.auth.allowed_signers(), &q.fingerprint)?;
     let ended = s.sched.store.delete_sessions(&q.fingerprint)?;
+    s.sched.store.set_key_policy(&q.fingerprint, &Default::default())?;
     Ok(Json(json!({"removed": removed, "sessions_ended": ended})))
 }
 
@@ -1624,6 +1745,7 @@ fn report_json(tz: &Tz, r: &crate::store::ReportRow, sess: &Session) -> Value {
         "closed_at": fmt_opt(tz, r.closed_at),
         "closed_by": r.closed_by,
         "note": r.note,
+        "resolution": r.resolution,
     });
     if !sess.guest {
         v["reported_by_key"] = r.fingerprint.clone().into();
@@ -1705,19 +1827,57 @@ async fn get_report(State(s): State<AppState>, sess: Session, Path(id): Path<i64
 }
 
 #[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct CloseReq {
     note: Option<String>,
+    /// fixed (default), wont_fix, duplicate or not_a_bug.
+    resolution: Option<String>,
 }
+
+const RESOLUTIONS: &[&str] = &["fixed", "wont_fix", "duplicate", "not_a_bug"];
 
 async fn close_report(State(s): State<AppState>, sess: Session, Path(id): Path<i64>, body: Option<Json<CloseReq>>) -> ApiResult<Json<Value>> {
     sess.require_not_guest("close reports")?;
     load_report(&s, &sess, id)?;
-    let note = body.and_then(|Json(b)| b.note).map(|n| n.trim().chars().take(2000).collect::<String>()).filter(|n| !n.is_empty());
-    if !s.sched.store.close_report(id, &sess.public_name(), note.as_deref())? {
+    let req = body.map(|Json(b)| b).unwrap_or_default();
+    let resolution = req.resolution.unwrap_or_else(|| "fixed".into());
+    if !RESOLUTIONS.contains(&resolution.as_str()) {
+        return Err(ApiError::bad_request(format!("unknown resolution {resolution:?}"), RESOLUTIONS.join(", ")));
+    }
+    let note = req.note.map(|n| n.trim().chars().take(2000).collect::<String>()).filter(|n| !n.is_empty());
+    if !s.sched.store.close_report(id, &sess.public_name(), note.as_deref(), &resolution)? {
         return Err(ApiError::bad_request(format!("report {id} is already closed"), ""));
     }
     let r = load_report(&s, &sess, id)?;
     Ok(Json(report_json(&s.tz, &r, &sess)))
+}
+
+#[derive(Deserialize)]
+struct ReportWaitQuery {
+    timeout: Option<u64>,
+}
+
+/// Returns once the report is closed (with the owner's note and resolution), or after
+/// `timeout` seconds with `timed_out: true`; the reporter's agent repeats it to watch.
+async fn wait_report(
+    State(s): State<AppState>,
+    sess: Session,
+    Path(id): Path<i64>,
+    Query(q): Query<ReportWaitQuery>,
+    headers: HeaderMap,
+) -> ApiResult<Json<Value>> {
+    let max = if headers.contains_key("cf-ray") { PROXIED_WAIT_SECS } else { 900 };
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(q.timeout.unwrap_or(600).min(max));
+    loop {
+        let r = load_report(&s, &sess, id)?;
+        let closed = r.state == "closed";
+        if closed || tokio::time::Instant::now() >= deadline {
+            let mut v = report_json(&s.tz, &r, &sess);
+            v["timed_out"] = (!closed).into();
+            return Ok(Json(v));
+        }
+        tokio::time::sleep_until(deadline.min(tokio::time::Instant::now() + Duration::from_secs(2))).await;
+    }
 }
 
 // ------------------------------------------------------------------ budget

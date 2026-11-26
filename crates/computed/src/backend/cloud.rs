@@ -789,6 +789,12 @@ impl Backend for Cloud {
     async fn stage(&self, job: &Job, snapshot: &Path, files: &StageFiles) -> Result<()> {
         let b = &self.0;
         let inst = b.instance(job, true).await?;
+        // A guest's job gets an instance of its own, which reaches neither this host nor the
+        // tailnet: that is its sandbox. Runtimes that run the image natively (RunPod, Modal)
+        // couldn't nest the runner's container sandbox anyway.
+        let mut job = job.clone();
+        job.spec.sandbox = false;
+        let job = &job;
         let n = inst.nodes.len().max(1) as u32;
         let master = inst.nodes.first().and_then(|x| x.private_ip.clone()).unwrap_or_else(|| "127.0.0.1".into());
         let data_paths: Vec<String> = files.datasets.iter().map(|(_, p)| p.clone()).collect();

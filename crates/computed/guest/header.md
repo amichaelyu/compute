@@ -43,7 +43,11 @@ Unless {{OWNER}} made your key an owner, it is a guest key (`GET /v1/whoami` say
   outputs at `/out`, inputs at `/in` and datasets at `/data/<name>`, nothing else from the host.
   The network outside is reachable (pip, Hugging Face), the tailnet and private networks are
   not. Env and secrets are visible only inside the container.
-- **One node, no paid clouds.** `max_cost_usd` and `resources.nodes > 1` are refused.
+- **One node.** `resources.nodes > 1` is refused.
+- **Only the backends {{OWNER}} allows.** By default that's the free ones; {{OWNER}} may allow
+  paid clouds too, with caps per hour and per month. `GET /v1/whoami` lists your `backends`
+  and, per paid backend, your `limits` and what you've spent. On a paid cloud your job gets an
+  instance of its own instead of the container sandbox.
 - **Your own things only.** Logs, metrics, outputs, cancel and delete-outputs work on your own
   jobs; other jobs show their state but not their command or env. Secrets, datasets and
   snapshots are visible and usable only by whoever created them (a snapshot counts as yours
@@ -52,5 +56,5 @@ Unless {{OWNER}} made your key an owner, it is a guest key (`GET /v1/whoami` say
 - **Shared settings are the owner's.** Turning backends on or off, image builds and Slurm queue
   views are refused (403).
 
-Errors for these say `guest_sandbox`, `not_yours` or `forbidden`. Still be modest with shared
+Errors for these say `guest_sandbox`, `not_yours`, `backend_not_allowed` or `forbidden`. Still be modest with shared
 GPUs: ask for the GPUs, memory and time the job needs, and cancel jobs you no longer need.

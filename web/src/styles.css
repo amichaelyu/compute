@@ -864,7 +864,13 @@ header > .skel,
 .users {
   display: grid;
   gap: 2.5rem;
-  max-width: 48rem;
+}
+
+/* The list uses the page's width; prose and the form stay at a readable one. */
+.users > section > p,
+.users .install,
+.users .add-user {
+  max-width: 52rem;
 }
 
 .users h2 {
@@ -930,11 +936,76 @@ header > .skel,
 }
 
 .user-key {
-  flex: 1;
+  flex: 0 1 26rem;
   min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+}
+
+.user-access {
+  flex: 1 1 22rem;
+  min-width: 0;
+}
+
+.access {
+  flex-basis: 100%;
+  display: grid;
+  gap: 0.9rem;
+  margin: 0.4rem 0 0.2rem;
+  padding: 0.8rem 0.9rem;
+  background: var(--raised);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+}
+
+.access fieldset {
+  display: grid;
+  gap: 0.4rem;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  min-width: 0;
+}
+
+.access legend {
+  padding: 0;
+  margin-bottom: 0.3rem;
+  font-size: 0.875rem;
+  color: var(--graphite);
+}
+
+.access label {
+  display: inline-flex;
+  gap: 0.4rem;
+  align-items: center;
+}
+
+.access-backends {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1.25rem;
+  padding-left: 1.5rem;
+}
+
+.access-caps {
+  display: grid;
+  gap: 0.5rem;
+}
+
+.access-cap {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.4rem 1rem;
+  align-items: center;
+}
+
+.access-cap-name {
+  min-width: 6rem;
+}
+
+.access-cap input {
+  width: 6.5rem;
 }
 
 /* ---------------------------------------------------------------- sign in */

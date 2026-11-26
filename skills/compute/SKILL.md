@@ -1,6 +1,6 @@
 ---
 name: compute
-description: Run compute jobs (training, eval, sweeps, data processing, anything longer than a few minutes, and all GPU work) through the compute scheduler's HTTP API, which places them on the user's machines and clusters. Use instead of running long jobs on the local machine and instead of hand-written sbatch scripts.
+description: Run compute jobs (training, eval, sweeps, data processing, GPU work) through the compute scheduler's HTTP API, which places them on the user's machines and clusters. Use when the user asks to run something through compute (or the scheduler); otherwise builds and jobs run locally as usual. When they do ask, use it instead of hand-written sbatch scripts.
 ---
 
 # compute: the job scheduler API (v1)
@@ -259,6 +259,13 @@ count against an hourly limit: the running cloud instances together may cost at 
 `hourly_usd` per hour (`GET /v1/budget` shows the limit and what's in use). A paid job whose
 rate doesn't fit yet waits in the queue until instances finish.
 
+The owner may also limit your key: which backends it may use, and per paid backend a cap in
+$/h and per month. `GET /v1/whoami` lists `backends` (the ones your key may use) and `limits`
+(per paid backend: `usd_per_hour`, `usd_per_month`, `in_use_usd_per_hour`,
+`spent_this_month_usd`, `committed_this_month_usd`; null means no cap). A job that would pass a
+cap waits, and its reason names the cap. The monthly cap counts running and placed jobs at their
+full time limit, so a long `time` uses up more of it.
+
 1. Send the request with `"max_cost_usd": 5, "dry_run": true`. The response has `quote_id`,
    `backend`, `estimated_cost_usd` (null when a free backend wins), `cheapest_paid_option` and
    the budget.
@@ -368,10 +375,11 @@ On `secret_missing`, ask the user for the value; don't go looking for one. Creat
 secret only with a value the user gave you, and only after they asked:
 `cx -X PUT --json '{"env":{"WANDB_API_KEY":"..."}}' "$COMPUTE_URL/v1/secrets/wandb"`.
 
-## 7. Long work never runs locally
+## 7. When to use compute
 
-Don't run long jobs on the machine you're working from; submit them here. Only the backends
-listed by `GET /v1/backends` run jobs.
+Submit work here when the user asks you to use compute. Otherwise run builds and jobs where
+you're working, as usual. When the work can't run there at all (it needs a GPU, say), ask the
+user before submitting it. Only the backends listed by `GET /v1/backends` run jobs.
 
 ## 8. Report problems with compute itself
 
@@ -412,6 +420,25 @@ cx "$COMPUTE_URL/v1/reports/7"    # its state, and the owner's note once closed
 compute should do). `job_id` is optional and must be one of your jobs. Each key may file 30
 reports a day.
 
+### Watching your report
+
+The owner closes a report when it's dealt with, with a `resolution` (`fixed`, `wont_fix`,
+`duplicate`, `not_a_bug`) and a `note` saying what changed or why. After filing, watch it in
+the background (it may take hours) and keep working on whatever doesn't depend on it:
+
+```bash
+until r=$(cx "$COMPUTE_URL/v1/reports/7/wait?timeout=600") && [ "$(jq -r .state <<<"$r")" = closed ]; do
+  sleep 5   # a timed-out wait (at most 90 s through Cloudflare) or a network blip: wait again
+done
+jq '{resolution, note, closed_at}' <<<"$r"
+```
+
+When it closes, tell the user the resolution and note. If it's `fixed`, retry what failed (a
+skill fix may come with a new skill: `GET $COMPUTE_URL/v1/skill`, and `changes` in
+`GET $COMPUTE_URL/v1/`). If it's `wont_fix` or `not_a_bug`, the note says what to do instead. To
+pick up a report you filed in an earlier session, list them with
+`cx "$COMPUTE_URL/v1/reports?state=all"` and wait on the open ones that are yours.
+
 ## Errors
 
 Every error is `{"error": {"code", "message", "hint"}}`. Follow the `hint`.
@@ -427,6 +454,8 @@ Every error is `{"error": {"code", "message", "hint"}}`. Follow the `hint`.
   the hint says.
 - `unauthorized`: run `compute_login`.
 - A Cloudflare 429 page on login: too many logins from here. Wait a minute and retry.
+- `backend_not_allowed` (HTTP 403): the request names a backend your key may not use; the
+  hint lists the ones it may. Drop it from `backends`, or tell the user to ask the owner.
 - `guest_sandbox`, `not_yours`, `forbidden` (HTTP 403): the key is a guest key and the
   request goes past what guests may do (see `GET /v1/whoami` and the guest rules). Don't
   retry; tell the user.

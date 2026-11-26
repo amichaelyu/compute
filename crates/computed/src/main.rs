@@ -9,6 +9,7 @@ mod datasets;
 mod error;
 mod images;
 mod model;
+mod policy;
 mod scheduler;
 mod secrets;
 mod snapshots;

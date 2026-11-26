@@ -6,6 +6,7 @@ use crate::backend::{Alloc, Backend, Quote, Shape, StageFiles};
 use crate::config::{BackendKind, BudgetConfig, Paths, RegistryConfig};
 use crate::images::ImageStatus;
 use crate::model::{DepRef, Job, JobState};
+use crate::policy::KeyPolicy;
 use crate::secrets::Secrets;
 use crate::snapshots::Snapshots;
 use crate::store::{JobUpdate, Store};
@@ -65,8 +66,29 @@ pub struct Scheduler {
     dataset_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     builds: Mutex<HashSet<String>>,
     logged_in: Mutex<HashSet<String>>,
-    /// Hourly rates of paid jobs placed but not launched yet (launch records the real cost row).
-    reserved: Mutex<HashMap<i64, f64>>,
+    /// Paid jobs placed but not launched yet (launch records the real cost row).
+    reserved: Mutex<HashMap<i64, PaidHold>>,
+}
+
+/// A paid job placed but not launched yet: what it holds of the budgets until its cost row opens.
+#[derive(Clone)]
+struct PaidHold {
+    rate: f64,
+    backend: String,
+    key: String,
+    /// Its estimated cost, for monthly caps.
+    cost: f64,
+}
+
+/// One key's spend on one backend, for its caps.
+#[derive(Default, Debug, Clone, Copy)]
+pub struct KeyUsage {
+    /// USD per hour of its instances running or about to start.
+    pub usd_per_hour: f64,
+    /// Spent so far this month.
+    pub spent: f64,
+    /// Spent, plus what running and placed jobs will cost by their time limit.
+    pub committed: f64,
 }
 
 /// The chosen backend for a job.
@@ -882,7 +904,75 @@ impl Scheduler {
         let mut reserved = lock(&self.reserved);
         reserved.retain(|id, _| staging.contains(id) && !open.contains_key(id));
         // + 0.0: an empty float sum is -0.0.
-        Ok(open.values().sum::<f64>() + reserved.values().sum::<f64>() + 0.0)
+        Ok(open.values().sum::<f64>() + reserved.values().map(|h| h.rate).sum::<f64>() + 0.0)
+    }
+
+    /// One key's spend on `backend` this month, leaving out job `except` (the one being placed,
+    /// which may have an earlier attempt's open row).
+    pub fn key_usage(&self, key: &str, backend: &str, except: i64) -> Result<KeyUsage> {
+        // Drops holds of jobs that have left staging.
+        self.hourly_in_use()?;
+        let now = Utc::now();
+        let since = self.month_start();
+        let hours = |a: DateTime<Utc>, b: DateTime<Utc>| (b - a).num_seconds().max(0) as f64 / 3600.0;
+        let mut u = KeyUsage::default();
+        let mut open = HashSet::new();
+        for (id, b, rate, started, ended, cost) in self.store.key_costs_since(key, since)? {
+            if b != backend || id == except {
+                continue;
+            }
+            match ended {
+                Some(end) => {
+                    let c = cost.unwrap_or_else(|| rate * hours(started.max(since), end));
+                    u.spent += c;
+                    u.committed += c;
+                }
+                None => {
+                    open.insert(id);
+                    let prior = cost.unwrap_or(0.0);
+                    let so_far = prior + rate * hours(started.max(since), now);
+                    let time_s = self.store.get_job(id)?.map(|j| j.resources.time_s).unwrap_or(0);
+                    u.usd_per_hour += rate;
+                    u.spent += so_far;
+                    u.committed += so_far.max(prior + rate * time_s as f64 / 3600.0);
+                }
+            }
+        }
+        for (id, h) in lock(&self.reserved).iter() {
+            if h.key == key && h.backend == backend && *id != except && !open.contains(id) {
+                u.usd_per_hour += h.rate;
+                u.committed += h.cost;
+            }
+        }
+        Ok(u)
+    }
+
+    /// Why the job's key can't spend `rate` (or `cost` in all) on `backend` now, under the caps
+    /// the owner set for it; None when it may.
+    fn key_limit_refusal(&self, job: &Job, policy: &KeyPolicy, backend: &str, rate: f64, cost: Option<f64>) -> Result<Option<String>> {
+        let Some(l) = policy.limits.get(backend).filter(|l| !l.is_empty()) else { return Ok(None) };
+        let u = self.key_usage(&job.key_fingerprint, backend, job.id)?;
+        if let Some(max) = l.usd_per_hour {
+            if rate > max {
+                return Ok(Some(format!("${rate:.2}/h is over your key's limit of ${max:.2}/h on {backend}")));
+            }
+            if u.usd_per_hour + rate > max {
+                return Ok(Some(format!(
+                    "${rate:.2}/h doesn't fit your key's limit on {backend} yet: ${:.2}/h of ${max:.2}/h in use",
+                    u.usd_per_hour
+                )));
+            }
+        }
+        if let Some(max) = l.usd_per_month {
+            let est = cost.unwrap_or(rate * job.resources.time_s as f64 / 3600.0);
+            if u.committed + est > max {
+                return Ok(Some(format!(
+                    "~${est:.2} would pass your key's monthly limit of ${max:.2} on {backend}: ${:.2} spent or committed this month",
+                    u.committed
+                )));
+            }
+        }
+        Ok(None)
     }
 
     /// Bytes used on the coordinator by outputs copied off cloud instances.
@@ -982,10 +1072,13 @@ impl Scheduler {
         let mut ready_at: HashMap<String, DateTime<Utc>> = HashMap::new();
         let limit = self.budget.hourly_usd;
         let in_use = self.hourly_in_use()?;
+        let policy = self.store.key_policy(&job.key_fingerprint)?;
         for b in &self.backends {
             let name = b.name().to_string();
             let q = if job.backends.as_ref().is_some_and(|l| !l.contains(&name)) {
                 Quote::no("not in the job's `backends` list", true)
+            } else if !policy.allows(&name, b.is_paid(), job.spec.sandbox) {
+                Quote::no(format!("your key may not use {name}; ask the network's owner"), true)
             } else if b.is_paid() && job.spec.max_cost_usd.is_none() {
                 Quote::no("paid backend; set max_cost_usd to allow it", true)
             } else if !self.enabled(&name)?.0 {
@@ -1002,6 +1095,10 @@ impl Scheduler {
                             Quote::no(format!("${rate:.2}/h is over the hourly limit of ${limit:.2}/h"), false)
                         } else if b.is_paid() && in_use + rate > limit {
                             Quote::no(format!("${rate:.2}/h doesn't fit the hourly limit yet: ${in_use:.2}/h of ${limit:.2}/h in use"), false)
+                        } else if let Some(why) =
+                            if b.is_paid() { self.key_limit_refusal(job, &policy, &name, rate, cost)? } else { None }
+                        {
+                            Quote::no(why, false)
                         } else {
                             let stage = self.staging_seconds(job, &name);
                             let mut start = start;
@@ -1170,7 +1267,8 @@ impl Scheduler {
             if backend.is_paid()
                 && let Some(rate) = shape.usd_per_hour
             {
-                lock(&self.reserved).insert(job.id, rate);
+                let cost = cost.unwrap_or(rate * job.resources.time_s as f64 / 3600.0);
+                lock(&self.reserved).insert(job.id, PaidHold { rate, backend: name.clone(), key: job.key_fingerprint.clone(), cost });
             }
             let mut job = job;
             job.state = JobState::Staging;
