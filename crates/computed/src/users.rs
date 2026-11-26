@@ -17,6 +17,7 @@ static WRITE: Mutex<()> = Mutex::new(());
 const SKILL: &str = include_str!("../../../skills/compute/SKILL.md");
 const GUEST_HEADER: &str = include_str!("../guest/header.md");
 const INSTALL: &str = include_str!("../guest/install.sh");
+const INSTALL_PS1: &str = include_str!("../guest/install.ps1");
 
 #[derive(Serialize)]
 pub struct User {
@@ -279,13 +280,17 @@ fn owner() -> String {
 }
 
 /// The compute skill for people using someone else's network: the guest header (setup and
-/// house rules), then the main skill from "Setup per shell" on.
+/// house rules), then the main skill from "The compute CLI" on.
 pub fn skill(url: &str) -> String {
-    let body = SKILL.find("\n## Setup per shell").map(|i| &SKILL[i + 1..]).unwrap_or(SKILL);
+    let body = SKILL.find("\n## The compute CLI").map(|i| &SKILL[i + 1..]).unwrap_or(SKILL);
     let head = GUEST_HEADER.replace("{{URL}}", url).replace("{{OWNER}}", &owner());
     format!("{}\n\n{body}", head.trim_end())
 }
 
 pub fn install_script(url: &str) -> String {
     INSTALL.replace("{{URL}}", url)
+}
+
+pub fn install_ps1(url: &str) -> String {
+    INSTALL_PS1.replace("{{URL}}", url)
 }

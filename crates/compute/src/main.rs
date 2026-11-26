@@ -2,7 +2,9 @@
 
 mod client;
 mod fmt;
+mod pack;
 mod rex;
+mod update;
 mod watch;
 
 use anyhow::{Context, Result, bail};
@@ -11,10 +13,10 @@ use client::{Client, err_text, q};
 use serde_json::{Value, json};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::Command;
 
 #[derive(Parser)]
-#[command(name = "compute", version, about = "Submit and watch jobs on the compute scheduler", propagate_version = true)]
+#[command(name = "compute", version = update::VERSION, about = "Submit and watch jobs on the compute scheduler", propagate_version = true)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -22,8 +24,24 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Cmd {
+    /// Set this machine up for a compute network: sign in, write the config, install the skill
+    Setup {
+        /// The network's address, e.g. https://compute.example.org/api
+        url: String,
+        /// SSH public key to sign in with (default $COMPUTE_KEY, else ~/.ssh/id_ed25519.pub)
+        #[arg(long)]
+        key: Option<PathBuf>,
+    },
+    /// Install the network's current build of this CLI and refresh the skill
+    Update {
+        /// Reinstall even when the version already matches
+        #[arg(long)]
+        force: bool,
+    },
     /// Sign a login challenge with your SSH key (done automatically when needed)
     Login,
+    /// Who you are signed in as, your scope, and the backends and limits of your key
+    Whoami,
     /// Live monitor: all jobs, or one job with status, resource usage and its log
     Watch {
         /// Job to show; omit for the list of jobs
@@ -133,6 +151,35 @@ enum Cmd {
     },
     /// Datasets and their copies
     Datasets { name: Option<String> },
+    /// Upload a local directory as a new version of a dataset
+    DatasetUpload {
+        name: String,
+        dir: PathBuf,
+        #[arg(long)]
+        description: Option<String>,
+    },
+    /// Secret names and their keys (values are never shown)
+    Secrets,
+    /// File a report about compute itself; the body is a file, or "-" for stdin
+    Report {
+        #[arg(long)]
+        title: String,
+        /// bug, docs or feature
+        #[arg(long, default_value = "bug")]
+        kind: String,
+        /// One of your jobs it's about
+        #[arg(long)]
+        job: Option<i64>,
+        body: String,
+    },
+    /// Reports: the open ones (--all for closed too), or one by id (--wait blocks until it's closed)
+    Reports {
+        id: Option<i64>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long)]
+        wait: bool,
+    },
     /// Cloud spend this month
     Budget,
     /// Call any API path: compute api GET /v1/jobs, compute api POST /v1/jobs job.json
@@ -153,8 +200,21 @@ fn main() {
 
 fn real_main() -> Result<()> {
     let cli = Cli::parse();
+    update::cleanup_old();
+    if let Cmd::Setup { url, key } = &cli.cmd {
+        return update::setup(url, key.clone());
+    }
     let c = Client::from_env()?;
+    if !matches!(cli.cmd, Cmd::Update { .. }) {
+        update::auto(&c);
+    }
     match cli.cmd {
+        Cmd::Setup { .. } => unreachable!(),
+        Cmd::Update { force } => {
+            let v = update::update(&c, force)?;
+            println!("compute {v}");
+        }
+        Cmd::Whoami => print_json(&c.get("/v1/whoami")?)?,
         Cmd::Login => {
             c.login()?;
             let me = c.get("/v1/whoami")?;
@@ -256,20 +316,7 @@ fn real_main() -> Result<()> {
                 Some(g) => format!("/v1/jobs/{id}/outputs?glob={}", q(&g)),
                 None => format!("/v1/jobs/{id}/outputs"),
             };
-            let mut body = c.download(&path)?;
-            let mut child = Command::new("sh")
-                .arg("-c")
-                .arg("zstd -dc | tar -x -C \"$1\"")
-                .arg("sh")
-                .arg(&dest)
-                .stdin(Stdio::piped())
-                .spawn()
-                .context("running zstd and tar")?;
-            std::io::copy(&mut body, child.stdin.as_mut().context("tar stdin")?)?;
-            drop(child.stdin.take());
-            if !child.wait()?.success() {
-                bail!("unpacking the outputs failed");
-            }
+            pack::unpack(c.download(&path)?, &dest)?;
             println!("outputs of job {id} are in {}", dest.display());
         }
         Cmd::Snapshot { dir, rev } => {
@@ -308,16 +355,42 @@ fn real_main() -> Result<()> {
             };
             print_json(&v)?;
         }
+        Cmd::DatasetUpload { name, dir, description } => {
+            let mut path = format!("/v1/datasets/{}/upload", q(&name));
+            if let Some(d) = description {
+                path.push_str(&format!("?description={}", q(&d)));
+            }
+            let p = pack::pack_dir(dir)?;
+            let v = c.upload("PUT", &path, &p.reader);
+            p.finish()?;
+            print_json(&v?)?;
+        }
+        Cmd::Secrets => print_json(&c.get("/v1/secrets")?)?,
         Cmd::Budget => print_json(&c.get("/v1/budget")?)?,
+        Cmd::Report { title, kind, job, body } => {
+            let mut req = json!({"kind": kind, "title": title, "body": read_text(&body)?});
+            if let Some(j) = job {
+                req["job_id"] = j.into();
+            }
+            let v = c.post("/v1/reports", &req)?;
+            println!("report {} filed ({}); watch it with: compute reports {} --wait", v["id"], v["state"].as_str().unwrap_or("open"), v["id"]);
+        }
+        Cmd::Reports { id: Some(id), wait, .. } => {
+            let mut v = c.get(&format!("/v1/reports/{id}"))?;
+            while wait && v["state"] != "closed" {
+                // A timed-out wait (at most 90 s through Cloudflare) or a network blip: wait again.
+                match c.get(&format!("/v1/reports/{id}/wait?timeout=600")) {
+                    Ok(r) => v = r,
+                    Err(_) => std::thread::sleep(std::time::Duration::from_secs(5)),
+                }
+            }
+            print_json(&v)?;
+        }
+        Cmd::Reports { id: None, all, .. } => print_json(&c.get(if all { "/v1/reports?state=all" } else { "/v1/reports" })?)?,
         Cmd::Api { method, path, body } => {
             let body = match body {
                 None => None,
-                Some(b) if b == "-" => {
-                    let mut s = String::new();
-                    std::io::stdin().read_to_string(&mut s)?;
-                    Some(serde_json::from_str(&s).context("stdin is not JSON")?)
-                }
-                Some(b) if Path::new(&b).is_file() => Some(serde_json::from_str(&std::fs::read_to_string(&b)?).context("file is not JSON")?),
+                Some(b) if b == "-" || Path::new(&b).is_file() => Some(serde_json::from_str(&read_text(&b)?).context("the body is not JSON")?),
                 Some(b) => Some(serde_json::from_str(&b).context("body is not JSON (or a file)")?),
             };
             let v = c.call(&method.to_ascii_uppercase(), &path, body.as_ref())?;
@@ -325,6 +398,16 @@ fn real_main() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// A file's text, or stdin's for "-".
+fn read_text(src: &str) -> Result<String> {
+    if src == "-" {
+        let mut s = String::new();
+        std::io::stdin().read_to_string(&mut s)?;
+        return Ok(s);
+    }
+    std::fs::read_to_string(src).with_context(|| format!("reading {src}"))
 }
 
 fn print_json(v: &Value) -> Result<()> {
@@ -464,7 +547,7 @@ fn repo_root(dir: &Path) -> Result<PathBuf> {
 fn snapshot(c: &Client, dir: Option<&Path>, rev: Option<&str>) -> Result<String> {
     let cwd = std::env::current_dir()?;
     let root = repo_root(dir.unwrap_or(&cwd))?;
-    let script = match rev {
+    let packing = match rev {
         Some(r) => {
             // A jj revision resolves to its git commit (colocated repos); plain git takes the rev as is.
             let commit = Command::new("jj")
@@ -476,28 +559,16 @@ fn snapshot(c: &Client, dir: Option<&Path>, rev: Option<&str>) -> Result<String>
                 .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
                 .filter(|s| !s.is_empty() && !s.contains('\n'))
                 .unwrap_or_else(|| r.to_string());
-            if !commit.chars().all(|ch| ch.is_ascii_alphanumeric() || "-_./~^@".contains(ch)) {
-                bail!("revision {r:?} has unexpected characters");
+            if commit.starts_with('-') {
+                bail!("revision {r:?} looks like an option");
             }
-            format!("git archive --format=tar {commit} | zstd -q -c")
+            pack::pack_command(&root, "git", &["archive", "--format=tar", &commit])?
         }
-        None => "if [ -e .git ]; then git ls-files -co --exclude-standard -z; \
-                 else jj file list | tr '\\n' '\\0'; fi \
-                 | COPYFILE_DISABLE=1 tar --null -T - -cf - | zstd -q -c"
-            .to_string(),
+        None => pack::pack_files(root.clone(), pack::repo_files(&root)?)?,
     };
-    let mut child = Command::new("sh")
-        .arg("-c")
-        .arg(&script)
-        .current_dir(&root)
-        .stdout(Stdio::piped())
-        .spawn()
-        .context("packing the repo (needs tar and zstd)")?;
-    let stdout = child.stdout.take().context("tar stdout")?;
-    let v = c.upload("POST", "/v1/snapshots", stdout)?;
-    if !child.wait()?.success() {
-        bail!("packing the repo failed");
-    }
+    let v = c.upload("POST", "/v1/snapshots", &packing.reader);
+    packing.finish().context("packing the repo failed")?;
+    let v = v?;
     let id = v["id"].as_str().context("no snapshot id in the response")?.to_string();
     eprintln!("snapshot {id} ({}){}", if v["existed"] == true { "already stored" } else { "uploaded" }, rev.map(|r| format!(" from {r}")).unwrap_or_default());
     Ok(id)

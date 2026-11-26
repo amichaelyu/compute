@@ -456,9 +456,13 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "clap",
+ "hex",
  "ratatui",
  "serde_json",
+ "sha2 0.11.1",
+ "tar",
  "ureq",
+ "zstd",
 ]
 
 [[package]]

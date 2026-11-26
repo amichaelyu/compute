@@ -76,6 +76,9 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/users", get(list_users).post(add_user).delete(remove_user))
         .route("/v1/users/access", put(set_user_access))
         .route("/v1/install", get(install_script))
+        .route("/v1/install.ps1", get(install_ps1))
+        .route("/v1/cli", get(cli_builds))
+        .route("/v1/cli/{platform}", get(cli_download))
         .route("/v1/skill", get(guest_skill));
     Router::new()
         .merge(api.clone())
@@ -232,6 +235,7 @@ async fn whoami(State(s): State<AppState>, sess: Session) -> ApiResult<Json<Valu
 
 /// Changes within v1 that a running agent should know about, newest first.
 const CHANGES: &[(&str, &str)] = &[
+    ("2026-11-26", "The `compute` CLI is served by the network: GET /v1/cli lists its version and per-platform builds (darwin-arm64, linux-x86_64, linux-arm64, windows-x86_64: url, sha256, size), GET /v1/cli/{platform} downloads one, both without signing in. GET /v1/ has `cli_version`. The install command (`curl -fsSL $COMPUTE_URL/v1/install | sh`, or `irm $COMPUTE_URL/v1/install.ps1 | iex` on Windows) installs the CLI and runs `compute setup`; the CLI keeps itself and the skill current (`compute update`). The skill now uses the CLI."),
     ("2026-11-26", "GET /v1/reports/{id}/wait?timeout=<s> returns once the report is closed, or after the timeout (at most 90 s through Cloudflare) with timed_out: true; repeat it to watch a report you filed. Closed reports carry `resolution` (fixed, wont_fix, duplicate, not_a_bug) and the owner's `note`. POST /v1/reports/{id}/close takes {note?, resolution?} (default fixed)."),
     ("2026-11-26", "Per-key access: the owner sets which backends each key may use and, per paid backend, caps in $/h and $/month. GET /v1/whoami lists `backends` (what your key may use) and `limits` (per paid backend: usd_per_hour, usd_per_month, in_use_usd_per_hour, spent_this_month_usd, committed_this_month_usd). Naming a backend you may not use answers 403 backend_not_allowed; a job over a cap waits (reason says which). Guest keys may use paid backends when the owner allows it (max_cost_usd is no longer refused)."),
     ("2026-11-25", "GET /v1/ lists `changes` only when signed in; without a session it has name, build and api_versions."),
@@ -260,12 +264,15 @@ const CHANGES: &[(&str, &str)] = &[
 
 /// Public, so a client can check the API version before signing in. The change log (which
 /// describes how the network works inside) is only for signed-in callers.
-async fn root(sess: Result<Session, ApiError>) -> Json<Value> {
+async fn root(State(s): State<AppState>, sess: Result<Session, ApiError>) -> Json<Value> {
     let mut v = json!({
         "name": "computed",
         "build": env!("CARGO_PKG_VERSION"),
         "api_versions": ["v1"],
     });
+    if let Some(m) = cli_manifest(&s) {
+        v["cli_version"] = m["version"].clone();
+    }
     if sess.is_ok() {
         v["changes"] = CHANGES.iter().map(|(d, c)| json!({"date": d, "change": c})).collect::<Vec<_>>().into();
     }
@@ -1502,6 +1509,65 @@ async fn install_script(headers: HeaderMap, OriginalUri(uri): OriginalUri) -> Re
         crate::users::install_script(&url),
     )
         .into_response()
+}
+
+async fn install_ps1(headers: HeaderMap, OriginalUri(uri): OriginalUri) -> Response {
+    let url = crate::users::base_url(&headers, uri.path());
+    (
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8"), (header::CACHE_CONTROL, "no-store")],
+        crate::users::install_ps1(&url),
+    )
+        .into_response()
+}
+
+/// `<state>/cli/manifest.json`: `{"version", "files": {"<platform>": {"file", "sha256", "size"}}}`.
+fn cli_manifest(s: &AppState) -> Option<Value> {
+    let text = std::fs::read_to_string(s.sched.paths.cli_dir().join("manifest.json")).ok()?;
+    serde_json::from_str::<Value>(&text).ok().filter(|m| m["version"].is_string())
+}
+
+fn no_cli() -> ApiError {
+    ApiError::new(StatusCode::NOT_FOUND, "no_cli", "this network serves no compute CLI builds", "ask the network's owner to deploy them")
+}
+
+/// The CLI's version and builds. Public: the installer fetches the binary before signing in.
+async fn cli_builds(State(s): State<AppState>, headers: HeaderMap, OriginalUri(uri): OriginalUri) -> ApiResult<Json<Value>> {
+    let m = cli_manifest(&s).ok_or_else(no_cli)?;
+    let url = crate::users::base_url(&headers, uri.path());
+    let platforms: Vec<Value> = m["files"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .map(|(p, f)| json!({"platform": p, "url": format!("{url}/v1/cli/{p}"), "sha256": f["sha256"], "size": f["size"]}))
+        .collect();
+    Ok(Json(json!({"version": m["version"], "platforms": platforms})))
+}
+
+async fn cli_download(State(s): State<AppState>, Path(platform): Path<String>) -> ApiResult<Response> {
+    let m = cli_manifest(&s).ok_or_else(no_cli)?;
+    let name = m["files"][&platform]["file"].as_str().unwrap_or_default();
+    // The manifest names a file in the cli directory, nothing else.
+    if name.is_empty() || name.contains(['/', '\\']) || name.starts_with('.') {
+        let known: Vec<&String> = m["files"].as_object().map(|f| f.keys().collect()).unwrap_or_default();
+        return Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            "not_found",
+            format!("no compute build for {platform}"),
+            format!("builds: {}", known.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", ")),
+        ));
+    }
+    let file = tokio::fs::File::open(s.sched.paths.cli_dir().join(name)).await.map_err(|_| no_cli())?;
+    let len = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/octet-stream".to_string()),
+            (header::CONTENT_LENGTH, len.to_string()),
+            (header::CONTENT_DISPOSITION, format!("attachment; filename=\"{name}\"")),
+            (header::CACHE_CONTROL, "no-store".to_string()),
+        ],
+        Body::from_stream(ReaderStream::new(file)),
+    )
+        .into_response())
 }
 
 /// The compute skill for people using this network, with its URL filled in.

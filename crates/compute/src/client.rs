@@ -5,7 +5,9 @@
 //!   COMPUTE_URL   where computed listens (required)
 //!   COMPUTE_KEY   an SSH public key listed in the daemon's allowed_signers
 //!                 (default ~/.ssh/id_ed25519.pub; its private half may be in ssh-agent)
-//! The session token is cached in `~/.config/compute/session`, as the skill does.
+//!   COMPUTE_SKILL_DIR  where `compute update` keeps the skill (default: Claude Code's, plus
+//!                 Codex's when ~/.codex exists)
+//! The session token is cached in `~/.config/compute/session`.
 
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
@@ -43,8 +45,13 @@ pub struct Client {
     agent: ureq::Agent,
 }
 
-fn home() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_default()
+/// The home directory: `$HOME`, else `%USERPROFILE%` (Windows).
+pub fn home() -> PathBuf {
+    ["HOME", "USERPROFILE"]
+        .iter()
+        .find_map(|k| std::env::var_os(k).filter(|v| !v.is_empty()))
+        .map(PathBuf::from)
+        .unwrap_or_default()
 }
 
 /// Expands `~`, `$HOME` and `${HOME}` (the forms client.env uses).
@@ -57,44 +64,54 @@ fn expand(v: &str) -> String {
     }
 }
 
-fn config_dir() -> PathBuf {
+pub fn config_dir() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| home().join(".config")).join("compute")
+}
+
+/// The client config file: `$COMPUTE_CLIENT_CONFIG`, else `~/.config/compute/client.env`.
+pub fn config_file() -> PathBuf {
+    std::env::var_os("COMPUTE_CLIENT_CONFIG").map(PathBuf::from).unwrap_or_else(|| config_dir().join("client.env"))
+}
+
+/// A setting: the environment variable, else its `KEY=value` line in the config file.
+pub fn setting(key: &str) -> Option<String> {
+    if let Some(v) = std::env::var(key).ok().filter(|v| !v.is_empty()) {
+        return Some(expand(&v));
+    }
+    let text = std::fs::read_to_string(config_file()).ok()?;
+    text.lines().find_map(|line| {
+        let line = line.trim();
+        let line = line.strip_prefix("export ").unwrap_or(line);
+        let (k, v) = line.split_once('=')?;
+        let v = v.split(" #").next().unwrap_or(v).trim().trim_matches('"').trim_matches('\'');
+        (k.trim() == key && !v.is_empty()).then(|| expand(v))
+    })
+}
+
+/// The SSH public key to sign in with: `COMPUTE_KEY`, else `~/.ssh/id_ed25519.pub`.
+pub fn default_key() -> PathBuf {
+    let k = setting("COMPUTE_KEY").unwrap_or_else(|| expand("~/.ssh/id_ed25519.pub"));
+    PathBuf::from(if k.ends_with(".pub") { k } else { format!("{k}.pub") })
 }
 
 impl Client {
     pub fn from_env() -> Result<Client> {
-        let file = std::env::var_os("COMPUTE_CLIENT_CONFIG").map(PathBuf::from).unwrap_or_else(|| config_dir().join("client.env"));
-        let mut url = None;
-        let mut key = None;
-        if let Ok(text) = std::fs::read_to_string(&file) {
-            for line in text.lines() {
-                let line = line.trim();
-                let line = line.strip_prefix("export ").unwrap_or(line);
-                let Some((k, v)) = line.split_once('=') else { continue };
-                let v = v.split(" #").next().unwrap_or(v).trim().trim_matches('"').trim_matches('\'');
-                match k.trim() {
-                    "COMPUTE_URL" => url = Some(expand(v)),
-                    "COMPUTE_KEY" => key = Some(expand(v)),
-                    _ => {}
-                }
-            }
-        }
-        let env = |k: &str| std::env::var(k).ok().filter(|v| !v.is_empty());
-        let url = env("COMPUTE_URL").or(url).with_context(|| {
-            format!("COMPUTE_URL is not set: put COMPUTE_URL=http://<coordinator>:8765 in {}", file.display())
+        let url = setting("COMPUTE_URL").with_context(|| {
+            format!(
+                "COMPUTE_URL is not set: run `compute setup <address>`, or put COMPUTE_URL=http://<coordinator>:8765 in {}",
+                config_file().display()
+            )
         })?;
-        let key = env("COMPUTE_KEY").map(|k| expand(&k)).or(key).unwrap_or_else(|| expand("~/.ssh/id_ed25519.pub"));
+        Ok(Client::new(&url, default_key()))
+    }
+
+    pub fn new(url: &str, key: PathBuf) -> Client {
         let agent: ureq::Agent = ureq::Agent::config_builder()
             .http_status_as_error(false)
             .timeout_connect(Some(Duration::from_secs(10)))
             .build()
             .into();
-        Ok(Client {
-            url: url.trim_end_matches('/').to_string(),
-            key: PathBuf::from(key),
-            session_file: config_dir().join("session"),
-            agent,
-        })
+        Client { url: url.trim_end_matches('/').to_string(), key, session_file: config_dir().join("session"), agent }
     }
 
     fn token(&self) -> Option<String> {
@@ -106,9 +123,12 @@ impl Client {
         let mut r = self.agent.post(format!("{}/v1/auth/challenge", self.url)).send_empty().context("reaching the daemon")?;
         let ch: Value = r.body_mut().read_json()?;
         let nonce = ch["nonce"].as_str().context("no nonce in the challenge")?;
+        // Sign with the private key next to the .pub when it's there, otherwise through ssh-agent.
+        let private = self.key.with_extension("");
+        let signer = if self.key.extension().is_some_and(|e| e == "pub") && private.is_file() { &private } else { &self.key };
         let mut child = Command::new("ssh-keygen")
             .args(["-Y", "sign", "-n", "compute", "-f"])
-            .arg(&self.key)
+            .arg(signer)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -205,6 +225,17 @@ impl Client {
         Ok(v)
     }
 
+    /// A public download (the CLI binaries), without signing in.
+    pub fn fetch_public(&self, path: &str) -> Result<Vec<u8>> {
+        let mut r = self.agent.get(format!("{}{path}", self.url)).call().with_context(|| format!("reaching {}", self.url))?;
+        let status = r.status().as_u16();
+        if status >= 400 {
+            let v: Value = r.body_mut().read_json().unwrap_or(Value::Null);
+            return Err(api_error(status, &v).into());
+        }
+        Ok(r.body_mut().with_config().limit(512 << 20).read_to_vec()?)
+    }
+
     /// Streams a response body (job outputs).
     pub fn download(&self, path: &str) -> Result<impl Read + use<>> {
         if self.get("/v1/whoami").is_err() {
@@ -232,10 +263,13 @@ fn api_error(status: u16, v: &Value) -> ApiError {
     }
 }
 
+/// Writes a file only its owner may read (mode 0600 on Unix; Windows keeps the profile's ACL).
 fn write_private(path: &std::path::Path, data: &str) -> Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut f = std::fs::OpenOptions::new().write(true).create(true).truncate(true).mode(0o600).open(path)?;
-    f.write_all(data.as_bytes())?;
+    let mut o = std::fs::OpenOptions::new();
+    o.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut o, 0o600);
+    o.open(path)?.write_all(data.as_bytes())?;
     Ok(())
 }
 

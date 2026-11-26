@@ -1,77 +1,49 @@
 #!/bin/sh
-# Sets this machine up to use the compute network at {{URL}}: signs in with your SSH key and
-# installs the compute skill for Claude Code. Run it again any time to update the skill.
+# Sets this machine up to use the compute network at {{URL}}: installs the `compute` CLI, signs
+# in with your SSH key and installs the compute skill for your agents (Claude Code, and Codex
+# when it's there). Run it again any time; the CLI also keeps itself and the skill up to date.
 #
 #   curl -fsSL {{URL}}/v1/install | sh
 #
-# COMPUTE_KEY picks the key (default ~/.ssh/id_ed25519.pub); COMPUTE_SKILL_DIR the skill's
-# folder (default ~/.claude/skills/compute).
+# COMPUTE_KEY picks the key (default ~/.ssh/id_ed25519.pub), COMPUTE_BIN_DIR where the CLI goes
+# (default ~/.local/bin), COMPUTE_SKILL_DIR the skill's folder (default ~/.claude/skills/compute,
+# plus ~/.codex/skills/compute when ~/.codex exists).
 set -eu
 
 url='{{URL}}'
-key="${COMPUTE_KEY:-$HOME/.ssh/id_ed25519.pub}"
-skill_dir="${COMPUTE_SKILL_DIR:-$HOME/.claude/skills/compute}"
-conf="$HOME/.config/compute"
+bin_dir="${COMPUTE_BIN_DIR:-$HOME/.local/bin}"
 
 die() { printf 'compute: %s\n' "$*" >&2; exit 1; }
 
-for t in curl jq ssh-keygen; do
-  command -v "$t" >/dev/null 2>&1 || die "needs $t; install it and run this again"
-done
-case "$key" in *.pub) ;; *) key="$key.pub" ;; esac
-[ -f "$key" ] || die "no SSH public key at $key. Make one with: ssh-keygen -t ed25519 (or set COMPUTE_KEY to your .pub file)"
+command -v curl >/dev/null 2>&1 || die "needs curl; install it and run this again"
+os=$(uname -s) arch=$(uname -m)
+case "$os-$arch" in
+  Darwin-arm64) platform=darwin-arm64 ;;
+  Linux-x86_64 | Linux-amd64) platform=linux-x86_64 ;;
+  Linux-aarch64 | Linux-arm64) platform=linux-arm64 ;;
+  MINGW* | MSYS* | CYGWIN*) die "on Windows, run this in PowerShell instead: irm $url/v1/install.ps1 | iex" ;;
+  *) die "there's no compute build for $os $arch" ;;
+esac
 
-# Sign with the private key next to the .pub when it's there, otherwise through ssh-agent.
-signer="$key"
-[ -f "${key%.pub}" ] && signer="${key%.pub}"
+mkdir -p "$bin_dir"
+tmp="$bin_dir/.compute-download.$$"
+trap 'rm -f "$tmp"' EXIT
+curl -fsSL "$url/v1/cli/$platform" -o "$tmp" || die "couldn't download the compute CLI from $url"
+chmod 755 "$tmp"
+"$tmp" --version >/dev/null 2>&1 || die "the downloaded compute CLI doesn't run on this machine"
+mv -f "$tmp" "$bin_dir/compute"
+printf 'compute: installed %s at %s/compute\n' "$("$bin_dir/compute" --version)" "$bin_dir"
 
-# Signs in; sets $token, or $denied when the key isn't allowed yet.
-sign_in() {
-  token='' denied=''
-  nonce=$(curl -fsS -X POST "$url/v1/auth/challenge" | jq -r .nonce) || die "can't reach $url"
-  sig=$(printf %s "$nonce" | ssh-keygen -Y sign -n compute -f "$signer") || die "ssh-keygen couldn't sign with $signer"
-  resp=$(jq -n --arg n "$nonce" --arg s "$sig" --rawfile k "$key" '{nonce:$n, signature:$s, public_key:$k}' |
-    curl -sS -H 'Content-Type: application/json' --data-binary @- "$url/v1/auth/token") || die "can't reach $url"
-  token=$(printf '%s' "$resp" | jq -r '.token // empty' 2>/dev/null || true)
-  [ -n "$token" ] && return 0
-  msg=$(printf '%s' "$resp" | jq -r '.error.message // empty' 2>/dev/null || true)
-  case "$msg" in
-    *allowed_signers*) denied=1 ;;
-    *) die "sign-in failed: ${msg:-$resp}" ;;
-  esac
-}
-
-sign_in
-if [ -n "$denied" ]; then
-  printf '%s\n\n' "This SSH key isn't on the compute network yet. Send this line to the person who runs it:" >&2
-  cat "$key" >&2
-  printf '\n' >&2
-  # The script itself arrives on stdin (curl | sh), so ask on the terminal.
-  if ! (exec </dev/tty) 2>/dev/null; then
-    printf '%s\n' "Once they've added it, run the same command again." >&2
-    exit 1
-  fi
-  while [ -n "$denied" ]; do
-    printf '%s' "Press Enter once they've added it (Ctrl-C to stop): " >&2
-    read -r _ </dev/tty || exit 1
-    sign_in
-    [ -n "$denied" ] && printf '%s\n' "Not added yet. Send them the key line above, then press Enter again." >&2
-  done
+# Signing in may wait for the network's owner to add the key; the script itself arrives on
+# stdin (curl | sh), so that prompt reads from the terminal.
+if (exec </dev/tty) 2>/dev/null; then
+  "$bin_dir/compute" setup "$url" </dev/tty
+else
+  "$bin_dir/compute" setup "$url"
 fi
 
-mkdir -p "$conf"
-chmod 700 "$conf"
-(umask 077 && printf '%s\n' "$token" > "$conf/session")
-if [ ! -f "$conf/client.env" ]; then
-  printf '# compute client config, written by %s/v1/install\nCOMPUTE_URL=%s\nCOMPUTE_KEY=%s\n' "$url" "$url" "$key" > "$conf/client.env"
-elif ! grep -qx "COMPUTE_URL=$url" "$conf/client.env"; then
-  printf 'compute: %s/client.env points at another address; left it as is. Set COMPUTE_URL=%s there to use this network.\n' "$conf" "$url" >&2
-fi
-
-mkdir -p "$skill_dir"
-curl -fsS -H "Authorization: Bearer $token" "$url/v1/skill" -o "$skill_dir/SKILL.md.tmp" || die "couldn't download the skill"
-mv "$skill_dir/SKILL.md.tmp" "$skill_dir/SKILL.md"
-
-name=$(curl -fsS -H "Authorization: Bearer $token" "$url/v1/whoami" | jq -r '.name // .identity' 2>/dev/null || echo "?")
-printf 'compute: signed in as %s; installed the skill at %s/SKILL.md\n' "$name" "$skill_dir"
-printf 'Ask Claude to run something on compute, e.g. "train this on a GPU with compute".\n'
+# shellcheck disable=SC2016  # $PATH is printed as is, for the user to paste
+case ":$PATH:" in
+  *":$bin_dir:"*) ;;
+  *) printf '\n%s is not on your PATH. Add it (e.g. to ~/.zshrc or ~/.bashrc), so you and your agents can run `compute`:\n  export PATH="%s:$PATH"\n' "$bin_dir" "$bin_dir" ;;
+esac

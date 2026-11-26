@@ -42,6 +42,11 @@ impl Paths {
     pub fn snapshots_dir(&self) -> PathBuf {
         self.state_dir.join("snapshots")
     }
+    /// The `compute` CLI builds served at /v1/cli: manifest.json plus one binary per platform,
+    /// put there by deploy/install.sh.
+    pub fn cli_dir(&self) -> PathBuf {
+        self.state_dir.join("cli")
+    }
     /// Uploaded datasets (tar.zst), one file per version.
     pub fn datasets_dir(&self) -> PathBuf {
         self.state_dir.join("datasets")

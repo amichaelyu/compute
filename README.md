@@ -13,8 +13,10 @@ job's state, logs and outputs. Jobs can depend on each other, read versioned dat
 container images (Docker, or Apptainer on Slurm), including ones it builds. A built-in dashboard
 shows the schedule, jobs, backends and people.
 
-Agents use it through [`skills/compute/SKILL.md`](skills/compute/SKILL.md); symlink it into
-`~/.claude/skills/compute`.
+Agents use it through the `compute` CLI and [`skills/compute/SKILL.md`](skills/compute/SKILL.md).
+The daemon serves both: the install command below sets a machine up, and the CLI then keeps itself
+and the skill current. To edit the skill in place, symlink it into `~/.claude/skills/compute`;
+updates leave symlinked skill folders alone.
 
 ## Layout
 
@@ -63,14 +65,18 @@ To deploy from your machine to a coordinator over Rex, set `COMPUTE_REX_HOST`, `
 and `COMPUTE_PORT` in `~/.config/compute/deploy.env`, then:
 
 ```bash
-deploy/install.sh          # build the dashboard and daemon, install, restart
+deploy/install.sh          # build the dashboard, daemon and CLI, install, restart
 deploy/install.sh config   # push hosts.toml and restart (running jobs survive)
 ```
 
 ## Sharing it
 
-Someone joins by running `curl -fsSL <url>/v1/install | sh`: it prints their public key, you paste
-it on the **Users** page, and it signs them in and installs the skill. Keys named in `owners` have
+Someone joins by running `curl -fsSL <url>/v1/install | sh` (on Windows, in PowerShell:
+`irm <url>/v1/install.ps1 | iex`). It installs the `compute` CLI (macOS arm64, Linux x86_64 and
+arm64, Windows x86_64, served from `GET /v1/cli`), prints their public key for you to paste on the
+**Users** page, then signs them in and installs the skill for Claude Code (and Codex). After that
+the CLI updates itself and the skill when you deploy a new build, checking at most once a day
+(`COMPUTE_NO_UPDATE=1` turns it off; `compute update` does it at once). Keys named in `owners` have
 full access; everyone else is a guest, whose jobs run sandboxed and who sees only their own jobs,
 secrets and datasets. Per person, **Access** sets which backends they may use and caps their spend
 on each paid one (per hour, per month). Caps decide whether a job starts; running jobs are never

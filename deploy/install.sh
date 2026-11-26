@@ -1,8 +1,12 @@
 #!/usr/bin/env bash
 # Deploys computed to the coordinator over Rex (`rex forward` to its sshd).
 #
-#   deploy/install.sh          build the dashboard and daemon, install binary + unit, restart
+#   deploy/install.sh          build the dashboard, daemon and CLI, install them + unit, restart
 #   deploy/install.sh config   push hosts.toml (and allowed_signers, cloud API keys), restart
+#
+# The install also builds the `compute` CLI for every platform the network serves it to
+# (GET /v1/cli): macOS arm64, Linux x86_64 and arm64 (static musl) and Windows x86_64. Its
+# version is the crate version plus the jj/git commit, so clients update when it changes.
 #
 # Settings come from ~/.config/compute/deploy.env (or $COMPUTE_DEPLOY_CONFIG), KEY=value lines;
 # environment variables of the same names override the file:
@@ -35,6 +39,14 @@ user="${COMPUTE_SSH_USER:?set COMPUTE_SSH_USER (login user on the coordinator) i
 api_port="${COMPUTE_PORT:-8765}"
 fwd="${COMPUTE_FORWARD:-52299}"
 target=x86_64-unknown-linux-gnu
+# CLI builds: "<rust target> <platform name the API uses>".
+cli_targets=(
+  "aarch64-apple-darwin darwin-arm64"
+  "x86_64-unknown-linux-musl linux-x86_64"
+  "aarch64-unknown-linux-musl linux-arm64"
+  "x86_64-pc-windows-gnu windows-x86_64"
+)
+cli_stage=target/cli-dist
 
 if [ "$mode" = install ]; then
   command -v cargo-zigbuild >/dev/null || { echo "install cargo-zigbuild first (brew install cargo-zigbuild)" >&2; exit 1; }
@@ -44,7 +56,9 @@ if [ "$mode" = install ]; then
     cargo=$(rustup which cargo)
     PATH="$(dirname "$cargo"):$PATH"
     export PATH
-    rustup target list --installed 2>/dev/null | grep -qx "$target" || rustup target add "$target"
+    for t in "$target" "${cli_targets[@]%% *}"; do
+      rustup target list --installed 2>/dev/null | grep -qx "$t" || rustup target add "$t"
+    done
   fi
   if command -v bun >/dev/null; then
     (cd web && bun install --frozen-lockfile && bun run build)
@@ -52,6 +66,30 @@ if [ "$mode" = install ]; then
     echo "bun not found: building without rebuilding the dashboard (web/dist as it is)" >&2
   fi
   "$cargo" zigbuild --release --target "$target" -p computed
+
+  # The CLI, for every platform, plus the manifest the daemon serves it from.
+  commit=$(jj log -r @ --no-graph -T 'commit_id.short(8)' 2>/dev/null || git rev-parse --short=8 HEAD)
+  cli_version="$(sed -n 's/^version = "\(.*\)"/\1/p' crates/compute/Cargo.toml | head -1)+$commit"
+  rm -rf "$cli_stage" && mkdir -p "$cli_stage"
+  entries=()
+  for spec in "${cli_targets[@]}"; do
+    read -r t platform <<< "$spec"
+    if [ "$t" = "aarch64-apple-darwin" ] && [ "$(uname -sm)" = "Darwin arm64" ]; then
+      COMPUTE_BUILD="$cli_version" "$cargo" build --release --target "$t" -p compute
+    else
+      COMPUTE_BUILD="$cli_version" "$cargo" zigbuild --release --target "$t" -p compute
+    fi
+    exe=compute; [[ "$t" == *windows* ]] && exe=compute.exe
+    file="compute-$platform"; [[ "$t" == *windows* ]] && file="$file.exe"
+    cp "target/$t/release/$exe" "$cli_stage/$file"
+    sum=$(shasum -a 256 "$cli_stage/$file" | cut -d' ' -f1)
+    size=$(wc -c < "$cli_stage/$file" | tr -d ' ')
+    entries+=("\"$platform\": {\"file\": \"$file\", \"sha256\": \"$sum\", \"size\": $size}")
+  done
+  { printf '{"version": "%s", "files": {' "$cli_version"
+    sep=''; for e in "${entries[@]}"; do printf '%s%s' "$sep" "$e"; sep=', '; done
+    printf '}}\n'; } > "$cli_stage/manifest.json"
+  echo "compute CLI $cli_version built for ${#entries[@]} platforms"
 fi
 
 if ! rex -S "$host" ls --json | grep -q '"label": "compute"'; then
@@ -72,6 +110,12 @@ case "$mode" in
   install)
     put "target/$target/release/computed" .local/bin/computed.new
     put deploy/computed.service .config/systemd/user/computed.service
+    # The CLI goes to <state dir>/cli, swapped in whole so the manifest always matches the files.
+    # shellcheck disable=SC2016  # expands on the coordinator
+    state_dir=$(rsh 'set -a; [ -f ~/.config/compute/computed.env ] && . ~/.config/compute/computed.env; echo "${COMPUTE_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/compute}"')
+    rsh "rm -rf '$state_dir/cli.new' && mkdir -p '$state_dir/cli.new'"
+    scp -q -P "$fwd" "${ssh_opts[@]}" "$cli_stage"/* "$dest:$state_dir/cli.new/"
+    rsh "chmod 755 '$state_dir'/cli.new/compute-* && rm -rf '$state_dir/cli.old' && { [ ! -d '$state_dir/cli' ] || mv '$state_dir/cli' '$state_dir/cli.old'; } && mv '$state_dir/cli.new' '$state_dir/cli' && rm -rf '$state_dir/cli.old'"
     if ! rsh 'test -f ~/.config/compute/hosts.toml'; then put hosts.toml .config/compute/hosts.toml; fi
     ;;
   config)

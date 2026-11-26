@@ -1,32 +1,34 @@
 ---
 name: compute
-description: Run compute jobs (training, eval, sweeps, data processing, anything longer than a few minutes, and all GPU work) on {{OWNER}}'s shared compute network through its HTTP API, which places them on their machines and clusters. Use instead of running long jobs on the local machine and instead of hand-written sbatch scripts.
+description: Run compute jobs (training, eval, sweeps, data processing, anything longer than a few minutes, and all GPU work) on {{OWNER}}'s shared compute network through the `compute` CLI, which places them on their machines and clusters. Use instead of running long jobs on the local machine and instead of hand-written sbatch scripts.
 ---
 
 # compute: a shared compute network (API v1)
 
 {{OWNER}} runs a job scheduler (`computed`) and shares it. It places each job on the backend
 that can start it soonest: machines, Slurm clusters, and possibly paid GPU clouds. Which
-backends exist, what hardware they have and what they allow all come from the API
-(`GET /v1/backends`), not from this file. You describe a job as JSON; the daemon uploads code,
+backends exist, what hardware they have and what they allow all come from the network
+(`compute backends`), not from this file. You describe a job as JSON; the daemon uploads code,
 picks a backend, runs the job and keeps its logs and outputs.
 
-Access is by SSH key, and this skill was installed (and is updated) with:
+Access is by SSH key. The `compute` CLI and this skill were installed (and are reinstalled)
+with:
 
 ```bash
-curl -fsSL {{URL}}/v1/install | sh
+curl -fsSL {{URL}}/v1/install | sh        # macOS (Apple Silicon) and Linux
+irm {{URL}}/v1/install.ps1 | iex          # Windows, in PowerShell
 ```
 
-That command signs in with `~/.ssh/id_ed25519.pub` (or `$COMPUTE_KEY`), writes
+That downloads the CLI (to `~/.local/bin`, or `%LOCALAPPDATA%\compute\bin` on Windows) and runs
+`compute setup`, which signs in with `~/.ssh/id_ed25519.pub` (or `$COMPUTE_KEY`), writes
 `~/.config/compute/client.env` and the session, and installs this file. If it says the key
 isn't on the network yet, it prints the public key line and waits: the user sends that line
-to {{OWNER}}, and presses Enter once it has been added. Rerun it to get the latest version of this skill. This skill targets **API v1**:
-`GET $COMPUTE_URL/v1/` must list `"v1"` in `api_versions`.
+to {{OWNER}}, and presses Enter once it has been added. After that the CLI keeps itself and
+this skill up to date (`compute update` does it at once).
 
 ## Limits of the public address
 
 When `COMPUTE_URL` is an `https://` address (through Cloudflare):
-- `wait` returns after at most 90 s (`timed_out: true` if nothing happened); call it again.
 - Request bodies over 100 MB are refused (HTTP 413). Keep snapshots small (code only; data
   goes in datasets registered from a URL or Hugging Face). If a dataset must be uploaded from
   here and is over 100 MB, ask {{OWNER}}.
@@ -34,7 +36,7 @@ When `COMPUTE_URL` is an `https://` address (through Cloudflare):
 
 ## Guest keys: what the network enforces
 
-Unless {{OWNER}} made your key an owner, it is a guest key (`GET /v1/whoami` says
+Unless {{OWNER}} made your key an owner, it is a guest key (`compute whoami` says
 `"scope": "guest"`), and the daemon enforces this:
 
 - **Jobs run sandboxed in a container.** Every job needs `container.image`, a public image
@@ -45,7 +47,7 @@ Unless {{OWNER}} made your key an owner, it is a guest key (`GET /v1/whoami` say
   not. Env and secrets are visible only inside the container.
 - **One node.** `resources.nodes > 1` is refused.
 - **Only the backends {{OWNER}} allows.** By default that's the free ones; {{OWNER}} may allow
-  paid clouds too, with caps per hour and per month. `GET /v1/whoami` lists your `backends`
+  paid clouds too, with caps per hour and per month. `compute whoami` lists your `backends`
   and, per paid backend, your `limits` and what you've spent. On a paid cloud your job gets an
   instance of its own instead of the container sandbox.
 - **Your own things only.** Logs, metrics, outputs, cancel and delete-outputs work on your own
