@@ -118,7 +118,9 @@ when the placement matters.
 Fields:
 
 - **Required:** `title` (≤ 80 chars), `description` (≤ 500 chars), `command` and
-  `resources.time` (`"30m"`, `"2h"`, `"1h30m"`, `"1d"`).
+  `resources.time` (`"30m"`, `"2h"`, `"1h30m"`, `"1d"`). A job with `max_cost_usd` may leave
+  `time` out (or null): it then runs only on paid backends, with as long a limit as
+  `max_cost_usd` buys at the price it is placed at (the dry run's reason says how long).
   - `title` says *what* the job is. `description` says *why* it is being run and what it belongs
     to, so the user can tell jobs apart weeks later.
 - **Resources:** `cpus` (default 1), `mem_gb` (default 4; always set it), `disk_gb` (always
@@ -249,7 +251,8 @@ $/h and per month. `compute whoami` lists `backends` (the ones your key may use)
 (per paid backend: `usd_per_hour`, `usd_per_month`, `in_use_usd_per_hour`,
 `spent_this_month_usd`, `committed_this_month_usd`; null means no cap). A job that would pass a
 cap waits, and its reason names the cap. The monthly cap counts running and placed jobs at their
-full time limit, so a long `time` uses up more of it. Caps only decide whether a job starts: a
+full time limit, so a long `time` uses up more of it (a job with no `time`: its whole
+`max_cost_usd`). Caps only decide whether a job starts: a
 running job is never stopped by one, even if it finishes past it.
 
 1. Send the request with `"max_cost_usd": 5` through `compute submit --dry-run`. The response has `quote_id`,

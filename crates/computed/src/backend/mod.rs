@@ -52,6 +52,9 @@ pub struct Shape {
     /// Cloud: price per hour for the whole job (all nodes).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usd_per_hour: Option<f64>,
+    /// Cloud, for a job with no time limit: the limit its `max_cost_usd` buys at this price.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub time_s: Option<u64>,
 }
 
 fn is_one(n: &u32) -> bool {
@@ -65,6 +68,7 @@ impl Shape {
 }
 
 #[derive(Clone, Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum Quote {
     Ok { start: DateTime<Utc>, source: String, reason: String, shape: Shape, cost: Option<f64> },
     /// `permanent` means this backend can never run the job as asked (not just "busy" or "down").

@@ -271,6 +271,7 @@ const GUEST_RESTRICTIONS: &[&str] = &[
 
 /// Changes within v1 that a running agent should know about, newest first.
 const CHANGES: &[(&str, &str)] = &[
+    ("2026-11-26", "resources.time may be left out (or null) on a job with max_cost_usd: it then runs only on paid backends, until it has spent max_cost_usd. Placement works its limit out from the price (boot included) and stores it in resources.time_s; resources show `no_time_limit: true`, and the quote's reason says how long it gets. PATCH /v1/jobs/{id} with resources.time null removes a waiting job's limit."),
     ("2026-11-26", "PATCH /v1/jobs/{id} edits a waiting or queued job: title, description, resources (cpus, mem_gb, gpus, gpu_type, disk_gb, time; send only what changes), backends, priority, max_cost_usd (null clears gpu_type, disk_gb, backends, max_cost_usd). ?array=1 edits every waiting or queued task of an array. The job is checked as a submit is and placed afresh; a job already placed answers 409 not_editable. Owners may edit any job, guests their own. CLI: `compute edit <id> <json>`."),
     ("2026-11-26", "GET /v1/whoami also lists `backends_not_allowed`, `secrets` (names your jobs may use), `secrets_not_allowed`, and for guest keys `restrictions` (what the network refuses them). GET /v1/secrets marks secrets shared with a guest key `shared: true`."),
     ("2026-11-26", "The owner can share secrets with a guest key (Users page, Access: `secrets` in the key's policy). A shared secret is listed by GET /v1/secrets and usable in the key's jobs (`secrets`) and Hugging Face datasets, but only its creator can replace or delete it."),
@@ -554,7 +555,7 @@ async fn submit(State(s): State<AppState>, sess: Session, body: Result<Json<Valu
             "reason": b.map(|b| b.reason.clone()),
             "estimated_start": b.map(|b| fmt(&s.tz, b.start)),
             "estimated_start_source": b.map(|b| b.source.clone()),
-            "estimated_finish": b.map(|b| fmt(&s.tz, b.start + chrono::Duration::seconds(res.time_s as i64))),
+            "estimated_finish": b.map(|b| fmt(&s.tz, b.start + chrono::Duration::seconds(b.shape.time_s.unwrap_or(res.time_s) as i64))),
             "estimated_cost_usd": b.and_then(|b| b.cost),
         })
     };
@@ -792,7 +793,7 @@ fn job_short(tz: &Tz, j: &Job) -> Value {
 fn resources_json(r: &crate::model::Resources) -> Value {
     json!({
         "nodes": r.nodes, "cpus": r.cpus, "mem_gb": (r.mem_mb as f64 / 1024.0), "gpus": r.gpus,
-        "gpu_type": r.gpu_type, "time_s": r.time_s,
+        "gpu_type": r.gpu_type, "time_s": r.time_s, "no_time_limit": r.no_time_limit,
         "disk_gb": (r.disk_mb > 0).then(|| r.disk_mb as f64 / 1024.0),
     })
 }
@@ -1201,7 +1202,7 @@ fn present<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(d: D) -> Resul
 }
 
 /// `PATCH /v1/jobs/{id}`: the fields of a waiting or queued job that may change. Absent fields
-/// stay; null clears `gpu_type`, `disk_gb`, `backends` and `max_cost_usd`.
+/// stay; null clears `gpu_type`, `disk_gb`, `time` (no limit), `backends` and `max_cost_usd`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct JobEdit {
@@ -1225,7 +1226,8 @@ struct ResourcesEdit {
     gpu_type: Option<Option<String>>,
     #[serde(default, deserialize_with = "present")]
     disk_gb: Option<Option<f64>>,
-    time: Option<String>,
+    #[serde(default, deserialize_with = "present")]
+    time: Option<Option<String>>,
 }
 
 /// The states in which a job may be edited: not yet placed on a backend.
@@ -1319,6 +1321,12 @@ async fn edit_job(
                 return Err(ApiError::bad_request("`max_cost_usd` must be positive", "e.g. 5, or null to keep the job off paid backends"));
             }
             j.spec.max_cost_usd = m;
+        }
+        if j.resources.no_time_limit && j.spec.max_cost_usd.is_none() {
+            return Err(ApiError::bad_request(
+                "a job with no time limit needs max_cost_usd",
+                "give resources.time (e.g. \"2h\"), or keep max_cost_usd: the job runs until it has spent it",
+            ));
         }
         // Checked as the submitting key: a guest's job (sandboxed) stays within the guest's policy.
         backends_known(&s, j.backends.as_ref())?;

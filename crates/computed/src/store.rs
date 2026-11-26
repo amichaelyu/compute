@@ -463,6 +463,12 @@ impl Store {
         Ok(self.conn().execute(&sql, params_from_iter(args))? > 0)
     }
 
+    /// Stores a job's resources (the time limit a placement worked out for a job with none).
+    pub fn set_resources(&self, id: i64, r: &Resources) -> Result<()> {
+        self.conn().execute("UPDATE jobs SET resources = ?1 WHERE id = ?2", params![serde_json::to_string(r)?, id])?;
+        Ok(())
+    }
+
     /// Replaces a job's editable fields (title, description, resources, backends, priority,
     /// spec) and its placement estimate, only while it is in one of `states`. Returns whether
     /// it applied.

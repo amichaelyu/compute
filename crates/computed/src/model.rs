@@ -83,7 +83,10 @@ pub struct ResourcesReq {
     /// Disk the job needs free for its outputs and working files, in GB.
     #[serde(default)]
     pub disk_gb: Option<f64>,
-    pub time: String,
+    /// The time limit. Absent or null: none, for a job on paid backends only, which then runs
+    /// until it has spent `max_cost_usd` (its limit is worked out from the price it is placed at).
+    #[serde(default)]
+    pub time: Option<String>,
 }
 
 fn one() -> u32 {
@@ -284,10 +287,15 @@ pub struct Resources {
     pub mem_mb: u64,
     pub gpus: u32,
     pub gpu_type: Option<String>,
+    /// The time limit. For a job with `no_time_limit`, 0 until it is placed, then the limit
+    /// its `max_cost_usd` buys on the backend it was placed on.
     pub time_s: u64,
     /// Free disk the job needs (0: not stated).
     #[serde(default)]
     pub disk_mb: u64,
+    /// No time limit was given: the job runs on paid backends only, until `max_cost_usd` is spent.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub no_time_limit: bool,
 }
 
 /// Parses `2h`, `90m`, `1h30m`, `45s`, `1d` (and combinations) into a duration.
@@ -419,6 +427,12 @@ impl JobRequest {
             return Err(ApiError::bad_request("`quote_id` without `max_cost_usd`", "quotes are only for jobs that may run on paid backends"));
         }
         let res = r.check()?;
+        if res.no_time_limit && self.max_cost_usd.is_none() {
+            return Err(ApiError::bad_request(
+                "`resources.time` is required",
+                "give a limit (e.g. \"2h\"), or set max_cost_usd to run on paid backends with no limit: the job then runs until it has spent max_cost_usd",
+            ));
+        }
         if let Some(os) = &self.os
             && os != "mac" && os != "linux" {
                 return Err(ApiError::bad_request("`os` must be \"mac\" or \"linux\"", "or leave it null"));
@@ -466,20 +480,24 @@ impl ResourcesReq {
         if self.gpu_type.as_deref().is_some_and(|t| t.trim().is_empty()) {
             return Err(ApiError::bad_request("`resources.gpu_type` is empty", "e.g. \"H100\", or null for any GPU"));
         }
-        let time = parse_duration(&self.time).ok_or_else(|| {
-            ApiError::bad_request(
-                format!("`resources.time` {:?} is not a duration", self.time),
-                "use forms like \"30m\", \"2h\", \"1h30m\", \"1d\"",
-            )
-        })?;
+        let time = match &self.time {
+            None => None,
+            Some(t) => Some(parse_duration(t).ok_or_else(|| {
+                ApiError::bad_request(
+                    format!("`resources.time` {t:?} is not a duration"),
+                    "use forms like \"30m\", \"2h\", \"1h30m\", \"1d\", or null for no limit (paid backends only)",
+                )
+            })?),
+        };
         Ok(Resources {
             nodes: self.nodes,
             cpus: self.cpus,
             mem_mb: (self.mem_gb * 1024.0).ceil() as u64,
             gpus: self.gpus,
             gpu_type: self.gpu_type.clone(),
-            time_s: time.as_secs(),
+            time_s: time.map_or(0, |t| t.as_secs()),
             disk_mb: self.disk_gb.map(|d| (d * 1024.0).ceil() as u64).unwrap_or(0),
+            no_time_limit: time.is_none(),
         })
     }
 }
@@ -494,7 +512,7 @@ impl From<&Resources> for ResourcesReq {
             gpus: r.gpus,
             gpu_type: r.gpu_type.clone(),
             disk_gb: (r.disk_mb > 0).then(|| r.disk_mb as f64 / 1024.0),
-            time: format!("{}s", r.time_s),
+            time: (!r.no_time_limit).then(|| format!("{}s", r.time_s)),
         }
     }
 }

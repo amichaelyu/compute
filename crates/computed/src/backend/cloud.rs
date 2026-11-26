@@ -39,7 +39,18 @@ const CREATE_TRIES: usize = 4;
 const STAGING_ALLOWANCE_S: u64 = 1800;
 /// Room after the time limit for the runner to stop and the outputs to be copied off.
 const COLLECT_ALLOWANCE_S: u64 = 900;
+/// The shortest run a job with no time limit is placed for: under it, max_cost_usd is too low.
+const MIN_OPEN_LIMIT_S: u64 = 600;
 const MASTER_PORT: u16 = 29500;
+
+/// `5h30m`-style hours and minutes.
+fn hm(secs: u64) -> String {
+    match (secs / 3600, secs % 3600 / 60) {
+        (0, m) => format!("{m}m"),
+        (h, 0) => format!("{h}h"),
+        (h, m) => format!("{h}h{m:02}m"),
+    }
+}
 
 /// One way to rent the GPUs a job asks for.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -758,11 +769,21 @@ impl Backend for Cloud {
             return Quote::no("no capacity right now for the GPUs asked", false);
         };
         let boot = b.boot();
-        let hours = (r.time_s as f64 + boot) / 3600.0;
         // Providers that bill CPU and memory separately (Modal) list those rates in hosts.toml.
         let extras = b.ccfg.cpu_rate * f64::from(r.cpus) + b.ccfg.mem_gb_rate * (r.mem_mb as f64 / 1024.0);
         let per_hour = (o.usd_per_hour + extras) * f64::from(r.nodes);
-        let cost = (per_hour * hours * 100.0).ceil() / 100.0;
+        // No time limit given: the job may run for as long as max_cost_usd pays for, boot included.
+        let limit = r.no_time_limit.then(|| (max / per_hour * 3600.0 - boot).floor().max(0.0) as u64);
+        if let Some(t) = limit
+            && t < MIN_OPEN_LIMIT_S
+        {
+            return Quote::no(
+                format!("max_cost_usd {max} buys only {} min at ${per_hour:.2}/h, boot included; raise it", t / 60),
+                true,
+            );
+        }
+        let hours = (limit.unwrap_or(r.time_s) as f64 + boot) / 3600.0;
+        let cost = ((per_hour * hours * 100.0).ceil() / 100.0).min(if limit.is_some() { max } else { f64::INFINITY });
         if cost > max {
             let cheapest = fitting.iter().map(|o| o.usd_per_hour).fold(f64::INFINITY, f64::min) * f64::from(r.nodes) * hours;
             return Quote::no(
@@ -780,16 +801,23 @@ impl Backend for Cloud {
             nodes: r.nodes,
             offer: serde_json::to_value(o).ok(),
             usd_per_hour: Some(per_hour),
+            time_s: limit,
             ..Default::default()
         };
         let nodes = if r.nodes > 1 { format!("{} nodes x ", r.nodes) } else { String::new() };
         Quote::Ok {
             start: Utc::now() + chrono::Duration::seconds(boot as i64),
             source: "provider".into(),
-            reason: if o.gpus == 0 {
-                format!("{} ({} vCPU, {} GB) at ${:.2}/h on {}", o.gpu_type, o.cpus, o.mem_gb, per_hour, b.cfg.name)
-            } else {
-                format!("{nodes}{} x{} at ${:.2}/h on {}", o.gpu_type, o.gpus, per_hour, b.cfg.name)
+            reason: {
+                let what = if o.gpus == 0 {
+                    format!("{} ({} vCPU, {} GB) at ${:.2}/h on {}", o.gpu_type, o.cpus, o.mem_gb, per_hour, b.cfg.name)
+                } else {
+                    format!("{nodes}{} x{} at ${:.2}/h on {}", o.gpu_type, o.gpus, per_hour, b.cfg.name)
+                };
+                match limit {
+                    Some(t) => format!("{what}; no time limit given, so up to {} (what max_cost_usd buys)", hm(t)),
+                    None => what,
+                }
             },
             shape,
             cost: Some(cost),

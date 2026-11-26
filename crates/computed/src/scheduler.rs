@@ -5,7 +5,7 @@
 use crate::backend::{Alloc, Backend, Quote, Shape, StageFiles};
 use crate::config::{BackendKind, BudgetConfig, Paths, RegistryConfig};
 use crate::images::ImageStatus;
-use crate::model::{DepRef, Job, JobState};
+use crate::model::{DepRef, Job, JobState, Resources};
 use crate::policy::KeyPolicy;
 use crate::secrets::Secrets;
 use crate::snapshots::Snapshots;
@@ -251,7 +251,9 @@ impl Scheduler {
     /// Returns the job as stored, or None when it went back.
     fn claimed(&self, job: &Job, from: JobState) -> Result<Option<Job>> {
         let Some(cur) = self.store.get_job(job.id)? else { return Ok(None) };
-        if cur.resources == job.resources && cur.backends == job.backends && cur.spec == job.spec {
+        // A job with no time limit gets one from each placement: that isn't an edit.
+        let limit = |r: &Resources| if r.no_time_limit { Resources { time_s: 0, ..r.clone() } } else { r.clone() };
+        if limit(&cur.resources) == limit(&job.resources) && cur.backends == job.backends && cur.spec == job.spec {
             return Ok(Some(cur));
         }
         let back = JobUpdate {
@@ -612,7 +614,7 @@ impl Scheduler {
     async fn native_dependency(&self, job: &Job, parents: &[Job], latest: Option<DateTime<Utc>>) -> Result<Option<(String, Shape, DateTime<Utc>)>> {
         let Some(first) = parents.first().and_then(|p| p.backend.clone()) else { return Ok(None) };
         let Some(b) = self.backend(&first) else { return Ok(None) };
-        if b.config().kind != BackendKind::Slurm {
+        if b.config().kind != BackendKind::Slurm || job.resources.no_time_limit {
             return Ok(None);
         }
         let mut ok_ids = Vec::new();
@@ -1137,6 +1139,8 @@ impl Scheduler {
                 Quote::no(format!("your key may not use {name}; ask the network's owner"), true)
             } else if b.is_paid() && job.spec.max_cost_usd.is_none() {
                 Quote::no("paid backend; set max_cost_usd to allow it", true)
+            } else if !b.is_paid() && job.resources.no_time_limit {
+                Quote::no("no time limit given, so only paid backends (where max_cost_usd bounds it) may run it; set resources.time", true)
             } else if !self.enabled(&name)?.0 {
                 Quote::no(format!("{name} is disabled"), false)
             } else if !self.runtime(&name).reachable || b.root().is_none() {
@@ -1268,6 +1272,13 @@ impl Scheduler {
             };
             let Best { backend: name, start, ready, source, reason, shape, cost } = best;
             let Some(backend) = self.backend(&name) else { continue };
+            // No time limit given: this placement's price sets one (what max_cost_usd buys).
+            let mut job = job;
+            if job.resources.no_time_limit
+                && let Some(t) = shape.time_s
+            {
+                job.resources.time_s = t;
+            }
             let finish = start + chrono::Duration::seconds(self.expected_secs(&job));
             let kind = backend.config().kind;
             // `ready`, not `start`: the dataset copy is part of staging, so a job that only waits
@@ -1320,14 +1331,19 @@ impl Scheduler {
             )? {
                 continue;
             }
-            let Some(job) = self.claimed(&job, JobState::Queued)? else { continue };
+            let Some(mut job) = self.claimed(&job, JobState::Queued)? else { continue };
+            if job.resources.no_time_limit
+                && let Some(t) = shape.time_s
+            {
+                job.resources.time_s = t;
+                self.store.set_resources(job.id, &job.resources)?;
+            }
             if backend.is_paid()
                 && let Some(rate) = shape.usd_per_hour
             {
                 let cost = cost.unwrap_or(rate * job.resources.time_s as f64 / 3600.0);
                 lock(&self.reserved).insert(job.id, PaidHold { rate, backend: name.clone(), key: job.key_fingerprint.clone(), cost });
             }
-            let mut job = job;
             job.state = JobState::Staging;
             job.backend = Some(name.clone());
             if kind == BackendKind::Slurm {
