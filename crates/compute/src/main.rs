@@ -99,8 +99,9 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         timeout: u64,
     },
-    /// Edit a waiting or queued job: a JSON file, "-" for stdin, or inline JSON with only the
-    /// fields to change, e.g. '{"resources": {"gpu_type": "H100"}}'
+    /// Edit a waiting or queued job (a running one: only its time limit, e.g.
+    /// '{"resources": {"time": "6h"}}'): a JSON file, "-" for stdin, or inline JSON with only
+    /// the fields to change, e.g. '{"resources": {"gpu_type": "H100"}}'
     Edit {
         id: i64,
         /// The changes: title, description, resources {cpus, mem_gb, gpus, gpu_type, disk_gb, time}, backends, priority, max_cost_usd

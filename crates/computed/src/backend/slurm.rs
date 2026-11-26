@@ -508,6 +508,10 @@ impl Backend for SlurmBackend {
         Ok(())
     }
 
+    async fn set_time_limit(&self, _job: &Job, _time_s: u64) -> Result<()> {
+        bail!("Slurm lets only its admins raise a running job's time limit (--time)")
+    }
+
     async fn shell_for(&self, _job: Option<&Job>) -> Result<(Arc<dyn Shell>, String)> {
         Ok((self.remote.shell().await?, self.remote.root_or_err()?))
     }

@@ -233,7 +233,15 @@ start_docker() {
       [ -c "$d" ] && args+=(--device "$d")
     done
   fi
-  [ -n "${NODE_RANK:-}" ] && args+=(--network host --ipc host)
+  if [ -n "${NODE_RANK:-}" ]; then
+    args+=(--network host --ipc host)
+  else
+    # Docker's default /dev/shm is 64 MB, too small for PyTorch DataLoader workers (they pass
+    # batches through it). Half the job's memory; what's written there counts against --memory.
+    shm_mb=8192
+    [ "${JOB_MEM_MB:-0}" -gt 0 ] && shm_mb=$((JOB_MEM_MB / 2))
+    args+=(--shm-size "${shm_mb}m")
+  fi
   if [ -n "$sandbox" ]; then
     start_guard
     args+=(--network "container:$guard_name" --security-opt no-new-privileges
@@ -363,11 +371,19 @@ kill_job() {
 final=""
 last_beat=$started
 last_sample=0
+# The daemon may change the time limit of the running job by writing time_limit (seconds from
+# the start); this file tells it this runner reads it.
+echo time_limit > "$jobdir/runner_features"
 while kill -0 "$pid" 2>/dev/null; do
   now=$(date +%s)
   if [ $((now - last_sample)) -ge 10 ]; then
     sample_metrics
     last_sample=$now
+    if [ -f "$jobdir/time_limit" ]; then
+      t=$(tr -dc 0-9 < "$jobdir/time_limit")
+      [ -n "$t" ] && [ "$t" != "${JOB_TIMEOUT_S:-0}" ] && JOB_TIMEOUT_S=$t &&
+        echo "compute: time limit set to ${JOB_TIMEOUT_S}s" >> "$jobdir/log"
+    fi
   fi
   if [ -f "$jobdir/cancel" ]; then
     final=cancelled

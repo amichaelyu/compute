@@ -266,6 +266,10 @@ impl Backend for LocalBackend {
         self.remote.touch_cancel(job.id).await
     }
 
+    async fn set_time_limit(&self, job: &Job, time_s: u64) -> Result<()> {
+        self.remote.set_time_limit(job.id, time_s).await
+    }
+
     async fn refresh(&self) -> Result<()> {
         let root = self.remote.root_or_err()?;
         let out = self.remote.shell().await?.run(&format!("ROOT={}\n{RESOURCES}", shell_quote(&root))).await?.text();

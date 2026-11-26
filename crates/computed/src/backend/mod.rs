@@ -169,6 +169,10 @@ pub trait Backend: Send + Sync {
     /// A tar stream of the job's outputs (optionally only files matching `glob`).
     async fn fetch(&self, job: &Job, glob: Option<&str>) -> Result<Reader>;
     async fn cancel(&self, job: &Job) -> Result<()>;
+    /// Changes a running job's time limit to `time_s` (from its start).
+    async fn set_time_limit(&self, _job: &Job, _time_s: u64) -> Result<()> {
+        bail!("{} can't change a running job's time limit", self.name())
+    }
     async fn availability(&self) -> Result<serde_json::Value>;
     /// A shell and root for the backend's host (`None`) or for a job's own instance (cloud).
     async fn shell_for(&self, job: Option<&Job>) -> Result<(Arc<dyn Shell>, String)>;
@@ -560,6 +564,20 @@ impl Remote {
         let script = format!("cat {d}/metrics.json 2>/dev/null || echo null\necho ---\ntail -n {history} {d}/metrics.jsonl 2>/dev/null || true");
         let out = self.shell().await?.run(&script).await?.text();
         Ok(parse_metrics(&out))
+    }
+
+    /// Tells job `id`'s runner its new time limit. Fails when the runner is older than the
+    /// `time_limit` file (it read its limit once, at the start).
+    pub async fn set_time_limit(&self, id: i64, time_s: u64) -> Result<()> {
+        let root = self.root_or_err()?;
+        let d = shell_quote(&Self::jobdir(&root, id));
+        let script = format!(
+            "if grep -qx time_limit {d}/runner_features 2>/dev/null; then echo {time_s} > {d}/time_limit.tmp && mv -f {d}/time_limit.tmp {d}/time_limit && echo ok; else echo old; fi"
+        );
+        match self.shell().await?.run(&script).await?.text().trim() {
+            "ok" => Ok(()),
+            _ => bail!("the job's runner started before time limits could be changed (it read its limit once, at the start)"),
+        }
     }
 
     pub async fn touch_cancel(&self, id: i64) -> Result<()> {

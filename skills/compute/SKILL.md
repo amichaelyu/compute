@@ -321,6 +321,7 @@ compute jobs --array 7                           # tasks of array 7
 compute api GET '/v1/jobs?limit=1000&before=812' # older jobs: page back by the smallest id seen
 compute job 42                                   # state, reason, times, cost (-v: command and env)
 compute edit 42 '{"resources": {"gpu_type": "H100"}}'  # change a waiting/queued job (--array: all tasks)
+compute edit 42 '{"resources": {"time": "6h"}}'        # a running job: a longer (or shorter) limit, from its start
 compute cancel 42                                # --array cancels a whole array
 compute delete-outputs 42                        # free a finished job's disk
 ```

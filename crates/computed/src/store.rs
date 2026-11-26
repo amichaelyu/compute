@@ -463,6 +463,26 @@ impl Store {
         Ok(self.conn().execute(&sql, params_from_iter(args))? > 0)
     }
 
+    /// The open cost row of job `id`, if it is billed now: `(USD per hour, billed since)`.
+    pub fn open_cost(&self, id: i64) -> Result<Option<(f64, DateTime<Utc>)>> {
+        let row = self
+            .conn()
+            .query_row("SELECT rate_usd_h, started_at FROM cloud_costs WHERE job_id = ?1 AND ended_at IS NULL", params![id], |r| {
+                Ok((r.get::<_, f64>(0)?, r.get::<_, String>(1)?))
+            })
+            .optional()?;
+        Ok(row.and_then(|(rate, at)| Some((rate, parse_ts(Some(at))?))))
+    }
+
+    /// A running job's new time limit (and cost cap) and the finish that follows from it.
+    pub fn set_running_limit(&self, j: &Job, est_finish: DateTime<Utc>) -> Result<bool> {
+        let n = self.conn().execute(
+            "UPDATE jobs SET resources = ?1, spec = ?2, est_finish = ?3 WHERE id = ?4 AND state = 'running'",
+            params![serde_json::to_string(&j.resources)?, serde_json::to_string(&j.spec)?, ts(est_finish), j.id],
+        )?;
+        Ok(n > 0)
+    }
+
     /// Stores a job's resources (the time limit a placement worked out for a job with none).
     pub fn set_resources(&self, id: i64, r: &Resources) -> Result<()> {
         self.conn().execute("UPDATE jobs SET resources = ?1 WHERE id = ?2", params![serde_json::to_string(r)?, id])?;

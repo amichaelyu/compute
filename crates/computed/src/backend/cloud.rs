@@ -1027,6 +1027,31 @@ impl Backend for Cloud {
         Ok(())
     }
 
+    /// Moves the runner's limit on every node, the instance's own deadline (RunPod's idle timer)
+    /// and the deadline the sweep tears it down by. Modal's sandbox timeout is fixed at creation.
+    async fn set_time_limit(&self, job: &Job, time_s: u64) -> Result<()> {
+        let b = &self.0;
+        if b.cfg.kind == BackendKind::Modal {
+            bail!("Modal sandboxes have a timeout fixed when they are created");
+        }
+        let mut inst = b.instance(job, false).await?;
+        for rank in 0..inst.nodes.len() {
+            b.remote(&inst, rank)?.set_time_limit(job.id, time_s).await?;
+        }
+        let started = job.started_at.unwrap_or_else(Utc::now);
+        inst.deadline = started + chrono::Duration::seconds((time_s + COLLECT_ALLOWANCE_S) as i64);
+        let left = (inst.deadline - Utc::now()).num_seconds().max(0) as u64;
+        for node in &inst.nodes {
+            let shell = b.provider.shell(node)?;
+            b.provider.extend_deadline(shell.as_ref(), left).await?;
+        }
+        b.instances.lock().await.insert(job.id, inst.clone());
+        let mut handle = job.handle.clone().unwrap_or_else(|| json!({}));
+        handle["instance"] = serde_json::to_value(&inst)?;
+        b.store.update_job_if(job.id, &[JobState::Running], JobUpdate { handle: Some(Some(handle)), ..Default::default() })?;
+        Ok(())
+    }
+
     async fn availability(&self) -> Result<Value> {
         let b = &self.0;
         let offers = b.cached_offers(&Need::any_gpu()).await?;

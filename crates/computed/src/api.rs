@@ -271,6 +271,8 @@ const GUEST_RESTRICTIONS: &[&str] = &[
 
 /// Changes within v1 that a running agent should know about, newest first.
 const CHANGES: &[(&str, &str)] = &[
+    ("2026-11-26", "PATCH /v1/jobs/{id} on a running job changes its time limit: {\"resources\": {\"time\": \"6h\"}} (the whole limit, from its start), optionally with max_cost_usd. On a paid backend the attempt's cost at the new limit must fit max_cost_usd (422 over_max_cost) and the key's monthly cap (422 over_key_limit). Local hosts, RunPod and Lambda can; Slurm and Modal can't (409 not_editable), nor jobs whose runner started before this change."),
+    ("2026-11-26", "Docker containers get /dev/shm of half the job's memory (8 GB when it sets none) instead of Docker's 64 MB, so PyTorch DataLoader workers have room."),
     ("2026-11-26", "resources.time may be left out (or null) on a job with max_cost_usd: it then runs only on paid backends, until it has spent max_cost_usd. Placement works its limit out from the price (boot included) and stores it in resources.time_s; resources show `no_time_limit: true`, and the quote's reason says how long it gets. PATCH /v1/jobs/{id} with resources.time null removes a waiting job's limit."),
     ("2026-11-26", "PATCH /v1/jobs/{id} edits a waiting or queued job: title, description, resources (cpus, mem_gb, gpus, gpu_type, disk_gb, time; send only what changes), backends, priority, max_cost_usd (null clears gpu_type, disk_gb, backends, max_cost_usd). ?array=1 edits every waiting or queued task of an array. The job is checked as a submit is and placed afresh; a job already placed answers 409 not_editable. Owners may edit any job, guests their own. CLI: `compute edit <id> <json>`."),
     ("2026-11-26", "GET /v1/whoami also lists `backends_not_allowed`, `secrets` (names your jobs may use), `secrets_not_allowed`, and for guest keys `restrictions` (what the network refuses them). GET /v1/secrets marks secrets shared with a guest key `shared: true`."),
@@ -1258,6 +1260,9 @@ async fn edit_job(
     for j in &jobs {
         sess.require_job(j)?;
     }
+    if !array && jobs[0].state == JobState::Running {
+        return edit_running(&s, &sess, &jobs[0], &edit).await;
+    }
     let editable: Vec<&Job> = jobs.iter().filter(|j| EDITABLE.contains(&j.state)).collect();
     if editable.is_empty() {
         let what = if array { format!("no task of array {id} is") } else { format!("job {id} is {}, not", jobs[0].state.as_str()) };
@@ -1265,7 +1270,7 @@ async fn edit_job(
             StatusCode::CONFLICT,
             "not_editable",
             format!("{what} waiting or queued"),
-            "only jobs not yet placed can be edited; cancel it and submit again",
+            "only jobs not yet placed can be edited (a running one: only resources.time and max_cost_usd); cancel it and submit again",
         ));
     }
 
@@ -1366,6 +1371,93 @@ async fn edit_job(
         return Ok(Json(v));
     }
     Ok(Json(json!({"edited": edited, "skipped": skipped, "per_backend": per_backend})))
+}
+
+/// `PATCH /v1/jobs/{id}` on a running job: a new time limit (from its start), and optionally a
+/// new `max_cost_usd` to pay for it. On a paid backend the attempt's cost at the new limit
+/// (billed since its instance was created) must stay within max_cost_usd and the key's monthly
+/// cap. The backend moves the runner's limit and the instance's deadlines.
+async fn edit_running(s: &AppState, sess: &Session, job: &Job, edit: &JobEdit) -> ApiResult<Json<Value>> {
+    let refuse = |m: String| ApiError::new(StatusCode::CONFLICT, "not_editable", m, "a running job's resources.time (and max_cost_usd) can change, nothing else");
+    let r = edit.resources.as_ref();
+    let other = edit.title.is_some()
+        || edit.description.is_some()
+        || edit.backends.is_some()
+        || edit.priority.is_some()
+        || r.is_some_and(|r| r.cpus.is_some() || r.mem_gb.is_some() || r.gpus.is_some() || r.gpu_type.is_some() || r.disk_gb.is_some());
+    if other {
+        return Err(refuse(format!("job {} is running", job.id)));
+    }
+    let Some(Some(time)) = r.and_then(|r| r.time.clone()) else {
+        return Err(refuse(format!("job {} is running: give its new resources.time", job.id)));
+    };
+    let new_s = crate::model::parse_duration(&time)
+        .ok_or_else(|| ApiError::bad_request(format!("`resources.time` {time:?} is not a duration"), "e.g. \"6h\": the whole limit, counted from the job's start"))?
+        .as_secs();
+    let now = Utc::now();
+    let started = job.started_at.unwrap_or(now);
+    let elapsed = (now - started).num_seconds().max(0) as u64;
+    if new_s < elapsed + 60 {
+        return Err(ApiError::bad_request(
+            format!("the job has run {elapsed}s already; a new limit must leave it at least a minute"),
+            "the limit counts from the job's start",
+        ));
+    }
+    let mut j = job.clone();
+    if let Some(m) = edit.max_cost_usd {
+        match m {
+            Some(m) if m > 0.0 && m.is_finite() => j.spec.max_cost_usd = Some(m),
+            _ => return Err(ApiError::bad_request("a running job's `max_cost_usd` must be positive", "e.g. 20")),
+        }
+    }
+    let name = job.backend.clone().unwrap_or_default();
+    let backend = s.sched.backend(&name).ok_or_else(|| refuse(format!("job {} has no backend it runs on", job.id)))?;
+    let mut cost = None;
+    if backend.is_paid()
+        && let Some((rate, billed_since)) = s.sched.store.open_cost(job.id)?
+    {
+        let hours = ((started - billed_since).num_seconds().max(0) as u64 + new_s) as f64 / 3600.0;
+        let c = (rate * hours * 100.0).ceil() / 100.0;
+        if let Some(max) = j.spec.max_cost_usd
+            && c > max
+        {
+            return Err(ApiError::new(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "over_max_cost",
+                format!("~${c:.2} at ${rate:.2}/h for a {time} limit is over max_cost_usd {max}"),
+                "raise max_cost_usd in the same edit",
+            ));
+        }
+        let policy = s.sched.store.key_policy(&job.key_fingerprint)?;
+        if let Some(cap) = policy.limits.get(&name).and_then(|l| l.usd_per_month) {
+            let u = s.sched.key_usage(&job.key_fingerprint, &name, job.id)?;
+            if u.committed + c > cap {
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "over_key_limit",
+                    format!("~${c:.2} would pass the key's monthly limit of ${cap:.2} on {name}: ${:.2} spent or committed this month", u.committed),
+                    "ask for a shorter limit, or ask the network's owner to raise the cap",
+                ));
+            }
+        }
+        cost = Some(c);
+    }
+    backend
+        .set_time_limit(job, new_s)
+        .await
+        .map_err(|e| ApiError::new(StatusCode::CONFLICT, "not_editable", format!("{e:#}"), "cancel it and submit again with a longer resources.time"))?;
+    j.resources.time_s = new_s;
+    j.resources.no_time_limit = false;
+    let finish = started + chrono::Duration::seconds(new_s as i64);
+    if !s.sched.store.set_running_limit(&j, finish)? {
+        return Err(ApiError::new(StatusCode::CONFLICT, "not_editable", format!("job {} ended while its limit was being changed", job.id), ""));
+    }
+    tracing::info!("job {} time limit set to {new_s}s by {} ({})", job.id, sess.name, sess.fingerprint);
+    let j = load_job(s, job.id)?;
+    let mut v = job_view(&s.tz, &j, false, sess);
+    add_people(s, &j, &mut v, &mut HashMap::new())?;
+    v["estimated_cost_usd"] = cost.into();
+    Ok(Json(v))
 }
 
 // ------------------------------------------------------------------ backends
