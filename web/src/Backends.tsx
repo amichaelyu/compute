@@ -61,11 +61,11 @@ function localRows(h: Obj): Rows {
   return rows;
 }
 
-const SHOWN_GPUS = 6;
+/** Rows per column of the GPU price list before it starts another column. */
+const GPU_ROWS = 8;
 
-/** A cloud's in-stock GPU types as a price list, cheapest first; the rest fold away. */
+/** A cloud's in-stock GPU types as a price list, cheapest first, in balanced columns. */
 function CloudGpus({ h }: { h: Obj }) {
-  const [all, setAll] = useState(false);
   const types = Object.entries(obj(h.gpu_types))
     .map(([t, v]) => [t, obj(v)] as const)
     .filter(([, v]) => v.available)
@@ -76,25 +76,25 @@ function CloudGpus({ h }: { h: Obj }) {
       return { name: m ? m[1]! : t, spec: m ? m[2]! : "", price: num(v.usd_per_hour_per_gpu) };
     });
   if (!types.length) return <p className="muted">No GPUs in stock right now.</p>;
-  const shown = all ? types : types.slice(0, SHOWN_GPUS);
-  const hidden = types.length - shown.length;
+  const cols = Math.min(3, Math.ceil(types.length / GPU_ROWS));
+  const per = Math.ceil(types.length / cols);
+  const chunks = Array.from({ length: cols }, (_, i) => types.slice(i * per, (i + 1) * per));
   return (
     <div>
       <p className="hw-caption muted">{types.length} GPU types in stock, per GPU-hour</p>
-      <ul className="hw-prices">
-        {shown.map((t) => (
-          <li key={t.name + t.spec}>
-            <span>{t.name}</span>
-            <span className="muted">{t.spec}</span>
-            <span className="hw-price">${t.price.toFixed(2)}</span>
-          </li>
+      <div className="hw-price-cols">
+        {chunks.map((chunk, i) => (
+          <ul key={i} className="hw-prices">
+            {chunk.map((t) => (
+              <li key={t.name + t.spec}>
+                <span>{t.name}</span>
+                <span className="muted">{t.spec}</span>
+                <span className="hw-price">${t.price.toFixed(2)}</span>
+              </li>
+            ))}
+          </ul>
         ))}
-      </ul>
-      {types.length > SHOWN_GPUS && (
-        <button className="link hw-more" aria-expanded={all} onClick={() => setAll(!all)}>
-          {all ? "Show the cheapest only" : `Show ${hidden} more`}
-        </button>
-      )}
+      </div>
     </div>
   );
 }
@@ -199,8 +199,11 @@ function availabilityRows(b: BackendDetail): Rows | null {
     return rows;
   }
   if (b.kind !== "slurm") {
+    const usd = (v: unknown) => `$${num(v ?? 0).toFixed(2)}`;
     return [
-      ["Your instances", String(a.my_instances ?? 0)],
+      ["Spending", `${usd(a.usd_per_hour_now)}/h`],
+      ["This month", `${usd(a.spent_this_month_usd)} spent`],
+      ["Instances", String(a.my_instances ?? 0)],
       ["Boot time", `about ${Math.round(num(a.boot_estimate_s ?? 0) / 60)} min`],
     ];
   }
@@ -285,10 +288,10 @@ function BackendSkeleton() {
         <span className="skel skel-phrase" />
       </header>
       <div className="backend-cols">
-        {[0, 1, 2].map((c) => (
+        {[4, 6].map((lines, c) => (
           <div key={c}>
             <span className="skel skel-word skel-heading" />
-            {[0, 1, 2, 3].map((r) => (
+            {Array.from({ length: lines }, (_, r) => (
               <span key={r} className="skel skel-line" />
             ))}
           </div>
@@ -344,14 +347,6 @@ function Backend({ b, onChange }: { b: BackendDetail; onChange: () => void }) {
         <div>
           <h3>Hardware</h3>
           <Hardware b={b} />
-        </div>
-        <div>
-          <h3>Limits</h3>
-          <ul className="limits">
-            {b.restrictions.map((r) => (
-              <li key={r}>{r}</li>
-            ))}
-          </ul>
         </div>
       </div>
     </section>

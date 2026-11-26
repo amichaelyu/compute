@@ -1244,7 +1244,15 @@ async fn get_backend(State(s): State<AppState>, _sess: Session, Path(name): Path
     if !enabled {
         restrictions.push("currently disabled: takes no new jobs".into());
     }
-    let availability = if enabled { s.sched.availability(&name).await } else { None };
+    let mut availability = if enabled { s.sched.availability(&name).await } else { None };
+    // What a cloud costs now and has cost this month.
+    if b.is_paid()
+        && let Some(Value::Object(a)) = availability.as_mut()
+    {
+        let (rate, spent) = s.sched.backend_spend(&name)?;
+        a.insert("usd_per_hour_now".into(), round2(rate).into());
+        a.insert("spent_this_month_usd".into(), round2(spent).into());
+    }
     Ok(Json(json!({
         "name": name,
         "kind": c.kind.as_str(),

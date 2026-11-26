@@ -1005,7 +1005,9 @@ impl Backend for Cloud {
             .take(12)
             .map(|o| json!({"gpu_type": o.gpu_type, "usd_per_hour": (o.usd_per_hour * 100.0).round() / 100.0}))
             .collect();
-        let running = b.instances.lock().await.len();
+        // Instances still billing, from the cost records (the in-memory map is empty after a
+        // restart until each job is polled).
+        let running = b.store.costs_since(chrono::Utc::now())?.iter().filter(|r| r.4.is_none() && r.1 == b.cfg.name).count();
         Ok(json!({"in_stock": available, "my_instances": running, "boot_estimate_s": b.boot().round()}))
     }
 

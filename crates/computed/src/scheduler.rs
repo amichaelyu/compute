@@ -895,6 +895,28 @@ impl Scheduler {
         Ok(spent)
     }
 
+    /// One backend's instances billing now (USD per hour) and its spend this month.
+    pub fn backend_spend(&self, backend: &str) -> Result<(f64, f64)> {
+        let now = Utc::now();
+        let since = self.month_start();
+        let (mut rate_now, mut spent) = (0.0, 0.0);
+        for (_, b, rate, started, ended, cost) in self.store.costs_since(since)? {
+            if b != backend {
+                continue;
+            }
+            match (ended, cost) {
+                (Some(_), Some(c)) => spent += c,
+                (_, prior) => {
+                    spent += prior.unwrap_or(0.0) + rate * (now - started.max(since)).num_seconds().max(0) as f64 / 3600.0;
+                    if ended.is_none() {
+                        rate_now += rate;
+                    }
+                }
+            }
+        }
+        Ok((rate_now, spent))
+    }
+
     /// USD per hour of the cloud instances running or about to start, which counts against
     /// `budget.hourly_usd`.
     pub fn hourly_in_use(&self) -> Result<f64> {

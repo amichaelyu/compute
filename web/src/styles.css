@@ -720,8 +720,7 @@ header > .skel,
   border-left: 1px solid var(--rule);
 }
 
-.kv-list,
-.limits {
+.kv-list {
   margin: 0;
   padding-left: 1.1rem;
 }
@@ -797,10 +796,11 @@ header > .skel,
   color: var(--graphite);
 }
 
+/* What the backend is doing now, then its hardware, which gets the room to spread out. */
 .backend-cols {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 2rem;
+  grid-template-columns: minmax(18rem, 1fr) minmax(0, 2fr);
+  gap: 2rem 3rem;
   margin-top: 1rem;
 }
 
@@ -842,9 +842,11 @@ header > .skel,
   text-align: right;
 }
 
-.hw-more {
-  margin-top: 0.35rem;
-  color: var(--graphite);
+.hw-price-cols {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: 0.15rem 3rem;
 }
 
 .hw-part h4 {
