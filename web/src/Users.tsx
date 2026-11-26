@@ -133,8 +133,8 @@ export function Users() {
       <section>
         <h2>Add someone</h2>
         <p className="muted">
-          They run this command. Until their key is added, it prints the public key line to paste below; after that, the
-          same command signs them in and installs the compute skill for Claude Code.
+          They run this command. It prints their public key line for you to paste below, then waits; once you've added
+          it they press Enter, and it signs them in and installs the compute skill for Claude Code.
         </p>
         <InstallCommand />
         <AddUser
@@ -143,18 +143,25 @@ export function Users() {
             refresh();
           }}
         />
-        {added && <p>Added {added}. They can run the command again now.</p>}
+        {added && <p>Added {added}. They can press Enter in the installer now (or run the command again).</p>}
       </section>
       <section>
         <h2>People with access</h2>
         <p className="muted">
-          Everyone here can submit jobs, use any secret and spend the cloud budget. Removing someone signs them out at once.
+          Owners can do everything. Everyone else is a guest: their jobs run sandboxed in a container, they can't use
+          paid backends or others' secrets, and they can only cancel or read their own jobs. Removing someone signs them
+          out at once.
         </p>
         {error && !data && <p className="error">{errorText(error)}</p>}
-        <ul className="user-list">
-          {data?.map((u) => (
-            <UserRow key={u.fingerprint} u={u} onRemoved={refresh} />
-          ))}
+        <ul className="user-list" aria-busy={!data}>
+          {!data && !error
+            ? [0, 1, 2].map((i) => (
+                <li key={i} className="user" aria-hidden="true">
+                  <span className="skel skel-word" />
+                  <span className="skel skel-phrase" />
+                </li>
+              ))
+            : data?.map((u) => <UserRow key={u.fingerprint} u={u} onRemoved={refresh} />)}
         </ul>
       </section>
     </div>

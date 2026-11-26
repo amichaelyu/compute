@@ -176,6 +176,29 @@ button {
 
 /* ---------------------------------------------------------------- lanes */
 
+.spend {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0.5rem 1.25rem;
+  margin-bottom: 1.25rem;
+  font-size: 0.875rem;
+  color: var(--graphite);
+}
+
+.spend-label {
+  font-weight: 600;
+  color: var(--ink);
+}
+
+.spend > .skel {
+  display: inline-block;
+}
+
+.row-cost {
+  white-space: nowrap;
+}
+
 .lanes {
   position: relative;
   padding-top: 1.5rem;
@@ -504,6 +527,53 @@ input[type="search"] {
   z-index: 10;
 }
 
+/* Loading placeholders: grey blocks shaped like the content, pulsing gently. */
+.skel {
+  display: block;
+  height: 0.85rem;
+  border-radius: 4px;
+  background: var(--rule);
+  opacity: 0.55;
+  animation: skel-pulse 1.4s ease-in-out infinite;
+}
+
+header > .skel,
+.user > .skel {
+  display: inline-block;
+}
+
+.skel-title {
+  width: 6rem;
+  height: 1.3rem;
+}
+
+.skel-word {
+  width: 5rem;
+}
+
+.skel-phrase {
+  width: 12rem;
+}
+
+.skel-heading {
+  margin-bottom: 0.75rem;
+}
+
+.skel-line {
+  width: 85%;
+  margin-bottom: 0.55rem;
+}
+
+.skel-line:nth-child(odd) {
+  width: 65%;
+}
+
+@keyframes skel-pulse {
+  50% {
+    opacity: 0.25;
+  }
+}
+
 @keyframes panel-in {
   from {
     transform: translateX(1.5rem);
@@ -512,7 +582,8 @@ input[type="search"] {
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .panel {
+  .panel,
+  .skel {
     animation: none;
   }
 }

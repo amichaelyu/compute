@@ -11,7 +11,7 @@ have and what they allow all come from the API (`GET /v1/backends`), not from th
 
 You describe a job as JSON. The daemon uploads code, picks a backend, runs the job and keeps
 its logs and outputs. This skill targets **API v1**: `GET $COMPUTE_URL/v1/` must list `"v1"`
-in `api_versions`.
+in `api_versions`. Signed in (`cx`), it also lists `changes` to the API, newest first.
 
 ## Configuration
 

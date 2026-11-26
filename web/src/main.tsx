@@ -3,6 +3,7 @@ import "./styles.css";
 import { ApiError, type QueuedJob, getQueue, listBackends, listWorkingJobs, token, whoami } from "./api";
 import { Backends } from "./Backends";
 import { JobList } from "./JobList";
+import { Spend } from "./Spend";
 import { JobPanel } from "./JobPanel";
 import { Lanes } from "./Lanes";
 import { SignIn } from "./SignIn";
@@ -100,6 +101,7 @@ function App() {
           <Users />
         ) : (
           <>
+            <Spend />
             <Lanes jobs={jobs.data ?? []} backends={backends.data ?? []} queues={queues.data ?? {}} now={now} />
             <JobList jobs={jobs.data ?? []} now={now} />
           </>

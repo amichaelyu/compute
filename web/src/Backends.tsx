@@ -190,9 +190,44 @@ function Toggle({ b, onChange }: { b: BackendDetail; onChange: () => void }) {
   );
 }
 
-function Backend({ name }: { name: string }) {
-  const { data: b, error, refresh } = usePoll(() => getBackend(name), 30_000, [name]);
-  if (!b) return <section className="backend">{error ? <p className="error">{error.message}</p> : <h2>{name}</h2>}</section>;
+/** A placeholder shaped like a backend section, shown until every backend has loaded. */
+function BackendSkeleton() {
+  return (
+    <section className="backend" aria-hidden="true">
+      <header>
+        <span className="skel skel-title" />
+        <span className="skel skel-word" />
+        <span className="skel skel-phrase" />
+      </header>
+      <div className="backend-cols">
+        {[0, 1, 2].map((c) => (
+          <div key={c}>
+            <span className="skel skel-word skel-heading" />
+            {[0, 1, 2, 3].map((r) => (
+              <span key={r} className="skel skel-line" />
+            ))}
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+/** Every backend's details, fetched together so the page fills in at once. A backend whose
+ * details fail keeps its summary and the error. */
+async function loadBackends(): Promise<{ name: string; detail: BackendDetail | null; error: string | null }[]> {
+  const list = await listBackends();
+  return Promise.all(
+    list.map((s) =>
+      getBackend(s.name).then(
+        (detail) => ({ name: s.name, detail, error: null }),
+        (e: unknown) => ({ name: s.name, detail: null, error: e instanceof Error ? e.message : String(e) }),
+      ),
+    ),
+  );
+}
+
+function Backend({ b, onChange }: { b: BackendDetail; onChange: () => void }) {
   const status = !b.enabled
     ? "off"
     : !b.reachable
@@ -213,7 +248,7 @@ function Backend({ name }: { name: string }) {
               : `${b.kind} cloud, paid per job`}
         </span>
       </header>
-      <Toggle b={b} onChange={refresh} />
+      <Toggle b={b} onChange={onChange} />
       {b.last_error && !b.reachable && <p className="error">{b.last_error}</p>}
       <div className="backend-cols">
         <div>
@@ -239,11 +274,23 @@ function Backend({ name }: { name: string }) {
 }
 
 export function Backends() {
-  const { data, error } = usePoll(listBackends, 60_000, []);
+  const { data, error, refresh } = usePoll(loadBackends, 30_000, []);
   return (
-    <div className="backends">
+    <div className="backends" aria-busy={!data}>
       {error && !data && <p className="error">{error.message}</p>}
-      {data?.map((b) => <Backend key={b.name} name={b.name} />)}
+      {!data && !error && [0, 1, 2].map((i) => <BackendSkeleton key={i} />)}
+      {data?.map((x) =>
+        x.detail ? (
+          <Backend key={x.name} b={x.detail} onChange={refresh} />
+        ) : (
+          <section key={x.name} className="backend">
+            <header>
+              <h2>{x.name}</h2>
+            </header>
+            <p className="error">{x.error}</p>
+          </section>
+        ),
+      )}
     </div>
   );
 }

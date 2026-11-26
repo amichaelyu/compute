@@ -38,9 +38,12 @@ export interface JobRow {
   exit_code: number | null;
   /** The name of the key that submitted it (its fingerprint if the key is gone). */
   submitted_by: string;
+  /** Cloud jobs: the instance's rate and what it cost (so far, while it runs). */
+  usd_per_hour?: number;
+  cost_usd?: number;
 }
 
-export interface Job extends Omit<JobRow, "time_s"> {
+export interface Job extends Omit<JobRow, "time_s" | "cost_usd" | "usd_per_hour"> {
   description: string;
   estimated_start_source: string | null;
   resources: { nodes: number; cpus: number; mem_gb: number; gpus: number; gpu_type: string | null; time_s: number };
@@ -201,6 +204,15 @@ export interface Metrics {
   requested: { cpus: number; mem_mb: number; gpus: number };
 }
 export const getMetrics = (id: number) => api<Metrics>(`/v1/jobs/${id}/metrics`);
+
+/** Cloud spend: the hourly limit, what's running against it, and this month's total. */
+export interface Budget {
+  hourly_usd: number;
+  in_use_usd_per_hour: number;
+  remaining_usd_per_hour: number;
+  spent_this_month_usd: number;
+}
+export const getBudget = () => api<Budget>("/v1/budget");
 
 /** A job in a Slurm backend's queue; `compute_job` is set when compute submitted it. */
 export interface QueuedJob {

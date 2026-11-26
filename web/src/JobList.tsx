@@ -34,13 +34,31 @@ function group(jobs: JobRow[]): Item[] {
   return items;
 }
 
+/** "$3.40", "$3.40 so far" while it runs, or nothing for a free backend. */
+export function costText(jobs: JobRow[]) {
+  const paid = jobs.filter((j) => j.cost_usd !== undefined);
+  if (!paid.length) return "";
+  const usd = paid.reduce((n, j) => n + (j.cost_usd ?? 0), 0);
+  const open = paid.some((j) => ACTIVE.includes(j.state));
+  return `$${usd.toFixed(2)}${open ? " so far" : ""}`;
+}
+
 function Row({ j, now, task }: { j: JobRow; now: number; task?: boolean }) {
+  const cost = costText([j]);
   return (
     <a className={`row${task ? " row-task" : ""}`} href={`#/jobs/${j.id}`}>
       <span className="row-id">{j.id}</span>
       <span className="row-title">{task ? `Task ${j.array_index}` : j.title}</span>
       <State state={j.state} />
-      <span className="row-backend">{j.backend ?? "not placed"}</span>
+      <span className="row-backend">
+        {j.backend ?? "not placed"}
+        {cost && (
+          <span className="row-cost" title={j.usd_per_hour !== undefined ? `$${j.usd_per_hour.toFixed(2)}/h` : undefined}>
+            {" "}
+            · {cost}
+          </span>
+        )}
+      </span>
       <span className="row-who" title="Submitted by">
         {who(j.submitted_by)}
       </span>
@@ -59,6 +77,7 @@ function ArrayRows({ id, jobs, now }: { id: number; jobs: JobRow[]; now: number 
   const summary = [...counts.entries()].map(([s, n]) => `${n} ${s}`).join(", ");
   const backends = [...new Set(jobs.map((j) => j.backend ?? "not placed"))].join(", ");
   const people = [...new Set(jobs.map((j) => who(j.submitted_by)))].join(", ");
+  const cost = costText(jobs);
   const first = jobs[0]!;
   return (
     <>
@@ -71,7 +90,10 @@ function ArrayRows({ id, jobs, now }: { id: number; jobs: JobRow[]; now: number 
           </span>
         </span>
         <State state={jobs.some((j) => j.state === "running") ? "running" : first.state} />
-        <span className="row-backend">{backends}</span>
+        <span className="row-backend">
+          {backends}
+          {cost && <span className="row-cost"> · {cost}</span>}
+        </span>
         <span className="row-who" title="Submitted by">
           {people}
         </span>

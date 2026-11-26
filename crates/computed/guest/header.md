@@ -19,8 +19,8 @@ curl -fsSL {{URL}}/v1/install | sh
 
 That command signs in with `~/.ssh/id_ed25519.pub` (or `$COMPUTE_KEY`), writes
 `~/.config/compute/client.env` and the session, and installs this file. If it says the key
-isn't on the network yet, the user sends the printed public key line to {{OWNER}} and runs it
-again. Rerun it to get the latest version of this skill. This skill targets **API v1**:
+isn't on the network yet, it prints the public key line and waits: the user sends that line
+to {{OWNER}}, and presses Enter once it has been added. Rerun it to get the latest version of this skill. This skill targets **API v1**:
 `GET $COMPUTE_URL/v1/` must list `"v1"` in `api_versions`.
 
 ## Limits of the public address

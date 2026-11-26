@@ -224,6 +224,8 @@ async fn whoami(sess: Session) -> Json<Value> {
 
 /// Changes within v1 that a running agent should know about, newest first.
 const CHANGES: &[(&str, &str)] = &[
+    ("2026-11-25", "GET /v1/ lists `changes` only when signed in; without a session it has name, build and api_versions."),
+    ("2026-11-25", "GET /v1/jobs rows of cloud jobs carry usd_per_hour and cost_usd (so far, while the instance runs)."),
     ("2026-11-25", "GET /v1/jobs takes `before=<id>` to page back past the newest `limit` (at most 1000) jobs: pass the smallest id of the previous page."),
     ("2026-11-25", "A cloud launch the provider refuses for lack of capacity no longer fails the job (staging_failed): compute tries the next fitting offer no dearer than the quote, else puts the job back in the queue (reason \"waiting: ...\") to be placed again, on another GPU type within max_cost_usd or later. The refused offer counts as unavailable for 10 minutes."),
     ("2026-11-24", "POST /v1/reports files a bug report about compute itself ({kind: bug|docs|feature, title, body, job_id?}); GET /v1/reports and /v1/reports/{id} read them (guests see their own), POST /v1/reports/{id}/close is the owner's. 30 reports per key per day."),
@@ -246,13 +248,18 @@ const CHANGES: &[(&str, &str)] = &[
     ("2026-11-24", "New: after_ok/after_any/inputs, datasets, container, max_cost_usd/quote_id/keep_outputs, nodes > 1; /v1/datasets, /v1/images, /v1/budget."),
 ];
 
-async fn root() -> Json<Value> {
-    Json(json!({
+/// Public, so a client can check the API version before signing in. The change log (which
+/// describes how the network works inside) is only for signed-in callers.
+async fn root(sess: Result<Session, ApiError>) -> Json<Value> {
+    let mut v = json!({
         "name": "computed",
         "build": env!("CARGO_PKG_VERSION"),
         "api_versions": ["v1"],
-        "changes": CHANGES.iter().map(|(d, c)| json!({"date": d, "change": c})).collect::<Vec<_>>(),
-    }))
+    });
+    if sess.is_ok() {
+        v["changes"] = CHANGES.iter().map(|(d, c)| json!({"date": d, "change": c})).collect::<Vec<_>>().into();
+    }
+    Json(v)
 }
 
 async fn challenge(State(s): State<AppState>) -> ApiResult<Json<Value>> {
@@ -800,10 +807,29 @@ async fn list_jobs(State(s): State<AppState>, _sess: Session, Query(q): Query<Li
         limit: Some(q.limit.unwrap_or(50).min(1000)),
     })?;
     let mut names = HashMap::new();
+    // Cloud cost per job: what it cost, or so far while its instance runs (earlier attempts too).
+    let now = Utc::now();
+    let costs: HashMap<i64, (f64, f64)> = s
+        .sched
+        .store
+        .costs_since(DateTime::<Utc>::UNIX_EPOCH)?
+        .into_iter()
+        .map(|(id, _, rate, started, ended, cost)| {
+            let usd = match (ended, cost) {
+                (Some(_), Some(c)) => c,
+                (_, prior) => prior.unwrap_or(0.0) + rate * (ended.unwrap_or(now) - started).num_seconds().max(0) as f64 / 3600.0,
+            };
+            (id, (rate, usd))
+        })
+        .collect();
     let mut out = Vec::with_capacity(jobs.len());
     for j in &jobs {
         let mut v = job_short(&s.tz, j);
         add_people(&s, j, &mut v, &mut names)?;
+        if let Some((rate, usd)) = costs.get(&j.id) {
+            v["usd_per_hour"] = (*rate).into();
+            v["cost_usd"] = round2(*usd).into();
+        }
         out.push(v);
     }
     Ok(Json(json!({"jobs": out})))
