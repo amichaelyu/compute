@@ -37,11 +37,15 @@ When `COMPUTE_URL` is an `https://` address (through Cloudflare):
 ## Guest keys: what the network enforces
 
 Unless {{OWNER}} made your key an owner, it is a guest key (`compute whoami` says
-`"scope": "guest"`), and the daemon enforces this:
+`"scope": "guest"`, with these rules in `restrictions` and the backends and secrets you may and
+may not use), and the daemon enforces this:
 
-- **Jobs run sandboxed in a container.** Every job needs `container.image`, a public image
-  (e.g. `{"image": "python:3.12"}` or your own pushed to a public registry); guests can't build
-  images here (`container.build`). The job gets a private copy of the code at `/work`, its
+- **Jobs run sandboxed in a container.** Every job needs a `container`: a public `image`
+  (e.g. `{"image": "python:3.12"}` or your own pushed to a public registry), or a `build` from a
+  Dockerfile in your code. A guest's build runs on the job's own cloud instance while it is set
+  up (Lambda, when {{OWNER}} allows it for your key; set `"backends": ["lambda"]` and
+  `max_cost_usd`), never on the network's own machines, so every such job builds afresh and pays
+  for the build time. The job gets a private copy of the code at `/work`, its
   outputs at `/out`, inputs at `/in` and datasets at `/data/<name>`, nothing else from the host.
   The network outside is reachable (pip, Hugging Face), the tailnet and private networks are
   not. Env and secrets are visible only inside the container.
@@ -50,12 +54,13 @@ Unless {{OWNER}} made your key an owner, it is a guest key (`compute whoami` say
   paid clouds too, with caps per hour and per month. `compute whoami` lists your `backends`
   and, per paid backend, your `limits` and what you've spent. On a paid cloud your job gets an
   instance of its own instead of the container sandbox.
-- **Your own things only.** Logs, metrics, outputs, cancel and delete-outputs work on your own
+- **Your own things only.** Logs, metrics, outputs, edit, cancel and delete-outputs work on your own
   jobs; other jobs show their state but not their command or env. Secrets, datasets and
-  snapshots are visible and usable only by whoever created them (a snapshot counts as yours
+  snapshots are visible and usable only by whoever created them (plus any secrets {{OWNER}}
+  shared with your key, which `compute secrets` lists and you can use but not change) (a snapshot counts as yours
   once you've uploaded it). Datasets come from uploads, Hugging Face or your own jobs' outputs,
   not from directories on the hosts or their rclone remotes.
-- **Shared settings are the owner's.** Turning backends on or off, image builds and Slurm queue
+- **Shared settings are the owner's.** Turning backends on or off, the image build list and Slurm queue
   views are refused (403).
 
 Errors for these say `guest_sandbox`, `not_yours`, `backend_not_allowed` or `forbidden`. Still be modest with shared

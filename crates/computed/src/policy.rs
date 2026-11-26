@@ -1,5 +1,5 @@
 //! Per-key access, set by the owner on the dashboard's Users page: which backends a key may
-//! use, and how much it may spend on each paid one.
+//! use, how much it may spend on each paid one, and which of the owner's secrets its jobs may use.
 
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -34,6 +34,11 @@ pub struct KeyPolicy {
     /// Spend caps by paid backend name.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub limits: BTreeMap<String, SpendLimit>,
+    /// Secrets shared with a guest key: its jobs (and Hugging Face datasets) may use them by
+    /// name, and `GET /v1/secrets` lists them, but it can't replace or delete them. The values
+    /// reach the job's environment, so the guest can read them there.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secrets: Vec<String>,
 }
 
 impl KeyPolicy {
@@ -45,6 +50,6 @@ impl KeyPolicy {
     }
 
     pub fn is_default(&self) -> bool {
-        self.backends.is_none() && self.limits.values().all(SpendLimit::is_empty)
+        self.backends.is_none() && self.limits.values().all(SpendLimit::is_empty) && self.secrets.is_empty()
     }
 }

@@ -111,6 +111,12 @@ function AccessSummary({ u }: { u: User }) {
       ) : (
         <span className="muted small">No backends</span>
       )}
+      {!u.owner &&
+        a.policy.secrets?.map((name) => (
+          <span key={`secret:${name}`} className="tag" title={`${u.name || "This key"} may use the secret ${name} in jobs`}>
+            secret {name}
+          </span>
+        ))}
     </span>
   );
 }
@@ -144,11 +150,13 @@ function CapInput({ value, onChange, label, disabled }: { value: string; onChang
 function AccessEditor({
   u,
   backends,
+  secrets,
   onSaved,
   onClose,
 }: {
   u: User;
   backends: BackendRef[];
+  secrets: string[];
   onSaved: () => void;
   onClose: () => void;
 }) {
@@ -164,6 +172,7 @@ function AccessEditor({
       }),
     ),
   );
+  const [shared, setShared] = useState<Set<string>>(new Set(policy.secrets ?? []));
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const who = u.name || "this key";
@@ -188,7 +197,11 @@ function AccessEditor({
         const usd_per_month = parseCap(c.m, `${b.name} cap per month`);
         if (usd_per_hour !== null || usd_per_month !== null) limits[b.name] = { usd_per_hour, usd_per_month };
       }
-      next = { backends: custom ? backends.map((b) => b.name).filter((n) => chosen.has(n)) : null, limits };
+      next = {
+        backends: custom ? backends.map((b) => b.name).filter((n) => chosen.has(n)) : null,
+        limits,
+        secrets: u.owner ? [] : secrets.filter((n) => shared.has(n)),
+      };
     } catch (e) {
       setError(errorText(e));
       return;
@@ -283,6 +296,33 @@ function AccessEditor({
         )}{" "}
         Empty caps mean no limit beyond the network's hourly budget. Running jobs are never stopped by a cap.
       </p>
+      {!u.owner && (
+        <fieldset className="access-secrets">
+          <legend>Secrets {who} may use</legend>
+          {secrets.length ? (
+            secrets.map((n) => (
+              <label key={n} className="access-backend">
+                <input
+                  type="checkbox"
+                  checked={shared.has(n)}
+                  onChange={(e) => {
+                    const next = new Set(shared);
+                    if (e.target.checked) next.add(n);
+                    else next.delete(n);
+                    setShared(next);
+                  }}
+                />
+                {n}
+              </label>
+            ))
+          ) : (
+            <span className="small muted">No secrets stored yet.</span>
+          )}
+          <p className="small muted access-default">
+            Their jobs can use these by name, so they can read the values inside a job. They can't replace or delete them.
+          </p>
+        </fieldset>
+      )}
       <div className="toggle">
         <button className="btn btn-primary" type="submit" disabled={busy}>
           {busy ? "Saving…" : "Save access"}
@@ -300,7 +340,17 @@ function AccessEditor({
   );
 }
 
-function UserRow({ u, backends, onChanged }: { u: User; backends: BackendRef[]; onChanged: () => void }) {
+function UserRow({
+  u,
+  backends,
+  secrets,
+  onChanged,
+}: {
+  u: User;
+  backends: BackendRef[];
+  secrets: string[];
+  onChanged: () => void;
+}) {
   const [editing, setEditing] = useState(false);
   const [confirm, setConfirm] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -354,7 +404,9 @@ function UserRow({ u, backends, onChanged }: { u: User; backends: BackendRef[]; 
       </span>
       {u.note && <span className="error small user-note">Can't sign in: {u.note}</span>}
       {error && <span className="error user-note">{error}</span>}
-      {editing && <AccessEditor u={u} backends={backends} onSaved={onChanged} onClose={() => setEditing(false)} />}
+      {editing && (
+        <AccessEditor u={u} backends={backends} secrets={secrets} onSaved={onChanged} onClose={() => setEditing(false)} />
+      )}
     </li>
   );
 }
@@ -383,8 +435,9 @@ export function Users() {
         <h2>People with access</h2>
         <p className="muted">
           Owners can do everything. Everyone else is a guest: their jobs run sandboxed in a container, they can't use
-          others' secrets, and they can only cancel or read their own jobs. Access sets which backends each person may
-          use (by default owners all, guests the free ones) and caps their spend per paid backend. Removing someone
+          others' secrets unless you share them, and they can only cancel or read their own jobs. Access sets which
+          backends each person may use (by default owners all, guests the free ones), caps their spend per paid backend,
+          and shares secrets (such as a Hugging Face token) with a guest. Removing someone
           signs them out at once.
         </p>
         {error && !data && <p className="error">{errorText(error)}</p>}
@@ -397,7 +450,7 @@ export function Users() {
                 </li>
               ))
             : data?.users.map((u) => (
-                <UserRow key={u.fingerprint} u={u} backends={data.backends} onChanged={refresh} />
+                <UserRow key={u.fingerprint} u={u} backends={data.backends} secrets={data.secrets ?? []} onChanged={refresh} />
               ))}
         </ul>
       </section>

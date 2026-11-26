@@ -145,6 +145,8 @@ export interface SpendLimit {
 export interface KeyPolicy {
   backends: string[] | null;
   limits?: Record<string, SpendLimit>;
+  /** Secrets shared with a guest key: its jobs may use them, it can't change them. */
+  secrets?: string[];
 }
 
 export interface UserAccess {
@@ -169,7 +171,7 @@ export interface BackendRef {
   paid: boolean;
 }
 
-export const listUsers = () => api<{ users: User[]; backends: BackendRef[] }>("/v1/users");
+export const listUsers = () => api<{ users: User[]; backends: BackendRef[]; secrets: string[] }>("/v1/users");
 export const setUserAccess = (fingerprint: string, policy: KeyPolicy) =>
   api<User>(`/v1/users/access?fingerprint=${encodeURIComponent(fingerprint)}`, {
     method: "PUT",

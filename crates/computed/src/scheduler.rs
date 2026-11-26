@@ -237,6 +237,34 @@ impl Scheduler {
         Ok(applied)
     }
 
+    /// Writes an edited job while it is in one of `states`; false when it has moved on.
+    pub fn edit(&self, j: &Job, states: &[JobState], reason: &str) -> Result<bool> {
+        let applied = self.store.edit_job_if(states, j, reason)?;
+        if applied {
+            self.bump();
+        }
+        Ok(applied)
+    }
+
+    /// After claiming `job` (now Staging), re-reads it: an edit that landed between the read
+    /// the placement was based on and the claim puts it back to `from` to be placed afresh.
+    /// Returns the job as stored, or None when it went back.
+    fn claimed(&self, job: &Job, from: JobState) -> Result<Option<Job>> {
+        let Some(cur) = self.store.get_job(job.id)? else { return Ok(None) };
+        if cur.resources == job.resources && cur.backends == job.backends && cur.spec == job.spec {
+            return Ok(Some(cur));
+        }
+        let back = JobUpdate {
+            state: Some(from),
+            backend: Some(None),
+            reason: Some(Some("edited while being placed; placing it again".into())),
+            ..Default::default()
+        };
+        self.update_if(job.id, &[JobState::Staging], back)?;
+        self.kick();
+        Ok(None)
+    }
+
     /// Startup: jobs caught mid-staging go back to the queue, except cloud jobs that already
     /// have an instance, which resume staging on it (see `resume_staging`); running jobs get a
     /// fresh grace period so a long daemon outage doesn't mark them lost before the first poll.
@@ -517,7 +545,7 @@ impl Scheduler {
                         )? {
                             continue;
                         }
-                        let mut job = job;
+                        let Some(mut job) = self.claimed(&job, JobState::Waiting)? else { continue };
                         job.state = JobState::Staging;
                         job.backend = Some(name.clone());
                         native.entry((name, job.group_key())).or_insert_with(|| (shape, Vec::new())).1.push(job);
@@ -1292,6 +1320,7 @@ impl Scheduler {
             )? {
                 continue;
             }
+            let Some(job) = self.claimed(&job, JobState::Queued)? else { continue };
             if backend.is_paid()
                 && let Some(rate) = shape.usd_per_hour
             {

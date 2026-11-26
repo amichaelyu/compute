@@ -56,7 +56,7 @@ If it isn't installed, ask the user to run the network's install command; don't 
 ```bash
 compute backends            # one line per backend
 compute backends <name>     # hardware, live availability, restrictions (JSON)
-compute whoami              # your scope, and the backends and limits of your key
+compute whoami              # your scope; the backends, limits and secrets your key may (and may not) use; a guest's restrictions
 ```
 
 Restrictions are enforced by placement, so pick `cpus`, `mem_gb`, `gpus` and `time` within
@@ -207,8 +207,10 @@ Images are Linux images, so `os: "mac"` can't be combined with `container`.
 snapshot (build context: the Dockerfile's directory, or `"context"`). The tag is a hash of the
 Dockerfile and its context, so an unchanged image is reused; the job waits in `queued` while a
 build runs. With a registry set up (`compute api GET /v1/images` shows `registry`), builds are pushed there
-and run anywhere. Without one, the image is built on the Docker host that runs the job, and
-cloud backends can't run it.
+and run anywhere. Without one (and always for a guest key), the image is built on the host that
+runs the job: a Docker host of the network, or the job's own cloud instance where it runs Docker
+(Lambda; RunPod and Modal can't). A cloud job builds afresh on each new instance, and the build
+time is billed. A guest's build only ever runs on a cloud instance of its own.
 
 **Images are public.** Registry builds go to a public GitHub package, and no backend logs in to
 pull, so every image a job uses (built or prebuilt `image`, including the Dockerfile's `FROM`)
@@ -315,6 +317,7 @@ compute jobs -q eval                             # search titles and description
 compute jobs --array 7                           # tasks of array 7
 compute api GET '/v1/jobs?limit=1000&before=812' # older jobs: page back by the smallest id seen
 compute job 42                                   # state, reason, times, cost (-v: command and env)
+compute edit 42 '{"resources": {"gpu_type": "H100"}}'  # change a waiting/queued job (--array: all tasks)
 compute cancel 42                                # --array cancels a whole array
 compute delete-outputs 42                        # free a finished job's disk
 ```

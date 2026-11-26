@@ -418,23 +418,7 @@ impl JobRequest {
         if self.quote_id.is_some() && self.max_cost_usd.is_none() {
             return Err(ApiError::bad_request("`quote_id` without `max_cost_usd`", "quotes are only for jobs that may run on paid backends"));
         }
-        if r.cpus == 0 {
-            return Err(ApiError::bad_request("`resources.cpus` must be at least 1", "set cpus >= 1"));
-        }
-        if !(r.mem_gb > 0.0 && r.mem_gb.is_finite()) {
-            return Err(ApiError::bad_request("`resources.mem_gb` must be positive", "e.g. 4"));
-        }
-        if let Some(d) = r.disk_gb
-            && !(d > 0.0 && d.is_finite())
-        {
-            return Err(ApiError::bad_request("`resources.disk_gb` must be positive", "e.g. 50"));
-        }
-        let time = parse_duration(&r.time).ok_or_else(|| {
-            ApiError::bad_request(
-                format!("`resources.time` {:?} is not a duration", r.time),
-                "use forms like \"30m\", \"2h\", \"1h30m\", \"1d\"",
-            )
-        })?;
+        let res = r.check()?;
         if let Some(os) = &self.os
             && os != "mac" && os != "linux" {
                 return Err(ApiError::bad_request("`os` must be \"mac\" or \"linux\"", "or leave it null"));
@@ -461,15 +445,57 @@ impl JobRequest {
             && (key.is_empty() || key.len() > 200) {
                 return Err(ApiError::bad_request("`idempotency_key` must be 1-200 characters", ""));
             }
+        Ok(res)
+    }
+}
+
+impl ResourcesReq {
+    /// Checks cpus, memory, disk and time and normalises them (nodes are checked by the caller).
+    pub fn check(&self) -> Result<Resources, ApiError> {
+        if self.cpus == 0 {
+            return Err(ApiError::bad_request("`resources.cpus` must be at least 1", "set cpus >= 1"));
+        }
+        if !(self.mem_gb > 0.0 && self.mem_gb.is_finite()) {
+            return Err(ApiError::bad_request("`resources.mem_gb` must be positive", "e.g. 4"));
+        }
+        if let Some(d) = self.disk_gb
+            && !(d > 0.0 && d.is_finite())
+        {
+            return Err(ApiError::bad_request("`resources.disk_gb` must be positive", "e.g. 50"));
+        }
+        if self.gpu_type.as_deref().is_some_and(|t| t.trim().is_empty()) {
+            return Err(ApiError::bad_request("`resources.gpu_type` is empty", "e.g. \"H100\", or null for any GPU"));
+        }
+        let time = parse_duration(&self.time).ok_or_else(|| {
+            ApiError::bad_request(
+                format!("`resources.time` {:?} is not a duration", self.time),
+                "use forms like \"30m\", \"2h\", \"1h30m\", \"1d\"",
+            )
+        })?;
         Ok(Resources {
+            nodes: self.nodes,
+            cpus: self.cpus,
+            mem_mb: (self.mem_gb * 1024.0).ceil() as u64,
+            gpus: self.gpus,
+            gpu_type: self.gpu_type.clone(),
+            time_s: time.as_secs(),
+            disk_mb: self.disk_gb.map(|d| (d * 1024.0).ceil() as u64).unwrap_or(0),
+        })
+    }
+}
+
+impl From<&Resources> for ResourcesReq {
+    /// A stored job's resources as a request, to apply an edit to.
+    fn from(r: &Resources) -> Self {
+        ResourcesReq {
             nodes: r.nodes,
             cpus: r.cpus,
-            mem_mb: (r.mem_gb * 1024.0).ceil() as u64,
+            mem_gb: r.mem_mb as f64 / 1024.0,
             gpus: r.gpus,
             gpu_type: r.gpu_type.clone(),
-            time_s: time.as_secs(),
-            disk_mb: r.disk_gb.map(|d| (d * 1024.0).ceil() as u64).unwrap_or(0),
-        })
+            disk_gb: (r.disk_mb > 0).then(|| r.disk_mb as f64 / 1024.0),
+            time: format!("{}s", r.time_s),
+        }
     }
 }
 

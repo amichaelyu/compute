@@ -463,6 +463,33 @@ impl Store {
         Ok(self.conn().execute(&sql, params_from_iter(args))? > 0)
     }
 
+    /// Replaces a job's editable fields (title, description, resources, backends, priority,
+    /// spec) and its placement estimate, only while it is in one of `states`. Returns whether
+    /// it applied.
+    pub fn edit_job_if(&self, states: &[JobState], j: &Job, reason: &str) -> Result<bool> {
+        let list: Vec<String> = states.iter().map(|s| format!("'{}'", s.as_str())).collect();
+        let sql = format!(
+            "UPDATE jobs SET title = ?1, description = ?2, resources = ?3, backends = ?4, priority = ?5, spec = ?6, \
+             reason = ?7, backend = NULL, est_start = NULL, est_finish = NULL, est_source = NULL \
+             WHERE id = ?8 AND state IN ({})",
+            list.join(",")
+        );
+        let n = self.conn().execute(
+            &sql,
+            params![
+                j.title,
+                j.description,
+                serde_json::to_string(&j.resources)?,
+                j.backends.as_ref().map(serde_json::to_string).transpose()?,
+                j.priority,
+                serde_json::to_string(&j.spec)?,
+                reason,
+                j.id,
+            ],
+        )?;
+        Ok(n > 0)
+    }
+
     // ---- sessions ----
 
     pub fn put_session(&self, token_hash: &str, fingerprint: &str, expires: DateTime<Utc>) -> Result<()> {

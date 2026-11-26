@@ -124,6 +124,9 @@ impl Backend for LocalBackend {
         if r.gpus > 0 {
             return Quote::no(format!("gpus={}, {} has no schedulable GPU", r.gpus, c.name), true);
         }
+        if job.spec.sandbox && job.local_build() {
+            return Quote::no(format!("a guest's image is built on a cloud instance of the job's own (Lambda), not on {}", c.name), true);
+        }
         if job.is_container() && !self.remote.runtimes().iter().any(|x| x == "docker") {
             return Quote::no(format!("container job; {} has no Docker", c.name), true);
         }

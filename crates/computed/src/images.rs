@@ -33,8 +33,10 @@ pub enum ImageStatus {
 }
 
 impl Scheduler {
-    /// Turns a request's `container` into the stored spec, working out the build tag.
-    pub async fn container_spec(&self, snapshot: &str, req: &ContainerReq) -> Result<ContainerSpec, ApiError> {
+    /// Turns a request's `container` into the stored spec, working out the build tag. A guest's
+    /// build is always local (built on the host that runs the job), never on the registry
+    /// builder: placement keeps those jobs to cloud instances of their own.
+    pub async fn container_spec(&self, snapshot: &str, req: &ContainerReq, guest: bool) -> Result<ContainerSpec, ApiError> {
         if let Some(image) = &req.image {
             return Ok(ContainerSpec { image: image.clone(), build: None });
         }
@@ -43,7 +45,7 @@ impl Scheduler {
             Some((dir, _)) => dir.to_string(),
             None => ".".to_string(),
         });
-        let prefix = self.registry.prefix();
+        let prefix = self.registry.prefix().filter(|_| !guest);
         let path = self.snapshots.path(snapshot);
         let (df, ctx) = (dockerfile.clone(), context.clone());
         let hash = tokio::task::spawn_blocking(move || build_hash(&path, &df, &ctx))
@@ -133,7 +135,12 @@ impl Scheduler {
         if !b.local {
             return Ok(());
         }
-        let lock = self.dataset_lock(&format!("build:{}:{image}", backend.name()));
+        // A shared host builds each tag once; every cloud job has an instance of its own.
+        let lock = if backend.is_paid() {
+            self.dataset_lock(&format!("build:{}:{}", backend.name(), job.id))
+        } else {
+            self.dataset_lock(&format!("build:{}:{image}", backend.name()))
+        };
         let _guard = lock.lock().await;
         let (shell, root) = backend.shell_for(Some(job)).await?;
         let snap = shell_quote(&crate::backend::Remote::snapshot_dir(&root, &job.snapshot));

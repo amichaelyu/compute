@@ -733,8 +733,11 @@ impl Backend for Cloud {
         if r.nodes > b.cfg.max_nodes {
             return Quote::no(format!("nodes={}; {} allows at most {}", r.nodes, b.cfg.name, b.cfg.max_nodes), true);
         }
-        if job.local_build() {
-            return Quote::no("the image is built locally (no registry), so cloud instances can't pull it", true);
+        if job.local_build() && b.provider.runtime() != "docker" {
+            return Quote::no(
+                format!("the image is built on the job's own instance, and {} runs the image as the instance (no Docker to build with); Lambda can", b.cfg.name),
+                true,
+            );
         }
         if b.image_for(job).is_none() {
             return Quote::no("cloud jobs run in a container: set container.image or container.build", true);

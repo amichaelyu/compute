@@ -99,6 +99,16 @@ enum Cmd {
         #[arg(long, default_value_t = 0)]
         timeout: u64,
     },
+    /// Edit a waiting or queued job: a JSON file, "-" for stdin, or inline JSON with only the
+    /// fields to change, e.g. '{"resources": {"gpu_type": "H100"}}'
+    Edit {
+        id: i64,
+        /// The changes: title, description, resources {cpus, mem_gb, gpus, gpu_type, disk_gb, time}, backends, priority, max_cost_usd
+        changes: String,
+        /// Edit every waiting or queued task of array ID
+        #[arg(long)]
+        array: bool,
+    },
     /// Cancel a job (or a whole array with --array)
     Cancel {
         id: i64,
@@ -242,13 +252,17 @@ fn real_main() -> Result<()> {
                 return print_json(&v);
             }
             let jobs = v["jobs"].as_array().cloned().unwrap_or_default();
-            println!("{:>5}  {:<17} {:<8} {:<11} {:<9} {:<14} TITLE", "ID", "STATE", "BACKEND", "START", "ELAPSED", "LEFT");
+            // Wide enough for the longest submitter shown (at least the header, at most 16).
+            let by_w = jobs.iter().map(|j| j["submitted_by"].as_str().unwrap_or("—").chars().count()).max().unwrap_or(0).clamp(2, 16);
+            println!("{:>5}  {:<17} {:<by_w$} {:<8} {:<11} {:<9} {:<14} TITLE", "ID", "STATE", "BY", "BACKEND", "START", "ELAPSED", "LEFT");
             for j in &jobs {
                 let t = fmt::times(j);
+                let by: String = j["submitted_by"].as_str().unwrap_or("—").chars().take(16).collect();
                 println!(
-                    "{:>5}  {:<17} {:<8} {:<11} {:<9} {:<14} {}",
+                    "{:>5}  {:<17} {:<by_w$} {:<8} {:<11} {:<9} {:<14} {}",
                     j["id"].as_i64().unwrap_or(0),
                     j["state"].as_str().unwrap_or("").replace('_', " "),
+                    by,
                     j["backend"].as_str().unwrap_or("—"),
                     t.start,
                     t.elapsed,
@@ -289,6 +303,15 @@ fn real_main() -> Result<()> {
                     break;
                 }
             }
+        }
+        Cmd::Edit { id, changes, array } => {
+            let body: Value = if changes == "-" || Path::new(&changes).is_file() {
+                serde_json::from_str(&read_text(&changes)?).context("the changes are not JSON")?
+            } else {
+                serde_json::from_str(&changes).context("the changes are not JSON (or a file)")?
+            };
+            let v = c.call("PATCH", &format!("/v1/jobs/{id}{}", if array { "?array=1" } else { "" }), Some(&body))?;
+            print_json(&v)?;
         }
         Cmd::Cancel { id, array } => {
             let v = c.post(&format!("/v1/jobs/{id}/cancel{}", if array { "?array=1" } else { "" }), &Value::Null)?;

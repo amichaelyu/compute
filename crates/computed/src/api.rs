@@ -47,7 +47,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/snapshots", post(upload_snapshot).layer(DefaultBodyLimit::disable()))
         .route("/v1/snapshots/{id}", axum::routing::head(head_snapshot))
         .route("/v1/jobs", post(submit).get(list_jobs))
-        .route("/v1/jobs/{id}", get(get_job))
+        .route("/v1/jobs/{id}", get(get_job).patch(edit_job))
         .route("/v1/jobs/{id}/wait", get(wait_job))
         .route("/v1/jobs/{id}/logs", get(job_logs))
         .route("/v1/jobs/{id}/metrics", get(job_metrics))
@@ -140,13 +140,19 @@ impl Session {
             StatusCode::FORBIDDEN,
             "not_yours",
             format!("job {} isn't yours", j.id),
-            "guest keys can read the logs and outputs of, cancel and reuse only their own jobs",
+            "guest keys can read the logs and outputs of, edit, cancel and reuse only their own jobs",
         ))
     }
 
     /// Owners may use anything; guests what they created (`kind`: snapshot, secret, dataset).
     fn may_use(&self, s: &AppState, kind: &str, id: &str) -> ApiResult<bool> {
         Ok(!self.guest || s.sched.store.owns(kind, id, &self.fingerprint)?)
+    }
+
+    /// Whether this caller's jobs may use secret `name`: its own, or one the owner shared with
+    /// its key (`secrets` in its access policy). Replacing or deleting needs `may_use`.
+    fn may_use_secret(&self, s: &AppState, name: &str) -> ApiResult<bool> {
+        Ok(self.may_use(s, "secret", name)? || s.sched.store.key_policy(&self.fingerprint)?.secrets.iter().any(|n| n == name))
     }
 
     /// Submitting jobs, uploading code and changing secrets need an SSH-key session.
@@ -228,13 +234,47 @@ async fn whoami(State(s): State<AppState>, sess: Session) -> ApiResult<Json<Valu
     if sess.full {
         let a = key_access(&s, &sess.fingerprint, sess.guest)?;
         v["backends"] = a["allowed"].clone();
+        let allowed: Vec<&str> = a["allowed"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        v["backends_not_allowed"] =
+            s.sched.backends.iter().map(|b| b.name()).filter(|n| !allowed.contains(n)).collect::<Vec<_>>().into();
         v["limits"] = a["limits"].clone();
+        let (mut usable, mut not_usable) = (Vec::new(), Vec::new());
+        for i in s.sched.secrets.list()? {
+            if !sess.guest || sess.may_use_secret(&s, &i.name)? {
+                usable.push(i.name);
+            } else if s.sched.registry.secret.as_deref() != Some(i.name.as_str()) {
+                not_usable.push(i.name);
+            }
+        }
+        v["secrets"] = usable.into();
+        v["secrets_not_allowed"] = not_usable.into();
+        if sess.guest {
+            v["restrictions"] = GUEST_RESTRICTIONS.into();
+        }
     }
     Ok(Json(v))
 }
 
+/// What a guest key may not do, for `GET /v1/whoami`. Keep in step with guest/header.md.
+const GUEST_RESTRICTIONS: &[&str] = &[
+    "jobs need a container: container.image (a public image) or container.build",
+    "container.build is built on the job's own Lambda instance, never on the network's machines; each such job builds afresh, and the build time is billed",
+    "on the network's own machines a job runs sandboxed: a private copy of the code, and no route to the host, the tailnet or the LAN",
+    "one node per job",
+    "backends: only those in `backends`, and paid ones within `limits`",
+    "secrets: your own and those in `secrets` (shared by the owner: usable, but not replaceable or deletable)",
+    "datasets: only your own, from uploads, Hugging Face or your own jobs' outputs (not host directories or the hosts' rclone remotes)",
+    "jobs: logs, metrics, outputs, edit, cancel and reuse as inputs only for your own; other jobs show their state, not their command or env",
+    "snapshots: only those you uploaded",
+    "owner only: turning backends on or off, Slurm queue views, image build logs, closing reports, managing users",
+];
+
 /// Changes within v1 that a running agent should know about, newest first.
 const CHANGES: &[(&str, &str)] = &[
+    ("2026-11-26", "PATCH /v1/jobs/{id} edits a waiting or queued job: title, description, resources (cpus, mem_gb, gpus, gpu_type, disk_gb, time; send only what changes), backends, priority, max_cost_usd (null clears gpu_type, disk_gb, backends, max_cost_usd). ?array=1 edits every waiting or queued task of an array. The job is checked as a submit is and placed afresh; a job already placed answers 409 not_editable. Owners may edit any job, guests their own. CLI: `compute edit <id> <json>`."),
+    ("2026-11-26", "GET /v1/whoami also lists `backends_not_allowed`, `secrets` (names your jobs may use), `secrets_not_allowed`, and for guest keys `restrictions` (what the network refuses them). GET /v1/secrets marks secrets shared with a guest key `shared: true`."),
+    ("2026-11-26", "The owner can share secrets with a guest key (Users page, Access: `secrets` in the key's policy). A shared secret is listed by GET /v1/secrets and usable in the key's jobs (`secrets`) and Hugging Face datasets, but only its creator can replace or delete it."),
+    ("2026-11-26", "Guest keys may use container.build. A guest's image is built with docker on the job's own cloud instance while it is staged (the build log is in the job's log), never on the network's hosts or in its registry, so such a job runs only on a paid backend whose instances run Docker (Lambda), within the key's limits. Every job builds its image afresh on its new instance. Cloud backends with Docker also run any job built without a registry this way."),
     ("2026-11-26", "The `compute` CLI is served by the network: GET /v1/cli lists its version and per-platform builds (darwin-arm64, linux-x86_64, linux-arm64, windows-x86_64: url, sha256, size), GET /v1/cli/{platform} downloads one, both without signing in. GET /v1/ has `cli_version`. The install command (`curl -fsSL $COMPUTE_URL/v1/install | sh`, or `irm $COMPUTE_URL/v1/install.ps1 | iex` on Windows) installs the CLI and runs `compute setup`; the CLI keeps itself and the skill current (`compute update`). The skill now uses the CLI."),
     ("2026-11-26", "GET /v1/reports/{id}/wait?timeout=<s> returns once the report is closed, or after the timeout (at most 90 s through Cloudflare) with timed_out: true; repeat it to watch a report you filed. Closed reports carry `resolution` (fixed, wont_fix, duplicate, not_a_bug) and the owner's `note`. POST /v1/reports/{id}/close takes {note?, resolution?} (default fixed)."),
     ("2026-11-26", "Per-key access: the owner sets which backends each key may use and, per paid backend, caps in $/h and $/month. GET /v1/whoami lists `backends` (what your key may use) and `limits` (per paid backend: usd_per_hour, usd_per_month, in_use_usd_per_hour, spent_this_month_usd, committed_this_month_usd). Naming a backend you may not use answers 403 backend_not_allowed; a job over a cap waits (reason says which). Guest keys may use paid backends when the owner allows it (max_cost_usd is no longer refused)."),
@@ -356,7 +396,7 @@ fn request_hash(raw: &Value) -> String {
 }
 
 /// Builds the stored spec: dependencies, inputs, datasets, container and cloud fields.
-async fn build_spec(s: &AppState, req: &JobRequest) -> ApiResult<JobSpec> {
+async fn build_spec(s: &AppState, req: &JobRequest, guest: bool) -> ApiResult<JobSpec> {
     let mut spec = JobSpec {
         after_ok: req.after_ok.clone(),
         after_any: req.after_any.clone(),
@@ -398,7 +438,7 @@ async fn build_spec(s: &AppState, req: &JobRequest) -> ApiResult<JobSpec> {
         spec.datasets.push(u);
     }
     if let Some(c) = &req.container {
-        spec.container = Some(s.sched.container_spec(&req.snapshot, c).await?);
+        spec.container = Some(s.sched.container_spec(&req.snapshot, c, guest).await?);
     }
     Ok(spec)
 }
@@ -413,18 +453,11 @@ async fn submit(State(s): State<AppState>, sess: Session, body: Result<Json<Valu
         req.title = format!("{}…", req.title.chars().take(79).collect::<String>().trim_end());
     }
     let res = req.validate()?;
-    if let Some(list) = &req.backends {
-        for name in list {
-            if s.sched.backend(name).is_none() {
-                let known: Vec<&str> = s.sched.backends.iter().map(|b| b.name()).collect();
-                return Err(ApiError::bad_request(format!("unknown backend {name:?}"), format!("known backends: {}", known.join(", "))));
-            }
-        }
-    }
+    backends_known(&s, req.backends.as_ref())?;
     if sess.guest {
         guest_request(&s, &sess, &req)?;
     }
-    backend_allowed(&s, &sess, &req)?;
+    backend_allowed(&s, &sess.fingerprint, sess.guest, req.backends.as_ref())?;
     if !s.sched.snapshots.exists(&req.snapshot) || !sess.may_use(&s, "snapshot", &req.snapshot)? {
         return Err(ApiError::new(
             StatusCode::BAD_REQUEST,
@@ -449,7 +482,7 @@ async fn submit(State(s): State<AppState>, sess: Session, body: Result<Json<Valu
         }
     }
 
-    let mut spec = build_spec(&s, &req).await?;
+    let mut spec = build_spec(&s, &req, sess.guest).await?;
     if sess.guest {
         for d in &spec.datasets {
             if !sess.may_use(&s, "dataset", &d.name)? {
@@ -636,28 +669,23 @@ async fn submit(State(s): State<AppState>, sess: Session, body: Result<Json<Valu
     Ok((StatusCode::CREATED, Json(body)).into_response())
 }
 
-/// What a guest's job may ask for: a public image (no builds), one node, and only its own
+/// What a guest's job may ask for: a container (a public image, or a build, which runs on the
+/// job's own cloud instance: see `container_spec`), one node, and only its own
 /// secrets and jobs' outputs. Which backends it may use is the key's policy (`backend_allowed`). Snapshots and datasets are checked where they're resolved.
 fn guest_request(s: &AppState, sess: &Session, req: &JobRequest) -> ApiResult<()> {
     let forbid = |m: String, hint: &str| ApiError::new(StatusCode::FORBIDDEN, "guest_sandbox", m, hint);
-    match &req.container {
-        None => {
-            return Err(forbid(
-                "guest jobs run sandboxed in a container".into(),
-                "set container.image to a public image, e.g. {\"image\": \"python:3.12\"}",
-            ));
-        }
-        Some(c) if c.image.is_none() => {
-            return Err(forbid("guest keys can't build images here".into(), "build and push a public image elsewhere and set container.image"));
-        }
-        _ => {}
+    if req.container.is_none() {
+        return Err(forbid(
+            "guest jobs run sandboxed in a container".into(),
+            "set container.image to a public image (e.g. {\"image\": \"python:3.12\"}), or container.build to build one on a Lambda instance of the job's own",
+        ));
     }
     if req.resources.nodes > 1 {
         return Err(forbid("guest jobs run on one node".into(), "set resources.nodes to 1"));
     }
     for n in &req.secrets {
-        if !sess.may_use(s, "secret", n)? {
-            return Err(forbid(format!("secret {n:?} isn't yours"), "store your own with PUT /v1/secrets/{name}"));
+        if !sess.may_use_secret(s, n)? {
+            return Err(forbid(format!("secret {n:?} isn't yours"), "store your own with PUT /v1/secrets/{name}, or ask the network's owner to share it with your key"));
         }
     }
     for inp in &req.inputs {
@@ -672,11 +700,22 @@ fn guest_request(s: &AppState, sess: &Session, req: &JobRequest) -> ApiResult<()
 
 /// Refuses a request naming a backend the key's policy doesn't allow (placement skips those
 /// anyway; this says so up front).
-fn backend_allowed(s: &AppState, sess: &Session, req: &JobRequest) -> ApiResult<()> {
-    let policy = s.sched.store.key_policy(&sess.fingerprint)?;
+fn backends_known(s: &AppState, list: Option<&Vec<String>>) -> ApiResult<()> {
+    for name in list.into_iter().flatten() {
+        if s.sched.backend(name).is_none() {
+            let known: Vec<&str> = s.sched.backends.iter().map(|b| b.name()).collect();
+            return Err(ApiError::bad_request(format!("unknown backend {name:?}"), format!("known backends: {}", known.join(", "))));
+        }
+    }
+    Ok(())
+}
+
+/// Refuses backends in `list` that key `fingerprint`'s access policy doesn't allow.
+fn backend_allowed(s: &AppState, fingerprint: &str, guest: bool, list: Option<&Vec<String>>) -> ApiResult<()> {
+    let policy = s.sched.store.key_policy(fingerprint)?;
     let allowed: Vec<&str> =
-        s.sched.backends.iter().filter(|b| policy.allows(b.name(), b.is_paid(), sess.guest)).map(|b| b.name()).collect();
-    if let Some(list) = &req.backends {
+        s.sched.backends.iter().filter(|b| policy.allows(b.name(), b.is_paid(), guest)).map(|b| b.name()).collect();
+    if let Some(list) = list {
         let denied: Vec<&str> = list.iter().map(String::as_str).filter(|n| !allowed.contains(n)).collect();
         if !denied.is_empty() {
             return Err(ApiError::new(
@@ -1155,6 +1194,172 @@ async fn cancel_job(State(s): State<AppState>, sess: Session, Path(id): Path<i64
     Ok(Json(json!({"cancelled": cancelled, "errors": errors})))
 }
 
+/// `Some(x)` for a field that is present (even as null), so `Option<Option<T>>` tells "leave
+/// it" (absent) from "clear it" (null).
+fn present<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(d: D) -> Result<Option<T>, D::Error> {
+    T::deserialize(d).map(Some)
+}
+
+/// `PATCH /v1/jobs/{id}`: the fields of a waiting or queued job that may change. Absent fields
+/// stay; null clears `gpu_type`, `disk_gb`, `backends` and `max_cost_usd`.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct JobEdit {
+    title: Option<String>,
+    description: Option<String>,
+    resources: Option<ResourcesEdit>,
+    #[serde(default, deserialize_with = "present")]
+    backends: Option<Option<Vec<String>>>,
+    priority: Option<i64>,
+    #[serde(default, deserialize_with = "present")]
+    max_cost_usd: Option<Option<f64>>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ResourcesEdit {
+    cpus: Option<u32>,
+    mem_gb: Option<f64>,
+    gpus: Option<u32>,
+    #[serde(default, deserialize_with = "present")]
+    gpu_type: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present")]
+    disk_gb: Option<Option<f64>>,
+    time: Option<String>,
+}
+
+/// The states in which a job may be edited: not yet placed on a backend.
+const EDITABLE: &[JobState] = &[JobState::Waiting, JobState::Queued];
+
+/// Changes a waiting or queued job (or, with `?array=1`, every such task of an array): its
+/// title, description, resources, backends, priority or cost cap. Owners may edit any job,
+/// guests their own. The edited job is checked as a submit would be, against the policy of the
+/// key that submitted it, and goes back to the queue to be placed afresh.
+async fn edit_job(
+    State(s): State<AppState>,
+    sess: Session,
+    Path(id): Path<i64>,
+    Query(q): Query<CancelQuery>,
+    body: Result<Json<JobEdit>, JsonRejection>,
+) -> ApiResult<Json<Value>> {
+    let Json(edit) = body.map_err(|e| ApiError::bad_request(format!("invalid edit: {}", e.body_text()), "send only the fields to change: title, description, resources {cpus, mem_gb, gpus, gpu_type, disk_gb, time}, backends, priority, max_cost_usd"))?;
+    let array = q.array.unwrap_or(0) > 0;
+    let jobs = if array {
+        let all = s.sched.store.list_jobs(&JobFilter { array_id: Some(id), ..Default::default() })?;
+        if all.is_empty() {
+            return Err(ApiError::not_found(format!("array {id} not found")));
+        }
+        all
+    } else {
+        vec![load_job(&s, id)?]
+    };
+    for j in &jobs {
+        sess.require_job(j)?;
+    }
+    let editable: Vec<&Job> = jobs.iter().filter(|j| EDITABLE.contains(&j.state)).collect();
+    if editable.is_empty() {
+        let what = if array { format!("no task of array {id} is") } else { format!("job {id} is {}, not", jobs[0].state.as_str()) };
+        return Err(ApiError::new(
+            StatusCode::CONFLICT,
+            "not_editable",
+            format!("{what} waiting or queued"),
+            "only jobs not yet placed can be edited; cancel it and submit again",
+        ));
+    }
+
+    let mut edited = Vec::new();
+    let mut skipped = Vec::new();
+    let mut per_backend = Value::Null;
+    for (n, old) in editable.into_iter().enumerate() {
+        let mut j = old.clone();
+        if let Some(t) = &edit.title {
+            let t = t.trim();
+            if t.is_empty() {
+                return Err(ApiError::bad_request("`title` is empty", "say what the job is"));
+            }
+            j.title = t.chars().take(80).collect();
+        }
+        if let Some(d) = &edit.description {
+            let len = d.chars().count();
+            if len == 0 || len > 500 {
+                return Err(ApiError::bad_request("`description` must be 1-500 characters", "one or two sentences: why the job is being run"));
+            }
+            j.description = d.clone();
+        }
+        if let Some(r) = &edit.resources {
+            let mut req = crate::model::ResourcesReq::from(&j.resources);
+            if let Some(v) = r.cpus {
+                req.cpus = v;
+            }
+            if let Some(v) = r.mem_gb {
+                req.mem_gb = v;
+            }
+            if let Some(v) = r.gpus {
+                req.gpus = v;
+            }
+            if let Some(v) = &r.gpu_type {
+                req.gpu_type = v.clone();
+            }
+            if let Some(v) = r.disk_gb {
+                req.disk_gb = v;
+            }
+            if let Some(v) = &r.time {
+                req.time = v.clone();
+            }
+            j.resources = req.check()?;
+        }
+        if let Some(b) = &edit.backends {
+            j.backends = b.clone();
+        }
+        if let Some(p) = edit.priority {
+            j.priority = p;
+        }
+        if let Some(m) = edit.max_cost_usd {
+            if m.is_some_and(|m| !(m > 0.0 && m.is_finite())) {
+                return Err(ApiError::bad_request("`max_cost_usd` must be positive", "e.g. 5, or null to keep the job off paid backends"));
+            }
+            j.spec.max_cost_usd = m;
+        }
+        // Checked as the submitting key: a guest's job (sandboxed) stays within the guest's policy.
+        backends_known(&s, j.backends.as_ref())?;
+        backend_allowed(&s, &j.key_fingerprint, j.spec.sandbox, j.backends.as_ref())?;
+        if n == 0 {
+            let plan = s.sched.plan(&j).await?;
+            if plan.quotes.iter().all(|(_, q)| matches!(q, Quote::No { permanent: true, .. })) {
+                let reasons: Vec<String> =
+                    plan.quotes.iter().map(|(b, q)| format!("{b}: {}", quote_line(&s.tz, q).trim_start_matches("no: "))).collect();
+                return Err(ApiError::new(
+                    StatusCode::UNPROCESSABLE_ENTITY,
+                    "unplaceable",
+                    "no backend can ever run this job as edited",
+                    reasons.join("; "),
+                ));
+            }
+            let lines: BTreeMap<String, String> = plan.quotes.iter().map(|(b, q)| (b.clone(), quote_line(&s.tz, q))).collect();
+            per_backend = serde_json::to_value(lines).unwrap_or_default();
+        }
+        let reason = format!("edited by {}; waiting to be placed", sess.public_name());
+        if s.sched.edit(&j, EDITABLE, &reason)? {
+            tracing::info!("job {} edited by {} ({})", j.id, sess.name, sess.fingerprint);
+            edited.push(j.id);
+        } else {
+            skipped.push(j.id); // placed (or cancelled) since it was read
+        }
+    }
+    s.sched.kick();
+    if !array {
+        if edited.is_empty() {
+            return Err(ApiError::new(StatusCode::CONFLICT, "not_editable", format!("job {id} was placed while it was being edited"), "check it with GET /v1/jobs/{id}; cancel and resubmit to change it"));
+        }
+        let j = load_job(&s, id)?;
+        let mut v = job_view(&s.tz, &j, false, &sess);
+        add_people(&s, &j, &mut v, &mut HashMap::new())?;
+        v["per_backend"] = per_backend;
+        return Ok(Json(v));
+    }
+    Ok(Json(json!({"edited": edited, "skipped": skipped, "per_backend": per_backend})))
+}
+
 // ------------------------------------------------------------------ backends
 
 async fn backend_summary(s: &AppState, name: &str) -> ApiResult<Value> {
@@ -1410,7 +1615,10 @@ async fn list_users(State(s): State<AppState>, sess: Session) -> ApiResult<Json<
         out.push(v);
     }
     let backends: Vec<Value> = s.sched.backends.iter().map(|b| json!({"name": b.name(), "paid": b.is_paid()})).collect();
-    Ok(Json(json!({"users": out, "backends": backends})))
+    // Secrets the owner may share with guests (not the registry login); names only.
+    let secrets: Vec<String> =
+        s.sched.secrets.list()?.into_iter().map(|i| i.name).filter(|n| s.sched.registry.secret.as_deref() != Some(n.as_str())).collect();
+    Ok(Json(json!({"users": out, "backends": backends, "secrets": secrets})))
 }
 
 /// Sets which backends a key may use and its spend caps on paid ones. `backends: null` goes
@@ -1450,6 +1658,16 @@ async fn set_user_access(
         }
     }
     policy.limits.retain(|_, l| !l.is_empty());
+    policy.secrets.sort();
+    policy.secrets.dedup();
+    for n in &policy.secrets {
+        if !s.sched.secrets.exists(n) {
+            return Err(ApiError::bad_request(format!("unknown secret {n:?}"), "use names from GET /v1/secrets"));
+        }
+        if s.sched.registry.secret.as_deref() == Some(n.as_str()) {
+            return Err(ApiError::bad_request(format!("secret {n:?} is the daemon's registry login"), "share another secret"));
+        }
+    }
     s.sched.store.set_key_policy(&user.fingerprint, &policy)?;
     tracing::info!("access of {} ({}) set to {}", user.name, user.fingerprint, serde_json::to_string(&policy).unwrap_or_default());
     // Queued jobs may fit now (or not any more).
@@ -1587,15 +1805,21 @@ async fn list_secrets(State(s): State<AppState>, sess: Session) -> ApiResult<Jso
     if sess.guest {
         let mut mine = Vec::new();
         for i in list {
-            if sess.may_use(&s, "secret", &i.name)? {
+            if sess.may_use_secret(&s, &i.name)? {
                 mine.push(i);
             }
         }
         list = mine;
     }
-    Ok(Json(json!({"secrets": list.iter().map(|i| json!({
-        "name": i.name, "keys": i.keys, "updated_at": fmt(&s.tz, i.updated_at)
-    })).collect::<Vec<_>>()})))
+    let mut out = Vec::with_capacity(list.len());
+    for i in &list {
+        let mut v = json!({"name": i.name, "keys": i.keys, "updated_at": fmt(&s.tz, i.updated_at)});
+        if sess.guest && !sess.may_use(&s, "secret", &i.name)? {
+            v["shared"] = true.into(); // the owner's, shared with this key: usable, not changeable
+        }
+        out.push(v);
+    }
+    Ok(Json(json!({"secrets": out})))
 }
 
 #[derive(Deserialize)]
@@ -1664,7 +1888,7 @@ async fn register_dataset(
         match &req.source {
             Source::HostPath { .. } => return Err(forbid("guest keys can't register directories on the hosts")),
             Source::Rclone { .. } => return Err(forbid("guest keys can't use the hosts' rclone remotes")),
-            Source::Hf { secret: Some(n), .. } if !sess.may_use(&s, "secret", n)? => return Err(forbid("that secret isn't yours")),
+            Source::Hf { secret: Some(n), .. } if !sess.may_use_secret(&s, n)? => return Err(forbid("that secret isn't yours")),
             Source::JobOutputs { job, .. } => sess.require_job(&load_job(&s, *job)?)?,
             _ => {}
         }
