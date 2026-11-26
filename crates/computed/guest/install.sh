@@ -25,22 +25,38 @@ case "$key" in *.pub) ;; *) key="$key.pub" ;; esac
 signer="$key"
 [ -f "${key%.pub}" ] && signer="${key%.pub}"
 
-nonce=$(curl -fsS -X POST "$url/v1/auth/challenge" | jq -r .nonce) || die "can't reach $url"
-sig=$(printf %s "$nonce" | ssh-keygen -Y sign -n compute -f "$signer") || die "ssh-keygen couldn't sign with $signer"
-resp=$(jq -n --arg n "$nonce" --arg s "$sig" --rawfile k "$key" '{nonce:$n, signature:$s, public_key:$k}' |
-  curl -sS -H 'Content-Type: application/json' --data-binary @- "$url/v1/auth/token") || die "can't reach $url"
-token=$(printf '%s' "$resp" | jq -r '.token // empty' 2>/dev/null || true)
-
-if [ -z "$token" ]; then
+# Signs in; sets $token, or $denied when the key isn't allowed yet.
+sign_in() {
+  token='' denied=''
+  nonce=$(curl -fsS -X POST "$url/v1/auth/challenge" | jq -r .nonce) || die "can't reach $url"
+  sig=$(printf %s "$nonce" | ssh-keygen -Y sign -n compute -f "$signer") || die "ssh-keygen couldn't sign with $signer"
+  resp=$(jq -n --arg n "$nonce" --arg s "$sig" --rawfile k "$key" '{nonce:$n, signature:$s, public_key:$k}' |
+    curl -sS -H 'Content-Type: application/json' --data-binary @- "$url/v1/auth/token") || die "can't reach $url"
+  token=$(printf '%s' "$resp" | jq -r '.token // empty' 2>/dev/null || true)
+  [ -n "$token" ] && return 0
   msg=$(printf '%s' "$resp" | jq -r '.error.message // empty' 2>/dev/null || true)
   case "$msg" in
-    *allowed_signers*)
-      printf '%s\n\n' "This SSH key isn't on the compute network yet. Send this line to the person who runs it:" >&2
-      cat "$key" >&2
-      printf '\n%s\n' "Once they've added it, run the same command again." >&2
-      exit 1 ;;
+    *allowed_signers*) denied=1 ;;
     *) die "sign-in failed: ${msg:-$resp}" ;;
   esac
+}
+
+sign_in
+if [ -n "$denied" ]; then
+  printf '%s\n\n' "This SSH key isn't on the compute network yet. Send this line to the person who runs it:" >&2
+  cat "$key" >&2
+  printf '\n' >&2
+  # The script itself arrives on stdin (curl | sh), so ask on the terminal.
+  if ! (exec </dev/tty) 2>/dev/null; then
+    printf '%s\n' "Once they've added it, run the same command again." >&2
+    exit 1
+  fi
+  while [ -n "$denied" ]; do
+    printf '%s' "Press Enter once they've added it (Ctrl-C to stop): " >&2
+    read -r _ </dev/tty || exit 1
+    sign_in
+    [ -n "$denied" ] && printf '%s\n' "Not added yet. Send them the key line above, then press Enter again." >&2
+  done
 fi
 
 mkdir -p "$conf"

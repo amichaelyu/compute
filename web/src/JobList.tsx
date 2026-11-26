@@ -1,14 +1,15 @@
 import { useMemo, useState } from "react";
-import { ACTIVE, type JobRow, type JobState, PROBLEM, listJobs } from "./api";
+import { ACTIVE, type JobRow, type JobState, PROBLEM, listAllJobs, listJobs } from "./api";
 import { State } from "./State";
-import { usePoll, when } from "./util";
+import { usePoll, when, who } from "./util";
 
-type Filter = "active" | "recent" | "problems";
+type Filter = "active" | "recent" | "problems" | "all";
 
 const FILTERS: { key: Filter; label: string; states: JobState[] | null }[] = [
   { key: "active", label: "Active", states: ACTIVE },
   { key: "recent", label: "Recent", states: null },
   { key: "problems", label: "Problems", states: PROBLEM },
+  { key: "all", label: "All", states: null },
 ];
 
 type Item = { kind: "job"; job: JobRow } | { kind: "array"; id: number; jobs: JobRow[] };
@@ -40,6 +41,9 @@ function Row({ j, now, task }: { j: JobRow; now: number; task?: boolean }) {
       <span className="row-title">{task ? `Task ${j.array_index}` : j.title}</span>
       <State state={j.state} />
       <span className="row-backend">{j.backend ?? "not placed"}</span>
+      <span className="row-who" title="Submitted by">
+        {who(j.submitted_by)}
+      </span>
       <span className="row-when">
         {when(j, now)}
         {j.exit_code !== null && j.exit_code !== 0 ? `, exit ${j.exit_code}` : ""}
@@ -54,6 +58,7 @@ function ArrayRows({ id, jobs, now }: { id: number; jobs: JobRow[]; now: number 
   for (const j of jobs) counts.set(j.state, (counts.get(j.state) ?? 0) + 1);
   const summary = [...counts.entries()].map(([s, n]) => `${n} ${s}`).join(", ");
   const backends = [...new Set(jobs.map((j) => j.backend ?? "not placed"))].join(", ");
+  const people = [...new Set(jobs.map((j) => who(j.submitted_by)))].join(", ");
   const first = jobs[0]!;
   return (
     <>
@@ -67,6 +72,9 @@ function ArrayRows({ id, jobs, now }: { id: number; jobs: JobRow[]; now: number 
         </span>
         <State state={jobs.some((j) => j.state === "running") ? "running" : first.state} />
         <span className="row-backend">{backends}</span>
+        <span className="row-who" title="Submitted by">
+          {people}
+        </span>
         <span className="row-when">{open ? "Hide tasks" : "Show tasks"}</span>
       </button>
       {open && jobs.map((j) => <Row key={j.id} j={j} now={now} task />)}
@@ -80,24 +88,32 @@ export function JobList({ jobs, now }: { jobs: JobRow[]; now: number }) {
   const filter: Filter = chosen ?? (anyActive || jobs.length === 0 ? "active" : "recent");
   const setFilter = setChosen;
   const [query, setQuery] = useState("");
+  // "" is everyone; otherwise only jobs this person submitted.
+  const [person, setPerson] = useState("");
   const q = query.trim();
   // Searching asks the daemon, so older jobs beyond the loaded window are found too.
-  const search = usePoll(() => (q ? listJobs({ q, limit: 200 }) : Promise.resolve(null)), 10_000, [q]);
+  const search = usePoll(() => (q ? listJobs({ q, limit: 1000 }) : Promise.resolve(null)), 10_000, [q]);
+  // Every job ever, loaded only while the All tab is open.
+  const all = usePoll(() => (filter === "all" ? listAllJobs() : Promise.resolve(null)), 30_000, [filter]);
 
+  const people = useMemo(() => [...new Set([...jobs, ...(all.data ?? [])].map((j) => j.submitted_by))].sort(), [jobs, all.data]);
   const shown = useMemo(() => {
-    const base = q && search.data ? search.data : jobs;
+    const mine = (list: JobRow[]) => (person ? list.filter((j) => j.submitted_by === person) : list);
+    if (filter === "all" && !q) return group(mine(all.data ?? jobs));
+    const base = mine(q && search.data ? search.data : jobs);
     const f = FILTERS.find((x) => x.key === filter)!;
-    return group(f.states ? base.filter((j) => f.states!.includes(j.state)) : base.slice(0, 100));
-  }, [jobs, filter, q, search.data]);
+    return group(f.states ? base.filter((j) => f.states!.includes(j.state)) : filter === "all" ? base : base.slice(0, 100));
+  }, [jobs, filter, q, search.data, all.data, person]);
 
-  const count = (states: JobState[] | null) => (states ? jobs.filter((j) => states.includes(j.state)).length : null);
+  const count = (key: Filter, states: JobState[] | null) =>
+    key === "all" ? (all.data?.length ?? null) : states ? jobs.filter((j) => states.includes(j.state)).length : null;
 
   return (
     <section className="jobs">
       <div className="jobs-bar">
         <div className="tabs" role="tablist" aria-label="Which jobs">
           {FILTERS.map((f) => {
-            const n = count(f.states);
+            const n = count(f.key, f.states);
             return (
               <button key={f.key} role="tab" aria-selected={filter === f.key} onClick={() => setFilter(f.key)}>
                 {f.label}
@@ -106,6 +122,16 @@ export function JobList({ jobs, now }: { jobs: JobRow[]; now: number }) {
             );
           })}
         </div>
+        {people.length > 1 && (
+          <select value={person} onChange={(e) => setPerson(e.target.value)} aria-label="Whose jobs">
+            <option value="">Everyone</option>
+            {people.map((p) => (
+              <option key={p} value={p}>
+                {who(p)}
+              </option>
+            ))}
+          </select>
+        )}
         <input
           type="search"
           placeholder="Search titles and descriptions"

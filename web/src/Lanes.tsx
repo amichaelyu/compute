@@ -1,5 +1,6 @@
+import { useState } from "react";
 import type { BackendSummary, JobRow, QueuedJob } from "./api";
-import { ms, when } from "./util";
+import { ms, when, who } from "./util";
 
 /** "22:00", or "Tue 00:00" where a new day starts. */
 function tickLabel(t: number) {
@@ -100,6 +101,14 @@ export function Lanes({
   queues: Record<string, QueuedJob[]>;
   now: number;
 }) {
+  // Lanes opened to show every row instead of the first MAX_ROWS.
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const toggle = (name: string) =>
+    setExpanded((s) => {
+      const n = new Set(s);
+      if (!n.delete(name)) n.add(name);
+      return n;
+    });
   const start = now - BEFORE;
   const end = now + AFTER;
   const pct = (t: number) => ((Math.min(Math.max(t, start), end) - start) / (end - start)) * 100;
@@ -139,6 +148,8 @@ export function Lanes({
         const ext = (queues[name] ?? []).map((q) => extBar(q, now)).filter((x): x is Ext => x !== null && x.to >= start && x.from <= end);
         // Rows of compute's own active jobs, then rows of the user's other Slurm jobs.
         const rows: (Bar | Ext)[][] = [...pack(bars.filter((b) => b.kind === "running" || b.kind === "waiting")), ...pack(ext)];
+        const open = expanded.has(name);
+        const visible = open ? rows : rows.slice(0, MAX_ROWS);
         const hidden = rows.slice(MAX_ROWS).reduce((n, r) => n + r.length, 0);
         // Finished jobs take a thin strip at the top; active bars sit below it.
         const offset = past.length ? 1.1 : 0.25;
@@ -153,7 +164,7 @@ export function Lanes({
                 </span>
               )}
             </div>
-            <div className="lane-track" style={{ minHeight: `${Math.max(1, Math.min(rows.length, MAX_ROWS)) * 1.75 + offset + 0.25}rem` }}>
+            <div className="lane-track" style={{ minHeight: `${Math.max(1, visible.length) * 1.75 + offset + (hidden > 0 ? 1.25 : 0.25)}rem` }}>
               {ticks.map((t) => (
                 <span key={t} className="gridline" style={{ left: `${pct(t)}%` }} />
               ))}
@@ -166,12 +177,12 @@ export function Lanes({
                     href={`#/jobs/${b.job.id}`}
                     className={`bar bar-past bar-${b.kind}`}
                     style={{ left: `${left}%`, width: `${Math.max(0, pct(b.to) - left)}%` }}
-                    title={`#${b.job.id} ${b.job.title}\n${b.job.state}, ${when(b.job, now)}`}
+                    title={`#${b.job.id} ${b.job.title}\nfrom ${who(b.job.submitted_by)}, ${b.job.state}, ${when(b.job, now)}`}
                     aria-label={`job ${b.job.id}, ${b.job.state}`}
                   />
                 );
               })}
-              {rows.slice(0, MAX_ROWS).map((row, r) =>
+              {visible.map((row, r) =>
                 row.map((b) => {
                   if ("q" in b) {
                     const x = b;
@@ -203,7 +214,7 @@ export function Lanes({
                         top: `${r * 1.75 + offset}rem`,
                         ...(b.split !== undefined ? { ["--elapsed" as string]: `${Math.max(0, Math.min(100, elapsed))}%` } : {}),
                       }}
-                      title={`#${b.job.id} ${b.job.title}\n${b.job.state}, ${when(b.job, now)}`}
+                      title={`#${b.job.id} ${b.job.title}\nfrom ${who(b.job.submitted_by)}, ${b.job.state}, ${when(b.job, now)}`}
                     >
                       {width > 2.5 && (
                         <span>
@@ -214,7 +225,11 @@ export function Lanes({
                   );
                 }),
               )}
-              {hidden > 0 && <span className="lane-more">{hidden} more</span>}
+              {hidden > 0 && (
+                <button className="lane-more link" onClick={() => toggle(name)} aria-expanded={open}>
+                  {open ? "Show fewer" : `${hidden} more`}
+                </button>
+              )}
             </div>
           </div>
         );

@@ -224,6 +224,7 @@ async fn whoami(sess: Session) -> Json<Value> {
 
 /// Changes within v1 that a running agent should know about, newest first.
 const CHANGES: &[(&str, &str)] = &[
+    ("2026-11-25", "GET /v1/jobs takes `before=<id>` to page back past the newest `limit` (at most 1000) jobs: pass the smallest id of the previous page."),
     ("2026-11-25", "A cloud launch the provider refuses for lack of capacity no longer fails the job (staging_failed): compute tries the next fitting offer no dearer than the quote, else puts the job back in the queue (reason \"waiting: ...\") to be placed again, on another GPU type within max_cost_usd or later. The refused offer counts as unavailable for 10 minutes."),
     ("2026-11-24", "POST /v1/reports files a bug report about compute itself ({kind: bug|docs|feature, title, body, job_id?}); GET /v1/reports and /v1/reports/{id} read them (guests see their own), POST /v1/reports/{id}/close is the owner's. 30 reports per key per day."),
     ("2026-11-24", "Guest keys (any key not in `owners` in hosts.toml; whoami scope \"guest\"): jobs need container.image and run sandboxed (private code copy, no tailnet/LAN, one node, no paid backends, no builds); logs/metrics/outputs/cancel only on their own jobs; secrets, datasets and snapshots only their own (HEAD /v1/snapshots/{id} is 404 until they upload it). Errors: guest_sandbox, not_yours."),
@@ -776,6 +777,7 @@ struct ListQuery {
     q: Option<String>,
     limit: Option<u32>,
     array: Option<i64>,
+    before: Option<i64>,
 }
 
 async fn list_jobs(State(s): State<AppState>, _sess: Session, Query(q): Query<ListQuery>) -> ApiResult<Json<Value>> {
@@ -794,6 +796,7 @@ async fn list_jobs(State(s): State<AppState>, _sess: Session, Query(q): Query<Li
         states,
         query: q.q.clone(),
         array_id: q.array,
+        before: q.before,
         limit: Some(q.limit.unwrap_or(50).min(1000)),
     })?;
     let mut names = HashMap::new();

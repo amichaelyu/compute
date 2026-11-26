@@ -175,8 +175,9 @@ while 1024 are outstanding.
 
 To let someone in, they run `curl -fsSL https://compute.example.com/api/v1/install | sh`. The
 script is public and holds no secrets. Until their key is allowed, it prints their public key
-line. Paste it on the dashboard's **Users** page (or add it to `allowed_signers` by hand); then
-the same command signs them in, writes their `client.env` and installs the compute skill
+line and waits. Paste it on the dashboard's **Users** page (or add it to `allowed_signers` by
+hand); when they press Enter it signs them in (asking again if the key isn't there yet), writes
+their `client.env` and installs the compute skill
 (`GET /v1/skill`, behind the SSH-key login), which adds house rules for a shared network.
 Removing someone on the Users page deletes their line and ends their sessions at once. Only a
 Cloudflare Access login can manage users; SSH keys can't. Every key has full access: all jobs,

@@ -36,6 +36,8 @@ export interface JobRow {
   estimated_finish: string | null;
   time_s: number;
   exit_code: number | null;
+  /** The name of the key that submitted it (its fingerprint if the key is gone). */
+  submitted_by: string;
 }
 
 export interface Job extends Omit<JobRow, "time_s"> {
@@ -45,7 +47,6 @@ export interface Job extends Omit<JobRow, "time_s"> {
   secrets: string[];
   retries_left: number;
   priority: number;
-  submitted_by: string;
   after_ok?: (number | { array: number })[];
   after_any?: (number | { array: number })[];
   inputs?: { from_job: number; glob?: string | null; as: string }[];
@@ -135,12 +136,31 @@ export const removeUser = (fingerprint: string) =>
     method: "DELETE",
   });
 
-export const listJobs = (params: { state?: JobState[]; q?: string; limit?: number }) => {
+export const listJobs = (params: { state?: JobState[]; q?: string; limit?: number; before?: number }) => {
   const sp = new URLSearchParams({ limit: String(params.limit ?? 300) });
   if (params.state?.length) sp.set("state", params.state.join(","));
   if (params.q) sp.set("q", params.q);
+  if (params.before !== undefined) sp.set("before", String(params.before));
   return api<{ jobs: JobRow[] }>(`/v1/jobs?${sp}`).then((r) => r.jobs);
 };
+
+/** Every job matching `state`, newest first, paging back 1000 at a time. */
+export async function listAllJobs(state?: JobState[]): Promise<JobRow[]> {
+  const out: JobRow[] = [];
+  for (;;) {
+    const page = await listJobs({ state, limit: 1000, before: out.at(-1)?.id });
+    out.push(...page);
+    if (page.length < 1000) return out;
+  }
+}
+
+/** The newest 300 jobs plus every active one, however old: the dashboard's working set. */
+export async function listWorkingJobs(): Promise<JobRow[]> {
+  const [recent, active] = await Promise.all([listJobs({ limit: 300 }), listAllJobs(ACTIVE)]);
+  const byId = new Map<number, JobRow>();
+  for (const j of [...active, ...recent]) byId.set(j.id, j);
+  return [...byId.values()].sort((a, b) => b.id - a.id);
+}
 
 export const getJob = (id: number) => api<Job>(`/v1/jobs/${id}`);
 export const getLogs = (id: number, offset: number) =>

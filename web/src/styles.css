@@ -323,8 +323,10 @@ button {
   position: absolute;
   right: 0.5rem;
   bottom: 0.15rem;
+  z-index: 2;
   font-size: 0.75rem;
   color: var(--graphite);
+  cursor: pointer;
 }
 
 /* ---------------------------------------------------------------- jobs */
@@ -368,6 +370,7 @@ input[type="search"],
 input[type="password"],
 input[type="time"],
 input[type="text"],
+select,
 textarea {
   font: inherit;
   color: var(--ink);
@@ -389,7 +392,7 @@ input[type="search"] {
 
 .row {
   display: grid;
-  grid-template-columns: 4rem minmax(0, 1fr) 10rem 9rem 17rem;
+  grid-template-columns: 4rem minmax(0, 1fr) 10rem 9rem 7rem 17rem;
   gap: 1rem;
   align-items: baseline;
   width: 100%;
@@ -431,9 +434,16 @@ input[type="search"] {
 }
 
 .row-backend,
+.row-who,
 .row-when {
   color: var(--graphite);
   font-size: 0.875rem;
+}
+
+.row-who {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .empty {
@@ -839,6 +849,7 @@ input[type="search"] {
     row-gap: 0.1rem;
   }
   .row-backend,
+  .row-who,
   .row-when {
     grid-column: 2 / -1;
   }
@@ -914,6 +925,7 @@ input[type="search"] {
     row-gap: 0.1rem;
   }
   .row-backend,
+  .row-who,
   .row-when {
     grid-column: 2 / -1;
   }

@@ -1,6 +1,6 @@
 import { createRoot } from "react-dom/client";
 import "./styles.css";
-import { ApiError, type QueuedJob, getQueue, listBackends, listJobs, token, whoami } from "./api";
+import { ApiError, type QueuedJob, getQueue, listBackends, listWorkingJobs, token, whoami } from "./api";
 import { Backends } from "./Backends";
 import { JobList } from "./JobList";
 import { JobPanel } from "./JobPanel";
@@ -31,7 +31,7 @@ function App() {
   const route = useRoute();
   const now = useNow(15_000);
   const me = usePoll(whoami, 300_000, []);
-  const jobs = usePoll(() => listJobs({ limit: 300 }), 5000, []);
+  const jobs = usePoll(listWorkingJobs, 5000, []);
   const backends = usePoll(listBackends, 30_000, []);
   const slurm = (backends.data ?? []).filter((b) => b.kind === "slurm" && b.enabled && b.reachable).map((b) => b.name);
   const queues = usePoll(

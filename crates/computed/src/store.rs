@@ -187,6 +187,8 @@ pub struct JobFilter {
     pub states: Vec<JobState>,
     pub query: Option<String>,
     pub array_id: Option<i64>,
+    /// Only jobs with a smaller id (paging back through the list).
+    pub before: Option<i64>,
     pub limit: Option<u32>,
 }
 
@@ -354,6 +356,10 @@ impl Store {
         if let Some(a) = f.array_id {
             args.push(a.into());
             sql.push_str(&format!(" AND array_id = ?{}", args.len()));
+        }
+        if let Some(b) = f.before {
+            args.push(b.into());
+            sql.push_str(&format!(" AND id < ?{}", args.len()));
         }
         sql.push_str(" ORDER BY id DESC");
         if let Some(l) = f.limit {

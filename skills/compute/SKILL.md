@@ -322,6 +322,7 @@ cx "$COMPUTE_URL/v1/jobs/42/outputs?glob=metrics/*.json" | zstd -dc | tar -x -C 
 cx "$COMPUTE_URL/v1/jobs?state=running,pending,queued,waiting" # what's active
 cx "$COMPUTE_URL/v1/jobs?q=eval"                               # search titles and descriptions
 cx "$COMPUTE_URL/v1/jobs?array=7"                              # tasks of array 7
+cx "$COMPUTE_URL/v1/jobs?limit=1000&before=812"                # older jobs: page back by the smallest id seen
 cx -X POST "$COMPUTE_URL/v1/jobs/42/cancel"                     # ?array=1 cancels a whole array
 cx -X DELETE "$COMPUTE_URL/v1/jobs/42/outputs"                  # free a finished job's disk
 ```
