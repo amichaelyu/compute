@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { Fragment, useState } from "react";
 import type { ReactNode } from "react";
 import { ApiError, type BackendDetail, disableBackend, enableBackend, getBackend, listBackends } from "./api";
 import { Meter } from "./Meter";
@@ -43,49 +43,134 @@ type Obj = Record<string, unknown>;
 const num = (v: unknown) => (typeof v === "number" ? v : Number(v));
 const obj = (v: unknown): Obj => (v && typeof v === "object" ? (v as Obj) : {});
 
-/** Plain-language hardware rows for the backends we know how to describe. */
-function hardwareRows(b: BackendDetail): Rows | null {
-  const h = obj(b.hardware);
-  if (b.kind === "local") {
-    if (!b.hardware) return null;
-    const sched = obj(h.schedulable);
-    const rows: Rows = [
-      ["Processor", `${h.cpu_model ?? "unknown"}, ${h.cpus} cores`],
-      ["Memory", `${h.mem_gb} GB`],
-      ["System", `${h.os} on ${h.arch}`],
-    ];
-    if (Number.isFinite(num(h.disk_free_kb))) rows.push(["Disk free", `${Math.round(num(h.disk_free_kb) / 1048576)} GB`]);
-    rows.push(["Jobs may use", `${sched.cpus} CPUs and ${sched.mem_gb} GB`]);
-    return rows;
-  }
-  if (b.kind !== "slurm") {
-    const types = Object.entries(obj(h.gpu_types))
-      .map(([t, v]) => [t, obj(v)] as const)
-      .filter(([, v]) => v.available)
-      .sort((a, b2) => num(a[1].usd_per_hour_per_gpu) - num(b2[1].usd_per_hour_per_gpu))
-      .slice(0, 6)
-      .map(([t, v]) => `${t} $${num(v.usd_per_hour_per_gpu).toFixed(2)}/h`);
-    if (!b.hardware) return null;
-    return [
-      ["GPUs in stock", types.length ? types.join(", ") : "none listed"],
-      ["Nodes per job", `up to ${h.max_nodes ?? 1}`],
-      ["Prices from", String(h.price_source ?? "provider")],
-    ];
-  }
-  const rows: Rows = [];
-  for (const [part, info] of Object.entries(obj(h.partitions))) {
-    const p = obj(info);
-    const groups = Array.isArray(p.groups) ? (p.groups as Obj[]) : [];
-    const lines = groups.map((g) => {
-      const gres = String(g.gres_or_nodes ?? "");
-      const gpu = /gpu:(\d+)/.exec(gres);
-      const extra = gpu ? `, ${gpu[1]} GPUs each` : gres && gres !== "(null)" ? ` (${gres})` : "";
-      return `${g.nodes} × ${g.cpus} CPUs, ${g.mem_gb} GB${extra}`;
+const OS_NAMES: Record<string, string> = { macos: "macOS", linux: "Linux" };
+const gb = (bytes: unknown) => Math.round((num(bytes) / 1024 ** 3) * 10) / 10;
+
+/** A local machine's specs as label/value rows. */
+function localRows(h: Obj): Rows {
+  const sched = obj(h.schedulable);
+  const os = String(h.os ?? "");
+  const rows: Rows = [
+    ["Processor", `${h.cpu_model ?? "unknown"}, ${h.cpus} cores`],
+    ["Memory", `${h.mem_gb} GB`],
+  ];
+  if (Number.isFinite(num(h.docker_mem_bytes))) rows.push(["Docker VM", `${gb(h.docker_mem_bytes)} GB`]);
+  rows.push(["System", `${OS_NAMES[os] ?? os}, ${h.arch}`]);
+  if (Number.isFinite(num(h.disk_free_kb))) rows.push(["Disk free", `${Math.round(num(h.disk_free_kb) / 1048576)} GB`]);
+  rows.push(["Jobs may use", `${sched.cpus} CPUs, ${sched.mem_gb} GB`]);
+  return rows;
+}
+
+const SHOWN_GPUS = 6;
+
+/** A cloud's in-stock GPU types as a price list, cheapest first; the rest fold away. */
+function CloudGpus({ h }: { h: Obj }) {
+  const [all, setAll] = useState(false);
+  const types = Object.entries(obj(h.gpu_types))
+    .map(([t, v]) => [t, obj(v)] as const)
+    .filter(([, v]) => v.available)
+    .sort((a, b) => num(a[1].usd_per_hour_per_gpu) - num(b[1].usd_per_hour_per_gpu) || a[0].localeCompare(b[0]))
+    .map(([t, v]) => {
+      // Lambda names carry the card's specs in parentheses: "A100 (40 GB SXM4)".
+      const m = /^(.*?)\s*\((.+)\)$/.exec(t);
+      return { name: m ? m[1]! : t, spec: m ? m[2]! : "", price: num(v.usd_per_hour_per_gpu) };
     });
-    if (p.gpu_type) lines.push(`${p.gpu_type} GPUs with ${p.gpu_mem_gb ?? "?"} GB each`);
-    rows.push([`${part} partition`, lines.join("; ")]);
-  }
-  return rows.length ? rows : null;
+  if (!types.length) return <p className="muted">No GPUs in stock right now.</p>;
+  const shown = all ? types : types.slice(0, SHOWN_GPUS);
+  const hidden = types.length - shown.length;
+  return (
+    <div>
+      <p className="hw-caption muted">{types.length} GPU types in stock, per GPU-hour</p>
+      <ul className="hw-prices">
+        {shown.map((t) => (
+          <li key={t.name + t.spec}>
+            <span>{t.name}</span>
+            <span className="muted">{t.spec}</span>
+            <span className="hw-price">${t.price.toFixed(2)}</span>
+          </li>
+        ))}
+      </ul>
+      {types.length > SHOWN_GPUS && (
+        <button className="link hw-more" aria-expanded={all} onClick={() => setAll(!all)}>
+          {all ? "Show the cheapest only" : `Show ${hidden} more`}
+        </button>
+      )}
+    </div>
+  );
+}
+
+/** Node names from Slurm's compressed list, split between hosts but not inside brackets:
+ * "barley-[01-04],oat-[01-06]" → ["barley-[01-04]", "oat-[01-06]"]. */
+const nodeNames = (s: string) => s.split(/,(?![^[]*\])/).filter(Boolean);
+
+/** A Slurm cluster's partitions: one aligned line per kind of node. */
+function SlurmPartitions({ h }: { h: Obj }) {
+  const parts = Object.entries(obj(h.partitions)).map(([name, info]) => [name, obj(info)] as const);
+  return (
+    <div className="hw-parts">
+      {parts.map(([name, p]) => {
+        const groups = Array.isArray(p.groups) ? (p.groups as Obj[]) : [];
+        return (
+          <section key={name} className="hw-part">
+            <h4>
+              {name}
+              {p.gpu_type ? (
+                <span className="muted">
+                  {" "}
+                  {String(p.gpu_type)} GPUs, {String(p.gpu_mem_gb ?? "?")} GB each
+                </span>
+              ) : (
+                <span className="muted"> CPU only</span>
+              )}
+            </h4>
+            {groups.map((g, i) => {
+              const gres = String(g.gres_or_nodes ?? "");
+              const gpus = /gpu:(\d+)/.exec(gres)?.[1];
+              const hosts = !gpus && gres && gres !== "(null)" ? nodeNames(gres) : [];
+              return (
+                <div key={i} className="hw-group">
+                  <span>{String(g.nodes)} nodes</span>
+                  <span>{String(g.cpus)} CPUs</span>
+                  <span>{String(g.mem_gb)} GB</span>
+                  <span>{gpus ? `${gpus} GPUs` : ""}</span>
+                  {hosts.length > 0 && (
+                    <span className="hw-hosts muted">
+                      {hosts.map((n, j) => (
+                        <Fragment key={n}>
+                          <span>{n}</span>
+                          {j < hosts.length - 1 ? ", " : ""}
+                        </Fragment>
+                      ))}
+                    </span>
+                  )}
+                </div>
+              );
+            })}
+          </section>
+        );
+      })}
+    </div>
+  );
+}
+
+/** The hardware column, laid out for each kind of backend; anything else falls back to KV. */
+function Hardware({ b }: { b: BackendDetail }) {
+  if (!b.hardware) return <KV value={null} />;
+  const h = b.hardware;
+  if (b.kind === "local") return <RowsOrKV rows={localRows(h)} raw={h} />;
+  if (b.kind === "slurm") return Object.keys(obj(h.partitions)).length ? <SlurmPartitions h={h} /> : <KV value={h} />;
+  return (
+    <div className="hw">
+      <CloudGpus h={h} />
+      <RowsOrKV
+        rows={[
+          ["Nodes per job", `up to ${h.max_nodes ?? 1}`],
+          ["Prices from", String(h.price_source ?? "provider")],
+        ]}
+        raw={null}
+      />
+    </div>
+  );
 }
 
 /** Plain-language availability rows. */
@@ -115,7 +200,7 @@ function availabilityRows(b: BackendDetail): Rows | null {
   }
   if (b.kind !== "slurm") {
     return [
-      ["Instances of yours", String(a.my_instances ?? 0)],
+      ["Your instances", String(a.my_instances ?? 0)],
       ["Boot time", `about ${Math.round(num(a.boot_estimate_s ?? 0) / 60)} min`],
     ];
   }
@@ -258,7 +343,7 @@ function Backend({ b, onChange }: { b: BackendDetail; onChange: () => void }) {
         </div>
         <div>
           <h3>Hardware</h3>
-          <RowsOrKV rows={hardwareRows(b)} raw={b.hardware} />
+          <Hardware b={b} />
         </div>
         <div>
           <h3>Limits</h3>

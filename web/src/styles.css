@@ -415,7 +415,7 @@ input[type="search"] {
 
 .row {
   display: grid;
-  grid-template-columns: 4rem minmax(0, 1fr) 10rem 9rem 7rem 17rem;
+  grid-template-columns: 4rem minmax(0, 1fr) 10rem 11rem 7rem 17rem;
   gap: 1rem;
   align-items: baseline;
   width: 100%;
@@ -785,6 +785,64 @@ header > .skel,
 .backend-cols h3 {
   font-size: 0.9375rem;
   margin-bottom: 0.5rem;
+}
+
+/* Hardware column: specs laid out as aligned columns, not run-on sentences. */
+
+.hw,
+.hw-parts {
+  display: grid;
+  gap: 1rem;
+}
+
+.hw-caption {
+  margin: 0 0 0.35rem;
+}
+
+.hw-prices {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+  display: grid;
+  grid-template-columns: repeat(3, max-content);
+  justify-content: start;
+  column-gap: 2ch;
+  row-gap: 0.15rem;
+}
+
+.hw-prices li {
+  display: grid;
+  grid-column: 1 / -1;
+  grid-template-columns: subgrid;
+}
+
+.hw-price {
+  text-align: right;
+}
+
+.hw-more {
+  margin-top: 0.35rem;
+  color: var(--graphite);
+}
+
+.hw-part h4 {
+  margin: 0 0 0.25rem;
+  font-size: inherit;
+  font-weight: 600;
+}
+
+.hw-group {
+  display: grid;
+  grid-template-columns: 9ch 9ch 8ch auto;
+  column-gap: 1rem;
+}
+
+.hw-hosts {
+  grid-column: 1 / -1;
+}
+
+.hw-hosts > span {
+  white-space: nowrap;
 }
 
 .toggle {

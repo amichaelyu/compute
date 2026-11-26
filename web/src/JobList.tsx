@@ -53,10 +53,12 @@ function Row({ j, now, task }: { j: JobRow; now: number; task?: boolean }) {
       <span className="row-backend">
         {j.backend ?? "not placed"}
         {cost && (
-          <span className="row-cost" title={j.usd_per_hour !== undefined ? `$${j.usd_per_hour.toFixed(2)}/h` : undefined}>
+          <>
             {" "}
-            · {cost}
-          </span>
+            <span className="row-cost" title={j.usd_per_hour !== undefined ? `$${j.usd_per_hour.toFixed(2)}/h` : undefined}>
+              · {cost}
+            </span>
+          </>
         )}
       </span>
       <span className="row-who" title="Submitted by">
@@ -92,7 +94,12 @@ function ArrayRows({ id, jobs, now }: { id: number; jobs: JobRow[]; now: number 
         <State state={jobs.some((j) => j.state === "running") ? "running" : first.state} />
         <span className="row-backend">
           {backends}
-          {cost && <span className="row-cost"> · {cost}</span>}
+          {cost && (
+            <>
+              {" "}
+              <span className="row-cost">· {cost}</span>
+            </>
+          )}
         </span>
         <span className="row-who" title="Submitted by">
           {people}
