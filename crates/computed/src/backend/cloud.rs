@@ -362,6 +362,13 @@ impl CloudBackend {
                 return self.ready_instance(job, i).await;
             }
             let _ = self.provider.terminate(&i).await;
+            // Its billing ends here; the next attempt carries the cost forward.
+            if let Err(e) = self.store.cost_end(job.id, Utc::now()) {
+                tracing::warn!("closing the cost of {}: {e:#}", i.name);
+            }
+            // Renting a new one here would skip placement (budget, the key's access and caps, the
+            // quoted price): put the job back in the queue to be placed again.
+            return Err(NoCapacity(format!("its instance {} from before the restart is gone; placing it again", i.name)).into());
         }
         self.create_instance(job).await
     }
@@ -375,7 +382,7 @@ impl CloudBackend {
         let offer = match &quoted {
             Some(q) => offers
                 .iter()
-                .find(|o| o.available && o.id == q.id && o.region == q.region)
+                .find(|o| o.available && o.id == q.id && o.region == q.region && o.usd_per_hour <= q.usd_per_hour)
                 .or_else(|| offers.iter().find(|o| o.available && offer_fits(o, job) && o.usd_per_hour <= q.usd_per_hour))
                 .cloned()
                 .ok_or_else(|| {

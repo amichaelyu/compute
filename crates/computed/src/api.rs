@@ -480,7 +480,9 @@ async fn submit(State(s): State<AppState>, sess: Session, body: Result<Json<Valu
         None
     };
 
-    let preview = Job::preview(&req, res.clone(), spec.clone());
+    let mut preview = Job::preview(&req, res.clone(), spec.clone());
+    // Placement applies the submitting key's access policy and spend caps.
+    preview.key_fingerprint = sess.fingerprint.clone();
     let plan = s.sched.plan(&preview).await?;
     let per_backend: BTreeMap<String, String> =
         plan.quotes.iter().map(|(n, q)| (n.clone(), quote_line(&s.tz, q))).collect();
@@ -1468,8 +1470,19 @@ async fn remove_user(State(s): State<AppState>, sess: Session, Query(q): Query<F
     sess.require_owner()?;
     let removed = crate::users::remove(s.auth.allowed_signers(), &q.fingerprint)?;
     let ended = s.sched.store.delete_sessions(&q.fingerprint)?;
+    // Its jobs that haven't started would otherwise still be placed, under the default access
+    // once its policy is gone; running ones finish.
+    let by = sess.public_name();
+    let mut cancelled = 0;
+    for j in s.sched.store.jobs_in_states(&[JobState::Waiting, JobState::Queued])? {
+        if j.key_fingerprint == q.fingerprint && s.sched.cancel(&j, &by).await.is_ok() {
+            s.sched.store.record_cancel(j.id, &by, &sess.public_key())?;
+            cancelled += 1;
+        }
+    }
     s.sched.store.set_key_policy(&q.fingerprint, &Default::default())?;
-    Ok(Json(json!({"removed": removed, "sessions_ended": ended})))
+    s.sched.kick();
+    Ok(Json(json!({"removed": removed, "sessions_ended": ended, "jobs_cancelled": cancelled})))
 }
 
 /// The one-command setup (`curl -fsSL <url>/v1/install | sh`). Public: it holds no secrets, and

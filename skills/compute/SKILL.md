@@ -264,7 +264,8 @@ $/h and per month. `GET /v1/whoami` lists `backends` (the ones your key may use)
 (per paid backend: `usd_per_hour`, `usd_per_month`, `in_use_usd_per_hour`,
 `spent_this_month_usd`, `committed_this_month_usd`; null means no cap). A job that would pass a
 cap waits, and its reason names the cap. The monthly cap counts running and placed jobs at their
-full time limit, so a long `time` uses up more of it.
+full time limit, so a long `time` uses up more of it. Caps only decide whether a job starts: a
+running job is never stopped by one, even if it finishes past it.
 
 1. Send the request with `"max_cost_usd": 5, "dry_run": true`. The response has `quote_id`,
    `backend`, `estimated_cost_usd` (null when a free backend wins), `cheapest_paid_option` and

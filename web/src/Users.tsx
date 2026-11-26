@@ -257,11 +257,6 @@ function UserRow({ u, backends, onChanged }: { u: User; backends: BackendRef[]; 
   return (
     <li className="user">
       <span className="user-name">{u.name || <span className="muted">(no name)</span>}</span>
-      <span className="muted small user-key" title={u.fingerprint}>
-        {u.key_type.replace(/^ssh-/, "")} {u.fingerprint.replace(/^SHA256:/, "").slice(0, 12)}…{u.comment && ` ${u.comment}`}
-      </span>
-      <AccessSummary u={u} />
-      {u.note && <span className="error small">Can't sign in: {u.note}</span>}
       {!editing && (
         <button className="btn" onClick={() => setEditing(true)} aria-expanded={editing}>
           Access
@@ -298,6 +293,11 @@ function UserRow({ u, backends, onChanged }: { u: User; backends: BackendRef[]; 
         </button>
       )}
       {error && <span className="error">{error}</span>}
+      <span className="muted small user-key" title={u.fingerprint}>
+        {u.key_type.replace(/^ssh-/, "")} {u.fingerprint.replace(/^SHA256:/, "").slice(0, 12)}…{u.comment && ` ${u.comment}`}
+      </span>
+      <AccessSummary u={u} />
+      {u.note && <span className="error small">Can't sign in: {u.note}</span>}
       {editing && <AccessEditor u={u} backends={backends} onSaved={onChanged} onClose={() => setEditing(false)} />}
     </li>
   );

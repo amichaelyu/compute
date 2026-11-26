@@ -900,15 +900,17 @@ impl Scheduler {
     pub fn hourly_in_use(&self) -> Result<f64> {
         let open: HashMap<i64, f64> =
             self.store.costs_since(Utc::now())?.into_iter().filter(|r| r.4.is_none()).map(|r| (r.0, r.2)).collect();
-        let staging: HashSet<i64> = self.store.jobs_in_states(&[JobState::Staging])?.iter().map(|j| j.id).collect();
+        // Lock before reading which jobs are staging: placement moves a job to Staging and then
+        // adds its hold, so a hold added after this read can't be dropped by it.
         let mut reserved = lock(&self.reserved);
+        let staging: HashSet<i64> = self.store.jobs_in_states(&[JobState::Staging])?.iter().map(|j| j.id).collect();
         reserved.retain(|id, _| staging.contains(id) && !open.contains_key(id));
         // + 0.0: an empty float sum is -0.0.
         Ok(open.values().sum::<f64>() + reserved.values().map(|h| h.rate).sum::<f64>() + 0.0)
     }
 
-    /// One key's spend on `backend` this month, leaving out job `except` (the one being placed,
-    /// which may have an earlier attempt's open row).
+    /// One key's spend on `backend` this month. Job `except` (the one being placed) counts only
+    /// for what earlier attempts of it cost, not for an attempt still open.
     pub fn key_usage(&self, key: &str, backend: &str, except: i64) -> Result<KeyUsage> {
         // Drops holds of jobs that have left staging.
         self.hourly_in_use()?;
@@ -918,7 +920,7 @@ impl Scheduler {
         let mut u = KeyUsage::default();
         let mut open = HashSet::new();
         for (id, b, rate, started, ended, cost) in self.store.key_costs_since(key, since)? {
-            if b != backend || id == except {
+            if b != backend || (id == except && ended.is_none()) {
                 continue;
             }
             match ended {
@@ -954,7 +956,7 @@ impl Scheduler {
         let u = self.key_usage(&job.key_fingerprint, backend, job.id)?;
         if let Some(max) = l.usd_per_hour {
             if rate > max {
-                return Ok(Some(format!("${rate:.2}/h is over your key's limit of ${max:.2}/h on {backend}")));
+                return Ok(Some(format!("${rate:.2}/h is over your key's limit of ${max:.2}/h on {backend} (a cheaper GPU type may fit)")));
             }
             if u.usd_per_hour + rate > max {
                 return Ok(Some(format!(
@@ -1072,7 +1074,11 @@ impl Scheduler {
         let mut ready_at: HashMap<String, DateTime<Utc>> = HashMap::new();
         let limit = self.budget.hourly_usd;
         let in_use = self.hourly_in_use()?;
-        let policy = self.store.key_policy(&job.key_fingerprint)?;
+        // An unreadable policy denies every backend for that key rather than stalling the queue.
+        let policy = self.store.key_policy(&job.key_fingerprint).unwrap_or_else(|e| {
+            tracing::warn!("job {}: {e:#}; placing nothing for its key", job.id);
+            KeyPolicy { backends: Some(Vec::new()), ..Default::default() }
+        });
         for b in &self.backends {
             let name = b.name().to_string();
             let q = if job.backends.as_ref().is_some_and(|l| !l.contains(&name)) {

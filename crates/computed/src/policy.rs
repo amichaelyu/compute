@@ -5,14 +5,15 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
 /// Spend caps on one paid backend. None: no cap of that kind (the network's hourly budget
-/// still applies).
+/// still applies). Caps decide whether a job may start; a running job is never stopped by one.
 #[derive(Serialize, Deserialize, Clone, Debug, Default, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct SpendLimit {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usd_per_hour: Option<f64>,
-    /// Per calendar month in the daemon's time zone, counting what running and placed jobs
-    /// will cost by their time limit, so a cap isn't overrun by jobs already started.
+    /// Per calendar month in the daemon's time zone. A job starts only if what's spent, plus
+    /// what running and placed jobs will cost by their time limit, plus its own estimate fits,
+    /// so a burst of jobs can't all start under it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usd_per_month: Option<f64>,
 }
