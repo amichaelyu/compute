@@ -944,96 +944,190 @@ header > .skel,
   border-top: 1px solid var(--rule);
 }
 
+/* One person per row: who they are, Access beside them (no trip across the page), what they
+   may use with their key under it, and Remove apart at the right edge. The access editor
+   opens under the row, full width. */
 .user {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.25rem 1rem;
-  align-items: center;
-  padding: 0.6rem 0;
+  display: grid;
+  grid-template-columns: 8rem auto minmax(0, 1fr) auto;
+  gap: 0.3rem 1.25rem;
+  align-items: start;
+  padding: 0.7rem 0;
   border-bottom: 1px solid var(--rule);
 }
 
+.user-who {
+  display: grid;
+  line-height: 1.25;
+}
+
 .user-name {
-  min-width: 6rem;
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
-/* Actions sit beside the name, so reaching them doesn't take a trip across the page. */
-.user > .btn,
-.user > .confirm {
-  flex: none;
+.user-actions {
+  display: flex;
+  gap: 0.5rem;
+  align-items: center;
+  flex-wrap: wrap;
 }
 
-.user-key {
-  flex: 0 1 26rem;
+.user-remove {
+  grid-column: 4;
+  grid-row: 1;
+  justify-self: end;
+}
+
+.user-remove .confirm {
+  justify-content: flex-end;
+  max-width: 30rem;
+  text-align: right;
+}
+
+.user-actions .btn[aria-expanded="true"] {
+  background: var(--raised);
+  border-color: var(--graphite);
+}
+
+.user-access {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.35rem;
   min-width: 0;
+  padding-top: 0.2rem;
+}
+
+/* The key identifies the person; it sits quietly under what they may use. */
+.user-key {
+  grid-column: 3;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
-.user-access {
-  flex: 1 1 22rem;
-  min-width: 0;
+.user-note,
+.user > .access {
+  grid-column: 1 / -1;
+}
+
+.tag {
+  display: inline-flex;
+  gap: 0.5rem;
+  align-items: baseline;
+  padding: 0.1rem 0.5rem;
+  border: 1px solid var(--rule);
+  border-radius: 4px;
+  font-size: 0.8125rem;
+  white-space: nowrap;
+}
+
+.tag-paid {
+  border-color: color-mix(in srgb, var(--waiting) 55%, var(--rule));
+}
+
+.tag-spend {
+  color: var(--graphite);
 }
 
 .access {
-  flex-basis: 100%;
   display: grid;
-  gap: 0.9rem;
-  margin: 0.4rem 0 0.2rem;
-  padding: 0.8rem 0.9rem;
+  gap: 0.8rem;
+  margin-top: 0.3rem;
+  padding: 0.9rem 1rem;
   background: var(--raised);
   border: 1px solid var(--rule);
   border-radius: 6px;
 }
 
-.access fieldset {
-  display: grid;
-  gap: 0.4rem;
-  margin: 0;
-  padding: 0;
-  border: 0;
-  min-width: 0;
+.access-table {
+  border-collapse: collapse;
+  width: max-content;
+  max-width: 100%;
 }
 
-.access legend {
-  padding: 0;
-  margin-bottom: 0.3rem;
-  font-size: 0.875rem;
+.access-table th {
+  text-align: left;
+  font-weight: normal;
+  font-size: 0.8125rem;
+  color: var(--graphite);
+  padding: 0 1.5rem 0.35rem 0;
+}
+
+.access-table td {
+  padding: 0.3rem 1.5rem 0.3rem 0;
+  vertical-align: middle;
+}
+
+.access-off .access-backend {
   color: var(--graphite);
 }
 
-.access label {
+.access-backend {
   display: inline-flex;
-  gap: 0.4rem;
-  align-items: center;
-}
-
-.access-backends {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.4rem 1.25rem;
-  padding-left: 1.5rem;
-}
-
-.access-caps {
-  display: grid;
   gap: 0.5rem;
-}
-
-.access-cap {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 0.4rem 1rem;
   align-items: center;
+  cursor: pointer;
 }
 
-.access-cap-name {
-  min-width: 6rem;
+.cap-input {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.2rem;
+  padding-left: 0.5rem;
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  background: var(--paper);
 }
 
-.access-cap input {
-  width: 6.5rem;
+.cap-input:focus-within {
+  border-color: var(--focus);
+}
+
+.cap-input input {
+  width: 6rem;
+  border: 0;
+  background: none;
+  padding: 0.3rem 0.5rem 0.3rem 0;
+}
+
+.cap-input input:focus-visible {
+  outline: none;
+}
+
+.cap-input-off {
+  opacity: 0.45;
+}
+
+.access-default {
+  margin: 0;
+  max-width: 72ch;
+}
+
+@media (max-width: 900px) {
+  .user {
+    grid-template-columns: minmax(0, 1fr) auto auto;
+  }
+  .user-remove {
+    grid-column: 3;
+  }
+  .user-access,
+  .user-key {
+    grid-column: 1 / -1;
+  }
+  .access-table thead {
+    display: none;
+  }
+  .access-table tr {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.4rem 0.75rem;
+    padding: 0.35rem 0;
+  }
+  .access-table td {
+    padding: 0;
+  }
 }
 
 /* ---------------------------------------------------------------- sign in */

@@ -79,30 +79,38 @@ function AddUser({ onAdded }: { onAdded: (u: User) => void }) {
   );
 }
 
-const usd = (n: number) => `$${n.toFixed(2)}`;
+const usd = (n: number) => `$${n % 1 ? n.toFixed(2) : n.toFixed(0)}`;
 
-/** "lambda $5/h, $50/mo, $3.20 spent" for each paid backend the key may use. */
-function capsText(u: User) {
-  return Object.entries(u.access?.limits ?? {}).map(([name, l]) => {
-    const caps = [
-      l.usd_per_hour !== null ? `${usd(l.usd_per_hour)}/h` : null,
-      l.usd_per_month !== null ? `${usd(l.usd_per_month)}/mo` : null,
-    ].filter(Boolean);
-    return `${name} ${caps.length ? caps.join(", ") : "no cap"}, ${usd(l.spent_this_month_usd)} spent`;
-  });
+/** One backend the key may use; paid ones carry this month's spend and their caps. */
+function BackendTag({ name, u }: { name: string; u: User }) {
+  const l = u.access?.limits[name];
+  if (!l) return <span className="tag">{name}</span>;
+  const caps = [
+    l.usd_per_hour !== null ? `${usd(l.usd_per_hour)}/h` : null,
+    l.usd_per_month !== null ? `${usd(l.usd_per_month)}/mo` : null,
+  ].filter(Boolean);
+  return (
+    <span className="tag tag-paid" title={`${name}: ${caps.length ? `capped at ${caps.join(" and ")}` : "no cap"}`}>
+      {name}
+      <span className="tag-spend">
+        {usd(l.spent_this_month_usd)}
+        {l.usd_per_month !== null && ` of ${usd(l.usd_per_month)}`} this month
+      </span>
+      {l.usd_per_hour !== null && <span className="tag-spend">max {usd(l.usd_per_hour)}/h</span>}
+    </span>
+  );
 }
 
 function AccessSummary({ u }: { u: User }) {
   const a = u.access;
   if (!a) return null;
-  const caps = capsText(u);
   return (
-    <span className="user-access small muted">
-      {u.owner ? "Owner" : "Guest"}
-      {" · "}
-      {a.allowed.length ? a.allowed.join(", ") : "no backends"}
-      {a.policy.backends === null && " (default)"}
-      {caps.length > 0 && ` · ${caps.join("; ")}`}
+    <span className="user-access">
+      {a.allowed.length ? (
+        a.allowed.map((name) => <BackendTag key={name} name={name} u={u} />)
+      ) : (
+        <span className="muted small">No backends</span>
+      )}
     </span>
   );
 }
@@ -114,6 +122,23 @@ function parseCap(text: string, label: string): number | null {
   const n = Number(t);
   if (!Number.isFinite(n) || n < 0) throw new Error(`${label} must be a dollar amount, 0 or more (or empty for no cap)`);
   return n;
+}
+
+function CapInput({ value, onChange, label, disabled }: { value: string; onChange: (v: string) => void; label: string; disabled: boolean }) {
+  return (
+    <span className={`cap-input${disabled ? " cap-input-off" : ""}`}>
+      <span aria-hidden="true">$</span>
+      <input
+        type="text"
+        inputMode="decimal"
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+        placeholder="no cap"
+        aria-label={label}
+        disabled={disabled}
+      />
+    </span>
+  );
 }
 
 function AccessEditor({
@@ -133,28 +158,34 @@ function AccessEditor({
   const [chosen, setChosen] = useState<Set<string>>(new Set(policy.backends ?? defaults));
   const [caps, setCaps] = useState<Record<string, { h: string; m: string }>>(() =>
     Object.fromEntries(
-      backends
-        .filter((b) => b.paid)
-        .map((b) => {
-          const l = policy.limits?.[b.name];
-          return [b.name, { h: l?.usd_per_hour?.toString() ?? "", m: l?.usd_per_month?.toString() ?? "" }];
-        }),
+      backends.map((b) => {
+        const l = policy.limits?.[b.name];
+        return [b.name, { h: l?.usd_per_hour?.toString() ?? "", m: l?.usd_per_month?.toString() ?? "" }];
+      }),
     ),
   );
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const allowed = new Set(custom ? chosen : defaults);
-  const paidAllowed = backends.filter((b) => b.paid && allowed.has(b.name));
+  const who = u.name || "this key";
+
+  const toggle = (name: string, on: boolean) => {
+    const next = new Set(chosen);
+    if (on) next.add(name);
+    else next.delete(name);
+    setChosen(next);
+    setCustom(true);
+  };
 
   const save = async () => {
     setError(null);
     let next: KeyPolicy;
     try {
       const limits: KeyPolicy["limits"] = {};
-      for (const b of paidAllowed) {
+      for (const b of backends) {
+        if (!b.paid || !chosen.has(b.name)) continue;
         const c = caps[b.name] ?? { h: "", m: "" };
-        const usd_per_hour = parseCap(c.h, `${b.name} $/hour`);
-        const usd_per_month = parseCap(c.m, `${b.name} $/month`);
+        const usd_per_hour = parseCap(c.h, `${b.name} cap per hour`);
+        const usd_per_month = parseCap(c.m, `${b.name} cap per month`);
         if (usd_per_hour !== null || usd_per_month !== null) limits[b.name] = { usd_per_hour, usd_per_month };
       }
       next = { backends: custom ? backends.map((b) => b.name).filter((n) => chosen.has(n)) : null, limits };
@@ -175,77 +206,97 @@ function AccessEditor({
   };
 
   return (
-    <div className="access" role="group" aria-label={`Access for ${u.name || "this key"}`}>
-      <fieldset>
-        <legend>Backends</legend>
-        <label>
-          <input type="radio" checked={!custom} onChange={() => setCustom(false)} />
-          Default ({u.owner ? "every backend, as an owner" : "the free ones, as a guest"})
-        </label>
-        <label>
-          <input type="radio" checked={custom} onChange={() => setCustom(true)} />
-          Only these:
-        </label>
-        <div className="access-backends">
-          {backends.map((b) => (
-            <label key={b.name} className={custom ? undefined : "muted"}>
-              <input
-                type="checkbox"
-                disabled={!custom}
-                checked={allowed.has(b.name)}
-                onChange={(e) => {
-                  const next = new Set(chosen);
-                  if (e.target.checked) next.add(b.name);
-                  else next.delete(b.name);
-                  setChosen(next);
-                }}
-              />
-              {b.name}
-              {b.paid && <span className="small muted">paid</span>}
-            </label>
-          ))}
-        </div>
-      </fieldset>
-      {paidAllowed.length > 0 && (
-        <fieldset>
-          <legend>Spend caps (empty: no cap beyond the network's hourly budget)</legend>
-          <div className="access-caps">
-            {paidAllowed.map((b) => {
-              const c = caps[b.name] ?? { h: "", m: "" };
-              const used = u.access?.limits[b.name];
-              const set = (k: "h" | "m", v: string) => setCaps({ ...caps, [b.name]: { ...c, [k]: v } });
-              return (
-                <div key={b.name} className="access-cap">
-                  <span className="access-cap-name">{b.name}</span>
-                  <label>
-                    $/hour
-                    <input type="text" inputMode="decimal" value={c.h} onChange={(e) => set("h", e.target.value)} placeholder="no cap" />
+    <form
+      className="access"
+      aria-label={`What ${who} may use`}
+      onSubmit={(e) => {
+        e.preventDefault();
+        save();
+      }}
+      onKeyDown={(e) => e.key === "Escape" && onClose()}
+    >
+      <table className="access-table">
+        <thead>
+          <tr>
+            <th scope="col">Backend</th>
+            <th scope="col">Max per hour</th>
+            <th scope="col">Max per month</th>
+            <th scope="col">This month</th>
+          </tr>
+        </thead>
+        <tbody>
+          {backends.map((b) => {
+            const on = chosen.has(b.name);
+            const c = caps[b.name] ?? { h: "", m: "" };
+            const set = (k: "h" | "m", v: string) => setCaps({ ...caps, [b.name]: { ...c, [k]: v } });
+            const used = u.access?.limits[b.name];
+            return (
+              <tr key={b.name} className={on ? undefined : "access-off"}>
+                <td>
+                  <label className="access-backend">
+                    <input type="checkbox" checked={on} onChange={(e) => toggle(b.name, e.target.checked)} />
+                    {b.name}
+                    {b.paid && <span className="small muted">paid</span>}
                   </label>
-                  <label>
-                    $/month
-                    <input type="text" inputMode="decimal" value={c.m} onChange={(e) => set("m", e.target.value)} placeholder="no cap" />
-                  </label>
-                  <span className="small muted">
-                    {used
-                      ? `${usd(used.spent_this_month_usd)} spent this month, ${usd(used.in_use_usd_per_hour)}/h now`
-                      : "nothing spent yet"}
-                  </span>
-                </div>
-              );
-            })}
-          </div>
-        </fieldset>
-      )}
+                </td>
+                {b.paid ? (
+                  <>
+                    <td>
+                      <CapInput value={c.h} onChange={(v) => set("h", v)} label={`${b.name} max per hour`} disabled={!on} />
+                    </td>
+                    <td>
+                      <CapInput value={c.m} onChange={(v) => set("m", v)} label={`${b.name} max per month`} disabled={!on} />
+                    </td>
+                    <td className="small muted">
+                      {used ? `${usd(used.spent_this_month_usd)} spent` : "—"}
+                      {used && used.in_use_usd_per_hour > 0 && `, ${usd(used.in_use_usd_per_hour)}/h now`}
+                    </td>
+                  </>
+                ) : (
+                  <td colSpan={3} className="small muted">
+                    Free
+                  </td>
+                )}
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+      <p className="small muted access-default">
+        {custom ? (
+          <>
+            Chosen for {who}.{" "}
+            <button
+              type="button"
+              className="link"
+              onClick={() => {
+                setCustom(false);
+                setChosen(new Set(defaults));
+              }}
+            >
+              Go back to the default
+            </button>{" "}
+            ({u.owner ? "every backend, as an owner" : "free backends only, as a guest"}).
+          </>
+        ) : (
+          <>Default for {u.owner ? "an owner: every backend" : "a guest: free backends only"}. Tick or untick to choose.</>
+        )}{" "}
+        Empty caps mean no limit beyond the network's hourly budget. Running jobs are never stopped by a cap.
+      </p>
       <div className="toggle">
-        <button className="btn btn-primary" disabled={busy} onClick={save}>
-          Save
+        <button className="btn btn-primary" type="submit" disabled={busy}>
+          {busy ? "Saving…" : "Save access"}
         </button>
-        <button className="btn" disabled={busy} onClick={onClose}>
+        <button className="btn" type="button" disabled={busy} onClick={onClose}>
           Cancel
         </button>
-        {error && <span className="error">{error}</span>}
+        {error && (
+          <span className="error" role="alert">
+            {error}
+          </span>
+        )}
       </div>
-    </div>
+    </form>
   );
 }
 
@@ -255,49 +306,54 @@ function UserRow({ u, backends, onChanged }: { u: User; backends: BackendRef[]; 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   return (
-    <li className="user">
-      <span className="user-name">{u.name || <span className="muted">(no name)</span>}</span>
-      {!editing && (
-        <button className="btn" onClick={() => setEditing(true)} aria-expanded={editing}>
+    <li className={`user${editing ? " user-open" : ""}`}>
+      <span className="user-who">
+        <span className="user-name">{u.name || <span className="muted">(no name)</span>}</span>
+        <span className="small muted">{u.owner ? "owner" : "guest"}</span>
+      </span>
+      <span className="user-actions">
+        <button className="btn" onClick={() => setEditing(!editing)} aria-expanded={editing}>
           Access
         </button>
-      )}
-      {confirm ? (
-        <span className="confirm" role="group" aria-label={`Confirm removing ${u.name}`}>
-          <span>Remove {u.name || "this key"} and sign them out?</span>
-          <button
-            className="btn btn-danger"
-            disabled={busy}
-            onClick={async () => {
-              setBusy(true);
-              try {
-                await removeUser(u.fingerprint);
-                onChanged();
-              } catch (e) {
-                setError(errorText(e));
-                setConfirm(false);
-              } finally {
-                setBusy(false);
-              }
-            }}
-          >
+      </span>
+      <AccessSummary u={u} />
+      <span className="user-remove">
+        {confirm ? (
+          <span className="confirm" role="group" aria-label={`Confirm removing ${u.name}`}>
+            <span>Remove {u.name || "this key"}, sign them out and cancel their queued jobs?</span>
+            <button
+              className="btn btn-danger"
+              disabled={busy}
+              onClick={async () => {
+                setBusy(true);
+                try {
+                  await removeUser(u.fingerprint);
+                  onChanged();
+                } catch (e) {
+                  setError(errorText(e));
+                  setConfirm(false);
+                } finally {
+                  setBusy(false);
+                }
+              }}
+            >
+              Remove
+            </button>
+            <button className="btn" onClick={() => setConfirm(false)}>
+              Keep
+            </button>
+          </span>
+        ) : (
+          <button className="btn btn-danger-quiet" onClick={() => setConfirm(true)}>
             Remove
           </button>
-          <button className="btn" onClick={() => setConfirm(false)}>
-            Keep
-          </button>
-        </span>
-      ) : (
-        <button className="btn btn-danger-quiet" onClick={() => setConfirm(true)}>
-          Remove
-        </button>
-      )}
-      {error && <span className="error">{error}</span>}
+        )}
+      </span>
       <span className="muted small user-key" title={u.fingerprint}>
         {u.key_type.replace(/^ssh-/, "")} {u.fingerprint.replace(/^SHA256:/, "").slice(0, 12)}…{u.comment && ` ${u.comment}`}
       </span>
-      <AccessSummary u={u} />
-      {u.note && <span className="error small">Can't sign in: {u.note}</span>}
+      {u.note && <span className="error small user-note">Can't sign in: {u.note}</span>}
+      {error && <span className="error user-note">{error}</span>}
       {editing && <AccessEditor u={u} backends={backends} onSaved={onChanged} onClose={() => setEditing(false)} />}
     </li>
   );
