@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { ApiError, type Job, cancelJob, getJob, getLogs, getMetrics, isActive, outputsUrl } from "./api";
 import { Meter } from "./Meter";
 import { State } from "./State";
-import { clock, dur, ms, usePoll, when, who } from "./util";
+import { dateClock, dur, ms, usePoll, when, who } from "./util";
 
 const LOG_CAP = 2_000_000; // characters kept in the browser
 
@@ -101,18 +101,18 @@ function Facts({ job, now }: { job: Job; now: number }) {
     ["Runs on", job.backend],
     ["Why there", job.reason],
     ["Resources", res.join(", ")],
-    ["Submitted", `${clock(ms(job.created_at), now)}`],
+    ["Submitted", dateClock(ms(job.created_at), now)],
     [
       "Started",
       Number.isFinite(started)
-        ? clock(started, now)
+        ? dateClock(started, now)
         : Number.isFinite(estStart)
-          ? `expected ${clock(estStart, now)} (${job.estimated_start_source === "slurm" ? "Slurm's estimate" : "daemon's estimate"})`
+          ? `expected ${dateClock(estStart, now)} (${job.estimated_start_source === "slurm" ? "Slurm's estimate" : "daemon's estimate"})`
           : null,
     ],
     [
       Number.isFinite(ended) ? "Ended" : "Expected to end",
-      Number.isFinite(ended) ? clock(ended, now) : Number.isFinite(estEnd) ? `by ${clock(estEnd, now)}` : null,
+      Number.isFinite(ended) ? dateClock(ended, now) : Number.isFinite(estEnd) ? `by ${dateClock(estEnd, now)}` : null,
     ],
     ["Exit code", job.exit_code === null ? null : String(job.exit_code)],
     ["Runs after", deps(job)],

@@ -13,6 +13,14 @@ export function clock(t: number, now = Date.now()) {
   return today ? hm : `${d.toLocaleDateString(undefined, { weekday: "short" })} ${hm}`;
 }
 
+/** "Tue, Nov 25, 19:40", with the year when it isn't this one. */
+export function dateClock(t: number, now = Date.now()) {
+  const d = new Date(t);
+  const year = d.getFullYear() !== new Date(now).getFullYear() ? { year: "numeric" as const } : {};
+  const date = d.toLocaleDateString(undefined, { weekday: "short", month: "short", day: "numeric", ...year });
+  return `${date}, ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
 /** "45 s", "12 min", "2 h 5 min", "3 d 4 h". */
 export function dur(seconds: number) {
   const s = Math.max(0, Math.round(seconds));
