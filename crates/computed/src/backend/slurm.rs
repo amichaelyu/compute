@@ -329,6 +329,9 @@ impl Backend for SlurmBackend {
     }
 
     async fn quote(&self, job: &Job, _active: &[Alloc]) -> Quote {
+        if !job.resources.regions.is_empty() {
+            return Quote::no(format!("resources.regions is set, and {} isn't a cloud backend", self.cfg().name), true);
+        }
         let key = format!("{}:{:?}:{:?}", job.group_key(), job.resources, job.os);
         if let Some((at, q)) = self.quotes.lock().await.get(&key)
             && at.elapsed() < QUOTE_TTL {

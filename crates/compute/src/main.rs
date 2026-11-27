@@ -104,7 +104,7 @@ enum Cmd {
     /// the fields to change, e.g. '{"resources": {"gpu_type": "H100"}}'
     Edit {
         id: i64,
-        /// The changes: title, description, resources {cpus, mem_gb, gpus, gpu_type, disk_gb, time}, backends, priority, max_cost_usd
+        /// The changes: title, description, resources {cpus, mem_gb, gpus, gpu_type, disk_gb, time, regions}, backends, priority, max_cost_usd
         changes: String,
         /// Edit every waiting or queued task of array ID
         #[arg(long)]

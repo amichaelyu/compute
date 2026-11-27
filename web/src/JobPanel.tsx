@@ -96,6 +96,7 @@ function Facts({ job, now }: { job: Job; now: number }) {
     `${r.mem_gb % 1 ? r.mem_gb.toFixed(1) : r.mem_gb} GB`,
     r.gpus ? `${r.gpus} GPU${r.gpu_type ? ` (${r.gpu_type})` : ""}` : null,
     `${dur(r.time_s)} limit`,
+    r.regions?.length ? `in ${r.regions.join(" or ")}` : null,
   ].filter(Boolean);
   const rows: [string, string | null][] = [
     ["Runs on", job.backend],

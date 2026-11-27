@@ -118,6 +118,9 @@ impl Backend for LocalBackend {
             return Quote::no(format!("{} has not been probed yet", c.name), false);
         };
         let r = &job.resources;
+        if !r.regions.is_empty() {
+            return Quote::no(format!("resources.regions is set, and {} isn't a cloud backend", c.name), true);
+        }
         if r.nodes > c.max_nodes {
             return Quote::no(format!("nodes={}; {} runs single-node jobs", r.nodes, c.name), true);
         }

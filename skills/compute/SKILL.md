@@ -125,7 +125,7 @@ Fields:
     to, so the user can tell jobs apart weeks later.
 - **Resources:** `cpus` (default 1), `mem_gb` (default 4; always set it), `disk_gb` (always
   set it; see section 1), `gpus` (default 0), `gpu_type` (a type a backend reports, or null for
-  any), `nodes` (default 1; see section 3e).
+  any), `nodes` (default 1; see section 3e), `regions` (cloud only; see section 3d).
 - **Placement:** `backends` (an allowlist of backend names from `compute backends`), `os`
   (`"mac"` or `"linux"`),
   `priority` (higher starts first in the daemon's queue).
@@ -269,7 +269,12 @@ set `keep_outputs` (for example `"checkpoints/final/**"`) when outputs are large
 
 The quote picks the cheapest GPU type with capacity, across every paid backend. To pin a
 provider or a GPU, set `"backends": ["lambda"]` (names from `compute backends`) or
-`resources.gpu_type`. Each instance is named `compute-<job id>-<hex>` in the provider's
+`resources.gpu_type`. To pin where it runs (for low latency to something it talks to), set
+`resources.regions` to the regions or data centres it may use, any of them: RunPod data centres
+(`"US-CA-2"`) and Lambda regions (`"us-west-1"`) side by side, e.g.
+`"regions": ["US-CA-2", "us-west-1"]`. `compute backends <name>` lists, under
+`availability.gpu_stock`, where each GPU type is in stock now. Such a job runs only on RunPod and
+Lambda, and waits while no listed region has capacity. Each instance is named `compute-<job id>-<hex>` in the provider's
 console. Keys listed in the backend's `authorized_keys` (hosts.toml) can ssh in while the job
 runs (Lambda: `ubuntu@<ip>`, with the IP shown in the Lambda console). The job's files are
 under `~/compute`.

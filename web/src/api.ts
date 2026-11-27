@@ -46,7 +46,7 @@ export interface JobRow {
 export interface Job extends Omit<JobRow, "time_s" | "cost_usd" | "usd_per_hour"> {
   description: string;
   estimated_start_source: string | null;
-  resources: { nodes: number; cpus: number; mem_gb: number; gpus: number; gpu_type: string | null; time_s: number };
+  resources: { nodes: number; cpus: number; mem_gb: number; gpus: number; gpu_type: string | null; time_s: number; regions?: string[] };
   secrets: string[];
   retries_left: number;
   priority: number;

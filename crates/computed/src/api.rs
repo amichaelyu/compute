@@ -271,6 +271,7 @@ const GUEST_RESTRICTIONS: &[&str] = &[
 
 /// Changes within v1 that a running agent should know about, newest first.
 const CHANGES: &[(&str, &str)] = &[
+    ("2026-11-27", "resources.regions pins a cloud job to regions or data centres, any of those listed: RunPod data centres (\"US-CA-2\") and Lambda regions (\"us-west-1\"), matched case-insensitively against what each provider reports. Only RunPod and Lambda take such a job; local hosts, Slurm and Modal refuse it. GET /v1/backends/{name} availability.gpu_stock lists, per GPU type in stock, `regions` where it is. PATCH /v1/jobs/{id} can set resources.regions (null clears it)."),
     ("2026-11-26", "PATCH /v1/jobs/{id} on a running job changes its time limit: {\"resources\": {\"time\": \"6h\"}} (the whole limit, from its start), optionally with max_cost_usd. On a paid backend the attempt's cost at the new limit must fit max_cost_usd (422 over_max_cost) and the key's monthly cap (422 over_key_limit). Local hosts, RunPod and Lambda can; Slurm and Modal can't (409 not_editable), nor jobs whose runner started before this change."),
     ("2026-11-26", "Docker containers get /dev/shm of half the job's memory (8 GB when it sets none) instead of Docker's 64 MB, so PyTorch DataLoader workers have room."),
     ("2026-11-26", "resources.time may be left out (or null) on a job with max_cost_usd: it then runs only on paid backends, until it has spent max_cost_usd. Placement works its limit out from the price (boot included) and stores it in resources.time_s; resources show `no_time_limit: true`, and the quote's reason says how long it gets. PATCH /v1/jobs/{id} with resources.time null removes a waiting job's limit."),
@@ -797,6 +798,7 @@ fn resources_json(r: &crate::model::Resources) -> Value {
         "nodes": r.nodes, "cpus": r.cpus, "mem_gb": (r.mem_mb as f64 / 1024.0), "gpus": r.gpus,
         "gpu_type": r.gpu_type, "time_s": r.time_s, "no_time_limit": r.no_time_limit,
         "disk_gb": (r.disk_mb > 0).then(|| r.disk_mb as f64 / 1024.0),
+        "regions": r.regions,
     })
 }
 
@@ -1204,7 +1206,7 @@ fn present<'de, T: Deserialize<'de>, D: serde::Deserializer<'de>>(d: D) -> Resul
 }
 
 /// `PATCH /v1/jobs/{id}`: the fields of a waiting or queued job that may change. Absent fields
-/// stay; null clears `gpu_type`, `disk_gb`, `time` (no limit), `backends` and `max_cost_usd`.
+/// stay; null clears `gpu_type`, `disk_gb`, `time` (no limit), `regions`, `backends` and `max_cost_usd`.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct JobEdit {
@@ -1230,6 +1232,8 @@ struct ResourcesEdit {
     disk_gb: Option<Option<f64>>,
     #[serde(default, deserialize_with = "present")]
     time: Option<Option<String>>,
+    #[serde(default, deserialize_with = "present")]
+    regions: Option<Option<Vec<String>>>,
 }
 
 /// The states in which a job may be edited: not yet placed on a backend.
@@ -1246,7 +1250,7 @@ async fn edit_job(
     Query(q): Query<CancelQuery>,
     body: Result<Json<JobEdit>, JsonRejection>,
 ) -> ApiResult<Json<Value>> {
-    let Json(edit) = body.map_err(|e| ApiError::bad_request(format!("invalid edit: {}", e.body_text()), "send only the fields to change: title, description, resources {cpus, mem_gb, gpus, gpu_type, disk_gb, time}, backends, priority, max_cost_usd"))?;
+    let Json(edit) = body.map_err(|e| ApiError::bad_request(format!("invalid edit: {}", e.body_text()), "send only the fields to change: title, description, resources {cpus, mem_gb, gpus, gpu_type, disk_gb, time, regions}, backends, priority, max_cost_usd"))?;
     let array = q.array.unwrap_or(0) > 0;
     let jobs = if array {
         let all = s.sched.store.list_jobs(&JobFilter { array_id: Some(id), ..Default::default() })?;
@@ -1312,6 +1316,9 @@ async fn edit_job(
             }
             if let Some(v) = &r.time {
                 req.time = v.clone();
+            }
+            if let Some(v) = &r.regions {
+                req.regions = v.clone().unwrap_or_default();
             }
             j.resources = req.check()?;
         }
@@ -1384,7 +1391,7 @@ async fn edit_running(s: &AppState, sess: &Session, job: &Job, edit: &JobEdit) -
         || edit.description.is_some()
         || edit.backends.is_some()
         || edit.priority.is_some()
-        || r.is_some_and(|r| r.cpus.is_some() || r.mem_gb.is_some() || r.gpus.is_some() || r.gpu_type.is_some() || r.disk_gb.is_some());
+        || r.is_some_and(|r| r.cpus.is_some() || r.mem_gb.is_some() || r.gpus.is_some() || r.gpu_type.is_some() || r.disk_gb.is_some() || r.regions.is_some());
     if other {
         return Err(refuse(format!("job {} is running", job.id)));
     }

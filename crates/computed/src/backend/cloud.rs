@@ -85,6 +85,9 @@ pub struct GpuStock {
     /// The provider's stock level ("high", "medium", "low"), when it gives one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub level: Option<String>,
+    /// Regions or data centres with stock of it (within the backend's configured regions).
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub regions: Vec<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -137,21 +140,42 @@ pub struct Need {
     pub cpus: u32,
     pub mem_gb: u32,
     pub min_cuda: Option<String>,
+    /// The job's regions or data centres (empty: anywhere the backend allows).
+    pub regions: Vec<String>,
 }
 
 impl Need {
     fn of(job: &Job, image: Option<&str>) -> Need {
         let r = &job.resources;
-        Need { gpus: r.gpus, nodes: r.nodes, cpus: r.cpus, mem_gb: r.mem_mb.div_ceil(1024) as u32, min_cuda: image.and_then(min_cuda_of) }
+        Need {
+            gpus: r.gpus,
+            nodes: r.nodes,
+            cpus: r.cpus,
+            mem_gb: r.mem_mb.div_ceil(1024) as u32,
+            min_cuda: image.and_then(min_cuda_of),
+            regions: r.regions.clone(),
+        }
     }
     /// Any one GPU, for price and stock listings.
     fn any_gpu() -> Need {
-        Need { gpus: 1, nodes: 1, cpus: 0, mem_gb: 0, min_cuda: None }
+        Need { gpus: 1, nodes: 1, cpus: 0, mem_gb: 0, min_cuda: None, regions: Vec::new() }
     }
 }
 
 /// The CUDA version an image tag names (`nvidia/cuda:12.4.1-…`, `…-cuda12.1-…`, `…cu121…`),
 /// so the instance's driver can be required to support it.
+/// The regions a job may use on a backend: the job's, within the backend's configured ones
+/// (case-insensitive, in the backend's spelling); the backend's when the job names none.
+fn allowed_regions(configured: &[String], job: &[String]) -> Vec<String> {
+    if job.is_empty() {
+        return configured.to_vec();
+    }
+    if configured.is_empty() {
+        return job.to_vec();
+    }
+    configured.iter().filter(|c| job.iter().any(|j| j.eq_ignore_ascii_case(c))).cloned().collect()
+}
+
 pub fn min_cuda_of(image: &str) -> Option<String> {
     let tag = image.rsplit_once(':').map(|(_, t)| t).unwrap_or(image).to_ascii_lowercase();
     let name = image.to_ascii_lowercase();
@@ -201,6 +225,14 @@ pub trait Provider: Send + Sync {
     /// GPU types in stock now with how many one machine can have (None: not known here).
     async fn gpu_stock(&self) -> Result<Option<Vec<GpuStock>>> {
         Ok(None)
+    }
+    /// Whether a job can be pinned to regions here (`resources.regions`).
+    fn pins_regions(&self) -> bool {
+        false
+    }
+    /// The regions the backend is limited to in hosts.toml (empty: any).
+    fn configured_regions(&self) -> &[String] {
+        &[]
     }
     /// Whether CPU-only jobs can run here (RunPod CPU pods).
     fn cpu_pods(&self) -> bool {
@@ -776,6 +808,15 @@ impl Backend for Cloud {
         if job.os.as_deref() == Some("mac") {
             return Quote::no("os=mac; cloud instances are linux", true);
         }
+        if !r.regions.is_empty() {
+            if !b.provider.pins_regions() {
+                return Quote::no(format!("resources.regions is set, and {} can't pin a region", b.cfg.name), true);
+            }
+            let configured = b.provider.configured_regions();
+            if allowed_regions(configured, &r.regions).is_empty() {
+                return Quote::no(format!("regions {}; {} is limited to {}", r.regions.join(", "), b.cfg.name, configured.join(", ")), true);
+            }
+        }
         let offers = match b.cached_offers(&Need::of(job, b.image_for(job).as_deref())).await {
             Ok(o) => o,
             Err(e) => return Quote::no(format!("price lookup failed: {e:#}"), false),
@@ -786,7 +827,8 @@ impl Backend for Cloud {
             return Quote::no(format!("no{want} offer with {} GPU(s) per node", r.gpus), true);
         }
         let Some(o) = fitting.iter().find(|o| o.available) else {
-            return Quote::no("no capacity right now for the GPUs asked", false);
+            let place = if r.regions.is_empty() { String::new() } else { format!(" in {}", r.regions.join(", ")) };
+            return Quote::no(format!("no capacity right now{place} for the GPUs asked"), false);
         };
         let boot = b.boot();
         // Providers that bill CPU and memory separately (Modal) list those rates in hosts.toml.
@@ -1392,16 +1434,24 @@ impl RunPod {
             user: d["username"].as_str().unwrap_or("root").to_string(),
         })
     }
-    /// Stock in the configured regions (or overall when none are set).
-    fn in_stock(&self, item: &Value) -> bool {
-        if self.regions.is_empty() {
+    /// Stock in `regions` (or overall when empty).
+    fn in_stock(item: &Value, regions: &[String]) -> bool {
+        if regions.is_empty() {
             return item["availability"].as_str().is_some_and(|a| a != "NONE");
         }
+        !Self::stocked_dcs(item, regions).is_empty()
+    }
+    /// The data centres with stock of `item`, within `regions` (all when empty).
+    fn stocked_dcs(item: &Value, regions: &[String]) -> Vec<String> {
         item["dataCenters"]
             .as_array()
             .into_iter()
             .flatten()
-            .any(|d| d["id"].as_str().is_some_and(|id| self.regions.iter().any(|r| r == id)) && d["availability"].as_str().is_some_and(|a| a != "NONE"))
+            .filter(|d| d["availability"].as_str().is_some_and(|a| a != "NONE"))
+            .filter_map(|d| d["id"].as_str())
+            .filter(|id| regions.is_empty() || regions.iter().any(|r| r.eq_ignore_ascii_case(id)))
+            .map(str::to_string)
+            .collect()
     }
     /// The stock level in the configured regions (the best of them), or overall.
     fn stock_level(&self, item: &Value) -> Option<String> {
@@ -1413,7 +1463,7 @@ impl RunPod {
                 .as_array()
                 .into_iter()
                 .flatten()
-                .filter(|d| d["id"].as_str().is_some_and(|id| self.regions.iter().any(|r| r == id)))
+                .filter(|d| d["id"].as_str().is_some_and(|id| self.regions.iter().any(|r| r.eq_ignore_ascii_case(id))))
                 .filter_map(|d| d["availability"].as_str())
                 .max_by_key(|l| rank(l))
                 .map(str::to_string)
@@ -1421,14 +1471,14 @@ impl RunPod {
         level.filter(|l| rank(l).is_some()).map(|l| l.to_ascii_lowercase())
     }
     /// CPU pods: one offer per flavor and power-of-two vCPU count (RunPod's allowed sizes).
-    async fn cpu_offers(&self) -> Result<Vec<Offer>> {
+    async fn cpu_offers(&self, regions: &[String]) -> Result<Vec<Offer>> {
         let v = self.call("GET", "/catalog/cpus?include=AVAILABILITY&product=POD", None).await?;
         let mut out = Vec::new();
         for c in v["cpus"].as_array().into_iter().flatten() {
             let (Some(id), Some(per_vcpu)) = (c["id"].as_str(), c["price"]["securePerVcpu"].as_f64()) else { continue };
             let ram_per = c["ramGbPerVcpu"].as_u64().unwrap_or(0) as u32;
             let (min, max) = (c["vcpu"]["min"].as_u64().unwrap_or(2).max(2) as u32, c["vcpu"]["max"].as_u64().unwrap_or(0) as u32);
-            let available = self.in_stock(c);
+            let available = Self::in_stock(c, regions);
             let name = c["name"].as_str().unwrap_or(id);
             let mut n = 2u32;
             while n <= max {
@@ -1455,8 +1505,9 @@ impl RunPod {
 #[async_trait]
 impl Provider for RunPod {
     async fn offers(&self, need: &Need) -> Result<Vec<Offer>> {
+        let regions = allowed_regions(&self.regions, &need.regions);
         if need.gpus == 0 {
-            return self.cpu_offers().await;
+            return self.cpu_offers(&regions).await;
         }
         let gpus = need.gpus;
         let cluster = need.nodes > 1;
@@ -1501,7 +1552,7 @@ impl Provider for RunPod {
                 cpus,
                 mem_gb,
                 usd_per_hour: price * f64::from(gpus),
-                available: self.in_stock(g),
+                available: Self::in_stock(g, &regions),
                 region: None,
                 disk_gb: 0,
             });
@@ -1519,7 +1570,7 @@ impl Provider for RunPod {
             let price = g["price"][key].as_f64().unwrap_or(0.0);
             let max = g["maxCount"][key].as_u64().unwrap_or(0) as u32;
             let amd = [g["id"].as_str(), g["name"].as_str()].into_iter().flatten().any(|t| contains_ci(t, "amd") || contains_ci(t, "instinct"));
-            if price <= 0.0 || max == 0 || !g[key].as_bool().unwrap_or(false) || amd || !self.in_stock(g) {
+            if price <= 0.0 || max == 0 || !g[key].as_bool().unwrap_or(false) || amd || !Self::in_stock(g, &self.regions) {
                 continue;
             }
             out.push(GpuStock {
@@ -1528,6 +1579,7 @@ impl Provider for RunPod {
                 max_gpus: max,
                 sizes: Vec::new(),
                 level: self.stock_level(g),
+                regions: Self::stocked_dcs(g, &self.regions),
             });
         }
         Ok(Some(out))
@@ -1535,6 +1587,14 @@ impl Provider for RunPod {
 
     fn cpu_pods(&self) -> bool {
         true
+    }
+
+    fn pins_regions(&self) -> bool {
+        true
+    }
+
+    fn configured_regions(&self) -> &[String] {
+        &self.regions
     }
 
     fn node_env(&self) -> Vec<(String, String)> {
@@ -1560,8 +1620,9 @@ impl Provider for RunPod {
             "cmd": [],
             "startSsh": true,
         });
-        if !self.regions.is_empty() {
-            body["dataCenterIds"] = json!(self.regions);
+        let regions = allowed_regions(&self.regions, &req.job.resources.regions);
+        if !regions.is_empty() {
+            body["dataCenterIds"] = json!(regions.iter().map(|r| r.to_ascii_uppercase()).collect::<Vec<_>>());
         }
         let now = Utc::now();
         let deadline = now + chrono::Duration::seconds(req.timeout_s as i64);
@@ -1793,8 +1854,17 @@ impl Lambda {
 
 #[async_trait]
 impl Provider for Lambda {
+    fn pins_regions(&self) -> bool {
+        true
+    }
+
+    fn configured_regions(&self) -> &[String] {
+        &self.regions
+    }
+
     async fn offers(&self, need: &Need) -> Result<Vec<Offer>> {
         let gpus = need.gpus;
+        let allowed = allowed_regions(&self.regions, &need.regions);
         let v = self.call("GET", "/instance-types", None).await?;
         let mut out = Vec::new();
         for (name, t) in v["data"].as_object().into_iter().flatten() {
@@ -1806,7 +1876,7 @@ impl Provider for Lambda {
                 continue;
             }
             let regions: Vec<String> = t["regions_with_capacity_available"].as_array().into_iter().flatten().filter_map(|r| r["name"].as_str().map(str::to_string)).collect();
-            let region = if self.regions.is_empty() { regions.first().cloned() } else { self.regions.iter().find(|r| regions.contains(r)).cloned() };
+            let region = if allowed.is_empty() { regions.first().cloned() } else { regions.iter().find(|r| allowed.iter().any(|a| a.eq_ignore_ascii_case(r))).cloned() };
             out.push(Offer {
                 id: name.clone(),
                 gpu_type: it["gpu_description"].as_str().unwrap_or(name).to_string(),
@@ -1832,8 +1902,14 @@ impl Provider for Lambda {
             if n == 0 || it["architecture"].as_str().is_some_and(|a| a != "x86_64") {
                 continue;
             }
-            let mut regions = t["regions_with_capacity_available"].as_array().into_iter().flatten().filter_map(|r| r["name"].as_str());
-            if !regions.any(|r| self.regions.is_empty() || self.regions.iter().any(|x| x == r)) {
+            let regions: Vec<&str> = t["regions_with_capacity_available"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|r| r["name"].as_str())
+                .filter(|r| self.regions.is_empty() || self.regions.iter().any(|x| x.eq_ignore_ascii_case(r)))
+                .collect();
+            if regions.is_empty() {
                 continue;
             }
             let per_gpu = it["price_cents_per_hour"].as_f64().unwrap_or(0.0) / 100.0 / f64::from(n);
@@ -1843,15 +1919,19 @@ impl Provider for Lambda {
                 max_gpus: 0,
                 sizes: Vec::new(),
                 level: None,
+                regions: Vec::new(),
             });
             s.usd_per_hour_per_gpu = s.usd_per_hour_per_gpu.min(per_gpu);
             s.max_gpus = s.max_gpus.max(n);
             s.sizes.push(n);
+            s.regions.extend(regions.into_iter().map(str::to_string));
         }
         let mut out: Vec<GpuStock> = by_type.into_values().collect();
         for s in &mut out {
             s.sizes.sort_unstable();
             s.sizes.dedup();
+            s.regions.sort();
+            s.regions.dedup();
         }
         Ok(Some(out))
     }

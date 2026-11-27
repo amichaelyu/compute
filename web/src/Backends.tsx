@@ -64,13 +64,26 @@ function localRows(h: Obj): Rows {
 /** Rows per column of the GPU price list before it starts another column. */
 const GPU_ROWS = 8;
 
-type GpuStock = { gpu_type: string; usd_per_hour_per_gpu: number; max_gpus?: number; sizes?: number[]; level?: string };
+type GpuStock = {
+  gpu_type: string;
+  usd_per_hour_per_gpu: number;
+  max_gpus?: number;
+  sizes?: number[];
+  level?: string;
+  regions?: string[];
+};
 
-/** "up to 8", with the sizes on sale and the provider's stock level in the tooltip. */
+/** "up to 8", with the sizes on sale, the stock level and where it is in the tooltip. */
 function stockText(s: GpuStock) {
   if (!s.max_gpus) return { text: "", title: undefined };
   const sizes = s.sizes && s.sizes.length > 1 ? `${s.sizes.join(", ")} GPUs per machine` : null;
-  const title = [sizes ?? `up to ${s.max_gpus} per machine`, s.level && `${s.level} stock`].filter(Boolean).join(", ");
+  const title = [
+    sizes ?? `up to ${s.max_gpus} per machine`,
+    s.level && `${s.level} stock`,
+    s.regions?.length && `in ${s.regions.join(", ")}`,
+  ]
+    .filter(Boolean)
+    .join(", ");
   return { text: s.max_gpus > 1 ? `up to ${s.max_gpus}` : "1", title };
 }
 

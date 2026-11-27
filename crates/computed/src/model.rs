@@ -87,6 +87,10 @@ pub struct ResourcesReq {
     /// until it has spent `max_cost_usd` (its limit is worked out from the price it is placed at).
     #[serde(default)]
     pub time: Option<String>,
+    /// Regions or data centres the job may run in, any of them (RunPod data centres such as
+    /// "US-CA-2", Lambda regions such as "us-west-1"). Empty: anywhere. Cloud backends only.
+    #[serde(default)]
+    pub regions: Vec<String>,
 }
 
 fn one() -> u32 {
@@ -296,6 +300,9 @@ pub struct Resources {
     /// No time limit was given: the job runs on paid backends only, until `max_cost_usd` is spent.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub no_time_limit: bool,
+    /// Regions or data centres the job may run in (empty: anywhere).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub regions: Vec<String>,
 }
 
 /// Parses `2h`, `90m`, `1h30m`, `45s`, `1d` (and combinations) into a duration.
@@ -480,6 +487,22 @@ impl ResourcesReq {
         if self.gpu_type.as_deref().is_some_and(|t| t.trim().is_empty()) {
             return Err(ApiError::bad_request("`resources.gpu_type` is empty", "e.g. \"H100\", or null for any GPU"));
         }
+        let mut regions: Vec<String> = Vec::new();
+        for r in &self.regions {
+            let r = r.trim();
+            if r.is_empty() || r.len() > 40 || !r.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                return Err(ApiError::bad_request(
+                    format!("`resources.regions` has {r:?}, which isn't a region id"),
+                    "ids as the providers write them: RunPod data centres like \"US-CA-2\", Lambda regions like \"us-west-1\"",
+                ));
+            }
+            if !regions.iter().any(|x| x.eq_ignore_ascii_case(r)) {
+                regions.push(r.to_string());
+            }
+        }
+        if regions.len() > 20 {
+            return Err(ApiError::bad_request("`resources.regions` lists more than 20 regions", "list the ones near you"));
+        }
         let time = match &self.time {
             None => None,
             Some(t) => Some(parse_duration(t).ok_or_else(|| {
@@ -498,6 +521,7 @@ impl ResourcesReq {
             time_s: time.map_or(0, |t| t.as_secs()),
             disk_mb: self.disk_gb.map(|d| (d * 1024.0).ceil() as u64).unwrap_or(0),
             no_time_limit: time.is_none(),
+            regions,
         })
     }
 }
@@ -513,6 +537,7 @@ impl From<&Resources> for ResourcesReq {
             gpu_type: r.gpu_type.clone(),
             disk_gb: (r.disk_mb > 0).then(|| r.disk_mb as f64 / 1024.0),
             time: (!r.no_time_limit).then(|| format!("{}s", r.time_s)),
+            regions: r.regions.clone(),
         }
     }
 }
