@@ -112,7 +112,7 @@ function Facts({ job, now }: { job: Job; now: number }) {
     ],
     [
       Number.isFinite(ended) ? "Ended" : "Expected to end",
-      Number.isFinite(ended) ? dateClock(ended, now) : Number.isFinite(estEnd) ? `by ${dateClock(estEnd, now)}` : null,
+      Number.isFinite(ended) ? dateClock(ended, now) : Number.isFinite(estEnd) ? dateClock(estEnd, now) : null,
     ],
     ["Exit code", job.exit_code === null ? null : String(job.exit_code)],
     ["Runs after", deps(job)],
