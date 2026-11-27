@@ -567,6 +567,16 @@ async fn submit(State(s): State<AppState>, sess: Session, body: Result<Json<Valu
     if req.dry_run {
         let mut v = estimate(best);
         v["would_place"] = best.is_some().into();
+        if best.is_none() {
+            // Say why, not just that: what each backend that could ever take it is waiting for.
+            let why: Vec<String> = plan
+                .quotes
+                .iter()
+                .filter(|(_, q)| matches!(q, Quote::No { permanent: false, .. }))
+                .map(|(n, q)| format!("{n}: {}", quote_line(&s.tz, q).trim_start_matches("no: ")))
+                .collect();
+            v["reason"] = format!("nothing can start it now, so it would wait: {}", why.join("; ")).into();
+        }
         v["shape"] = best.map(|b| serde_json::to_value(&b.shape).unwrap_or_default()).unwrap_or(Value::Null);
         v["per_backend"] = serde_json::to_value(&per_backend).unwrap_or_default();
         if let Some(c) = &spec.container {

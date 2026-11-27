@@ -369,6 +369,26 @@ impl CloudBackend {
         };
     }
 
+    /// Returns once `job_id` is no longer staging (cancelled), checking every few seconds.
+    async fn cancelled(&self, job_id: i64) {
+        loop {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            if self.store.get_job(job_id).ok().flatten().is_none_or(|j| j.state != JobState::Staging) {
+                return;
+            }
+        }
+    }
+
+    /// Waits for the instance to boot, giving up as soon as the job is cancelled: the
+    /// instance bills while it boots, which can take many minutes.
+    async fn boot_or_cancel(&self, job: &Job, inst: &mut Instance) -> Result<()> {
+        let boot_deadline = Instant::now() + Duration::from_secs(20 * 60);
+        tokio::select! {
+            r = self.provider.wait_ready(inst, boot_deadline) => r,
+            _ = self.cancelled(job.id) => bail!("job {} was cancelled while its instance booted", job.id),
+        }
+    }
+
     /// "waiting for lambda to assign the GPUs" (or the machine, for a CPU job).
     fn assign_step(&self, job: &Job) -> String {
         let what = if job.resources.gpus > 0 { "the GPUs" } else { "a machine" };
@@ -548,8 +568,7 @@ impl CloudBackend {
             JobUpdate { handle: Some(Some(json!({"instance": inst, "staging": true}))), ..Default::default() },
         );
         self.step(job.id, Some(self.assign_step(job)));
-        let boot_deadline = Instant::now() + Duration::from_secs(20 * 60);
-        if let Err(e) = self.provider.wait_ready(&mut inst, boot_deadline).await {
+        if let Err(e) = self.boot_or_cancel(job, &mut inst).await {
             let _ = self.provider.terminate(&inst).await;
             self.forget(&inst).await;
             return Err(e.context(format!("{} did not become ready", inst.name)));
@@ -569,8 +588,7 @@ impl CloudBackend {
     async fn ready_instance(&self, job: &Job, mut inst: Instance) -> Result<Instance> {
         if inst.nodes.is_empty() {
             self.step(job.id, Some(self.assign_step(job)));
-            let boot_deadline = Instant::now() + Duration::from_secs(20 * 60);
-            if let Err(e) = self.provider.wait_ready(&mut inst, boot_deadline).await {
+            if let Err(e) = self.boot_or_cancel(job, &mut inst).await {
                 let _ = self.provider.terminate(&inst).await;
                 self.forget(&inst).await;
                 return Err(e.context(format!("{} did not become ready", inst.name)));
@@ -895,7 +913,11 @@ impl Backend for Cloud {
         }
         let Some(o) = fitting.iter().find(|o| o.available) else {
             let place = if r.regions.is_empty() { String::new() } else { format!(" in {}", r.regions.join(", ")) };
-            return Quote::no(format!("no capacity right now{place} for the GPUs asked"), false);
+            let mut types: Vec<&str> = fitting.iter().map(|o| o.gpu_type.as_str()).collect();
+            types.sort_unstable();
+            types.dedup();
+            let what = if r.gpus == 0 { "the CPU machine asked".to_string() } else { format!("{} x {}", r.gpus, types.join(" / ")) };
+            return Quote::no(format!("no capacity right now{place} for {what}; compute backends {} lists what is in stock (availability.gpu_stock)", b.cfg.name), false);
         };
         let boot = b.boot();
         // Providers that bill CPU and memory separately (Modal) list those rates in hosts.toml.
@@ -1384,7 +1406,8 @@ fn boot_script(timeout_s: u64) -> String {
 echo "$(( $(date +%s) + {timeout_s} ))" > /run/compute-deadline
 if [ "$(id -u)" != 0 ]; then echo "compute: the image runs as uid $(id -u); RunPod jobs need an image that runs as root"; cat /tmp/compute-boot.log >&2; exit 1; fi
 # ssh sessions don't inherit PID 1's environment, and login shells reset PATH: replay it.
-export -p | grep -vE '^(export |declare -x )?(HOME|PWD|OLDPWD|SHLVL|HOSTNAME|_|PUBLIC_KEY)=' > /etc/profile.d/00-compute-env.sh
+# Unset what not to replay first (PUBLIC_KEY spans lines, so a line filter would cut it apart).
+(unset HOME PWD OLDPWD SHLVL HOSTNAME PUBLIC_KEY; export -p) | grep -vE '^(export |declare -x )?_=' > /etc/profile.d/00-compute-env.sh
 need=""
 [ -x /usr/sbin/sshd ] || need="$need sshd"
 command -v bash >/dev/null 2>&1 || need="$need bash"
