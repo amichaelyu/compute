@@ -55,6 +55,9 @@
 
 html {
   font-size: 100%;
+  /* Phones in landscape keep the same text size instead of inflating it. */
+  -webkit-text-size-adjust: 100%;
+  text-size-adjust: 100%;
 }
 
 body {
@@ -111,8 +114,9 @@ button {
 
 .top {
   display: flex;
+  flex-wrap: wrap;
   align-items: baseline;
-  gap: 2rem;
+  gap: 0.5rem 2rem;
   padding: 1rem 1.5rem 0.75rem;
   border-bottom: 1px solid var(--rule);
 }
@@ -766,6 +770,7 @@ header > .skel,
 
 .backends {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 2.5rem;
 }
 
@@ -887,6 +892,7 @@ header > .skel,
 
 .users {
   display: grid;
+  grid-template-columns: minmax(0, 1fr);
   gap: 2.5rem;
 }
 
@@ -1184,30 +1190,6 @@ header > .skel,
     width: 100%;
     border-left: 0;
   }
-  .rows {
-    display: block;
-  }
-  .row {
-    grid-template-columns: 3.25rem minmax(0, 1fr) auto;
-    column-gap: 1rem;
-    row-gap: 0.1rem;
-  }
-  .row-name {
-    grid-column: 1 / 3;
-  }
-  .row-id {
-    flex-basis: 4.25rem;
-  }
-  .row-backend {
-    grid-column: 2;
-  }
-  .row-cost {
-    grid-column: 3;
-  }
-  .row-who,
-  .row-when {
-    grid-column: 2 / -1;
-  }
   .backend-cols {
     grid-template-columns: 1fr;
   }
@@ -1215,11 +1197,59 @@ header > .skel,
     gap: 1rem;
     padding: 0.75rem 1rem;
   }
-  .who {
-    display: none;
-  }
   .main {
     padding: 1rem;
+  }
+  /* The job panel covers the page; the list behind it keeps its place but doesn't scroll. */
+  :root:has(.has-panel) {
+    overflow: hidden;
+  }
+  .panel {
+    padding: 0.75rem 1rem calc(2rem + env(safe-area-inset-bottom));
+    overscroll-behavior: contain;
+  }
+  /* Aligned GPU price columns once the lists wrap under each other. */
+  .hw-price-cols {
+    display: grid;
+    grid-template-columns: repeat(3, max-content);
+    column-gap: 2ch;
+    row-gap: 0.15rem;
+  }
+  .hw-prices {
+    display: contents;
+  }
+}
+
+/* Touch screens: 16px inputs so iOS doesn't zoom in on focus, and roomier tap targets. */
+@media (pointer: coarse) {
+  input[type="search"],
+  input[type="password"],
+  input[type="time"],
+  input[type="text"],
+  select,
+  textarea {
+    font-size: 1rem;
+  }
+  .top nav a {
+    padding: 0.35rem 0 0.2rem;
+  }
+  .tabs button {
+    padding: 0.45rem 0.85rem;
+  }
+}
+
+@media (max-width: 600px) {
+  .facts > div,
+  .kv > div {
+    grid-template-columns: 7rem minmax(0, 1fr);
+    gap: 0.75rem;
+  }
+  .jobs-bar {
+    gap: 0.75rem;
+  }
+  .jobs-bar input[type="search"] {
+    flex: 1 1 12rem;
+    width: auto;
   }
 }
 
@@ -1279,34 +1309,48 @@ header > .skel,
     display: block;
   }
   .row {
-    grid-template-columns: 3.5rem minmax(0, 1fr) auto;
+    grid-template-columns: 3.5rem auto minmax(0, 1fr) auto;
     column-gap: 1rem;
     row-gap: 0.1rem;
   }
   .row-name {
-    grid-column: 1 / 3;
+    grid-column: 1 / 4;
   }
   .row-id {
     flex-basis: 4.5rem;
   }
+  .row-backend,
+  .row-who,
+  .row-cost {
+    grid-row: 2;
+  }
   .row-backend {
     grid-column: 2;
+    max-width: 12rem;
+    overflow: hidden;
+    text-overflow: ellipsis;
   }
-  .row-cost {
+  .row-who {
     grid-column: 3;
   }
-  .row-who,
+  .row-cost {
+    grid-column: 4;
+    justify-self: end;
+  }
   .row-when {
     grid-column: 2 / -1;
+    grid-row: 3;
   }
 }
 /* ---------------------------------------------------------------- meters */
 
 .meter-row {
   display: inline-flex;
+  flex-wrap: wrap;
   align-items: center;
-  gap: 0.6rem;
+  gap: 0.15rem 0.6rem;
   min-width: 0;
+  max-width: 100%;
 }
 
 .meter {
@@ -1343,6 +1387,8 @@ header > .skel,
 }
 
 .meter-text {
+  min-width: 0;
+  max-width: 100%;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
