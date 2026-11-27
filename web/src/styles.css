@@ -789,6 +789,11 @@ header > .skel,
   font-size: 1.3rem;
 }
 
+.backend-console {
+  margin-left: auto;
+  font-size: 0.875rem;
+}
+
 .backend-status {
   font-weight: 600;
   color: var(--graphite);

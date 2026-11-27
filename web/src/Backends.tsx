@@ -350,6 +350,9 @@ async function loadBackends(): Promise<{ name: string; detail: BackendDetail | n
   );
 }
 
+/** The provider's web console, by backend kind. */
+const CONSOLES: Record<string, string> = { lambda: "https://cloud.lambda.com/", runpod: "https://console.runpod.io/" };
+
 function Backend({ b, onChange }: { b: BackendDetail; onChange: () => void }) {
   const status = !b.enabled
     ? "off"
@@ -370,6 +373,11 @@ function Backend({ b, onChange }: { b: BackendDetail; onChange: () => void }) {
               ? `machine, reached over ${b.transport}`
               : `${b.kind} cloud, paid per job`}
         </span>
+        {CONSOLES[b.kind] && (
+          <a className="backend-console" href={CONSOLES[b.kind]} target="_blank" rel="noreferrer">
+            Open console
+          </a>
+        )}
       </header>
       <Toggle b={b} onChange={onChange} />
       {b.last_error && !b.reachable && <p className="error">{b.last_error}</p>}
