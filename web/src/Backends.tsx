@@ -64,31 +64,53 @@ function localRows(h: Obj): Rows {
 /** Rows per column of the GPU price list before it starts another column. */
 const GPU_ROWS = 8;
 
-/** A cloud's in-stock GPU types as a price list, most expensive first, in balanced columns. */
-function CloudGpus({ h }: { h: Obj }) {
-  const types = Object.entries(obj(h.gpu_types))
-    .map(([t, v]) => [t, obj(v)] as const)
-    .filter(([, v]) => v.available)
-    .sort((a, b) => num(b[1].usd_per_hour_per_gpu) - num(a[1].usd_per_hour_per_gpu) || a[0].localeCompare(b[0]))
-    .map(([t, v]) => {
+type GpuStock = { gpu_type: string; usd_per_hour_per_gpu: number; max_gpus?: number; sizes?: number[]; level?: string };
+
+/** "up to 8", with the sizes on sale and the provider's stock level in the tooltip. */
+function stockText(s: GpuStock) {
+  if (!s.max_gpus) return { text: "", title: undefined };
+  const sizes = s.sizes && s.sizes.length > 1 ? `${s.sizes.join(", ")} GPUs per machine` : null;
+  const title = [sizes ?? `up to ${s.max_gpus} per machine`, s.level && `${s.level} stock`].filter(Boolean).join(", ");
+  return { text: s.max_gpus > 1 ? `up to ${s.max_gpus}` : "1", title };
+}
+
+/** A cloud's in-stock GPU types as a price list, most expensive first, in balanced columns.
+ * Live stock (`availability.gpu_stock`) wins over the daily hardware probe's list. */
+function CloudGpus({ h, live }: { h: Obj; live: unknown }) {
+  const stock: GpuStock[] = Array.isArray(live)
+    ? (live as GpuStock[])
+    : Object.entries(obj(h.gpu_types))
+        .filter(([, v]) => obj(v).available)
+        .map(([t, v]) => ({ gpu_type: t, usd_per_hour_per_gpu: num(obj(v).usd_per_hour_per_gpu) }));
+  const types = stock
+    .sort((a, b) => b.usd_per_hour_per_gpu - a.usd_per_hour_per_gpu || a.gpu_type.localeCompare(b.gpu_type))
+    .map((s) => {
       // Lambda names carry the card's specs in parentheses: "A100 (40 GB SXM4)".
-      const m = /^(.*?)\s*\((.+)\)$/.exec(t);
-      return { name: m ? m[1]! : t, spec: m ? m[2]! : "", price: num(v.usd_per_hour_per_gpu) };
+      const m = /^(.*?)\s*\((.+)\)$/.exec(s.gpu_type);
+      return { name: m ? m[1]! : s.gpu_type, spec: m ? m[2]! : "", price: s.usd_per_hour_per_gpu, stock: stockText(s) };
     });
+  const counts = types.some((t) => t.stock.text);
   if (!types.length) return <p className="muted">No GPUs in stock right now.</p>;
   const cols = Math.min(3, Math.ceil(types.length / GPU_ROWS));
   const per = Math.ceil(types.length / cols);
   const chunks = Array.from({ length: cols }, (_, i) => types.slice(i * per, (i + 1) * per));
   return (
     <div>
-      <p className="hw-caption muted">{types.length} GPU types in stock, per GPU-hour</p>
-      <div className="hw-price-cols">
+      <p className="hw-caption muted">
+        {types.length} GPU types in stock, per GPU-hour{counts && ", with the most GPUs one machine can have"}
+      </p>
+      <div className={`hw-price-cols${counts ? " hw-counts" : ""}`}>
         {chunks.map((chunk, i) => (
           <ul key={i} className="hw-prices">
             {chunk.map((t) => (
               <li key={t.name + t.spec}>
                 <span>{t.name}</span>
                 <span className="muted">{t.spec}</span>
+                {counts && (
+                  <span className="hw-count muted" title={t.stock.title}>
+                    {t.stock.text}
+                  </span>
+                )}
                 <span className="hw-price">${t.price.toFixed(2)}</span>
               </li>
             ))}
@@ -161,7 +183,7 @@ function Hardware({ b }: { b: BackendDetail }) {
   if (b.kind === "slurm") return Object.keys(obj(h.partitions)).length ? <SlurmPartitions h={h} /> : <KV value={h} />;
   return (
     <div className="hw">
-      <CloudGpus h={h} />
+      <CloudGpus h={h} live={obj(b.availability).gpu_stock} />
       <RowsOrKV
         rows={[
           ["Nodes per job", `up to ${h.max_nodes ?? 1}`],

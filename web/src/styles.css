@@ -848,6 +848,14 @@ header > .skel,
   text-align: right;
 }
 
+.hw-counts .hw-prices {
+  grid-template-columns: repeat(4, max-content);
+}
+
+.hw-count {
+  text-align: right;
+}
+
 .hw-price-cols {
   display: flex;
   flex-wrap: wrap;
@@ -1215,6 +1223,9 @@ header > .skel,
     grid-template-columns: repeat(3, max-content);
     column-gap: 2ch;
     row-gap: 0.15rem;
+  }
+  .hw-price-cols.hw-counts {
+    grid-template-columns: repeat(4, max-content);
   }
   .hw-prices {
     display: contents;
