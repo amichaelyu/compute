@@ -64,12 +64,12 @@ function localRows(h: Obj): Rows {
 /** Rows per column of the GPU price list before it starts another column. */
 const GPU_ROWS = 8;
 
-/** A cloud's in-stock GPU types as a price list, cheapest first, in balanced columns. */
+/** A cloud's in-stock GPU types as a price list, most expensive first, in balanced columns. */
 function CloudGpus({ h }: { h: Obj }) {
   const types = Object.entries(obj(h.gpu_types))
     .map(([t, v]) => [t, obj(v)] as const)
     .filter(([, v]) => v.available)
-    .sort((a, b) => num(a[1].usd_per_hour_per_gpu) - num(b[1].usd_per_hour_per_gpu) || a[0].localeCompare(b[0]))
+    .sort((a, b) => num(b[1].usd_per_hour_per_gpu) - num(a[1].usd_per_hour_per_gpu) || a[0].localeCompare(b[0]))
     .map(([t, v]) => {
       // Lambda names carry the card's specs in parentheses: "A100 (40 GB SXM4)".
       const m = /^(.*?)\s*\((.+)\)$/.exec(t);

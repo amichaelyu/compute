@@ -1,7 +1,7 @@
 import { useMemo, useState } from "react";
 import { ACTIVE, type JobRow, type JobState, PROBLEM, listAllJobs, listJobs } from "./api";
 import { State } from "./State";
-import { usePoll, when, who } from "./util";
+import { dateClock, ms, usePoll, when, who } from "./util";
 
 type Filter = "active" | "recent" | "problems" | "all";
 
@@ -45,6 +45,7 @@ export function costText(jobs: JobRow[]) {
 
 function Row({ j, now, task }: { j: JobRow; now: number; task?: boolean }) {
   const cost = costText([j]);
+  const started = ms(j.started_at);
   return (
     <a className={`row${task ? " row-task" : ""}`} href={`#/jobs/${j.id}`}>
       <span className="row-name">
@@ -59,12 +60,21 @@ function Row({ j, now, task }: { j: JobRow; now: number; task?: boolean }) {
       <span className="row-who" title="Submitted by">
         {who(j.submitted_by)}
       </span>
+      <span className="row-started" title="Started">
+        {Number.isFinite(started) ? dateClock(started, now) : ""}
+      </span>
       <span className="row-when">
         {when(j, now)}
         {j.exit_code !== null && j.exit_code !== 0 ? `, exit ${j.exit_code}` : ""}
       </span>
     </a>
   );
+}
+
+/** When the array's first task started, or nothing before any has. */
+function arrayStart(jobs: JobRow[], now: number) {
+  const t = Math.min(...jobs.map((j) => ms(j.started_at)).filter(Number.isFinite));
+  return Number.isFinite(t) ? dateClock(t, now) : "";
 }
 
 function ArrayRows({ id, jobs, now }: { id: number; jobs: JobRow[]; now: number }) {
@@ -93,6 +103,9 @@ function ArrayRows({ id, jobs, now }: { id: number; jobs: JobRow[]; now: number 
         <span className="row-cost">{cost}</span>
         <span className="row-who" title="Submitted by">
           {people}
+        </span>
+        <span className="row-started" title="First task started">
+          {arrayStart(jobs, now)}
         </span>
         <span className="row-when">{open ? "Hide tasks" : "Show tasks"}</span>
       </button>
