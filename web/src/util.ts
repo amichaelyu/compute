@@ -39,7 +39,10 @@ export function ago(t: number, now = Date.now()) {
 }
 
 /** One plain-language line about where a job is in its life. */
-export function when(j: Pick<JobRow, "state" | "started_at" | "ended_at" | "estimated_start" | "exit_code">, now = Date.now()) {
+export function when(
+  j: Pick<JobRow, "state" | "started_at" | "ended_at" | "estimated_start" | "exit_code" | "stage">,
+  now = Date.now(),
+) {
   const started = ms(j.started_at);
   const ended = ms(j.ended_at);
   const est = ms(j.estimated_start);
@@ -47,7 +50,7 @@ export function when(j: Pick<JobRow, "state" | "started_at" | "ended_at" | "esti
     case "running":
       return Number.isFinite(started) ? `running for ${dur((now - started) / 1000)}` : "running";
     case "staging":
-      return "copying code";
+      return j.stage ?? "copying code";
     case "waiting":
       return Number.isFinite(est) && est - now >= 60_000 ? `waiting on other jobs, around ${clock(est, now)}` : "waiting on other jobs";
     case "queued":

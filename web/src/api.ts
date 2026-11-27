@@ -41,6 +41,8 @@ export interface JobRow {
   /** Cloud jobs: the instance's rate and what it cost (so far, while it runs). */
   usd_per_hour?: number;
   cost_usd?: number;
+  /** What a staging job is doing now, on cloud backends. */
+  stage?: string;
 }
 
 export interface Job extends Omit<JobRow, "time_s" | "cost_usd" | "usd_per_hour"> {

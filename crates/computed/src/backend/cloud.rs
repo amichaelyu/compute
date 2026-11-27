@@ -296,6 +296,8 @@ pub struct CloudBackend {
     quoted: Mutex<HashMap<i64, Offer>>,
     /// `(offer id, region)` of offers that recently refused a launch for lack of capacity.
     full: Mutex<HashMap<(String, Option<String>), Instant>>,
+    /// What each staging job is doing now, for the dashboard.
+    steps: std::sync::Mutex<HashMap<i64, String>>,
 }
 
 /// What the outputs directory records about how a job ended (survives a daemon restart
@@ -354,7 +356,23 @@ impl CloudBackend {
             collected: Mutex::new(HashMap::new()),
             boot_secs: RwLock::new(None),
             full: Mutex::new(HashMap::new()),
+            steps: std::sync::Mutex::new(HashMap::new()),
         })
+    }
+
+    /// Records what staging `job_id` is doing (None: done).
+    fn step(&self, job_id: i64, what: Option<String>) {
+        let mut m = self.steps.lock().unwrap_or_else(|e| e.into_inner());
+        match what {
+            Some(w) => m.insert(job_id, w),
+            None => m.remove(&job_id),
+        };
+    }
+
+    /// "waiting for lambda to assign the GPUs" (or the machine, for a CPU job).
+    fn assign_step(&self, job: &Job) -> String {
+        let what = if job.resources.gpus > 0 { "the GPUs" } else { "a machine" };
+        format!("waiting for {} to assign {what}", self.cfg.name)
     }
 
     fn boot(&self) -> f64 {
@@ -488,6 +506,7 @@ impl CloudBackend {
                 }
                 o => o?,
             };
+            self.step(job.id, Some(format!("asking {} for {} x{}", self.cfg.name, offer.gpu_type, offer.gpus.max(1))));
             let req = CreateReq {
                 name: format!("compute-{}-{}", job.id, hex::encode(rand::random::<[u8; 3]>())),
                 job,
@@ -528,6 +547,7 @@ impl CloudBackend {
             &[JobState::Staging],
             JobUpdate { handle: Some(Some(json!({"instance": inst, "staging": true}))), ..Default::default() },
         );
+        self.step(job.id, Some(self.assign_step(job)));
         let boot_deadline = Instant::now() + Duration::from_secs(20 * 60);
         if let Err(e) = self.provider.wait_ready(&mut inst, boot_deadline).await {
             let _ = self.provider.terminate(&inst).await;
@@ -548,6 +568,7 @@ impl CloudBackend {
     /// Waits for an instance found again after a restart, then prepares it.
     async fn ready_instance(&self, job: &Job, mut inst: Instance) -> Result<Instance> {
         if inst.nodes.is_empty() {
+            self.step(job.id, Some(self.assign_step(job)));
             let boot_deadline = Instant::now() + Duration::from_secs(20 * 60);
             if let Err(e) = self.provider.wait_ready(&mut inst, boot_deadline).await {
                 let _ = self.provider.terminate(&inst).await;
@@ -567,6 +588,7 @@ impl CloudBackend {
     }
 
     async fn prepare_instance(&self, job: &Job, inst: Instance) -> Result<Instance> {
+        self.step(job.id, Some("setting up the machine".into()));
         for node in &inst.nodes {
             let shell = self.provider.shell(node)?;
             self.provider.prepare(shell.as_ref()).await?;
@@ -739,6 +761,51 @@ fn offer_fits(o: &Offer, job: &Job) -> bool {
 /// Wraps the backend so `spawn_collect` can hold an `Arc` to it.
 pub struct Cloud(pub Arc<CloudBackend>);
 
+impl Cloud {
+    /// Rents (or resumes) the instance and copies the job onto every node.
+    async fn stage_steps(&self, job: &Job, snapshot: &Path, files: &StageFiles) -> Result<()> {
+        let b = &self.0;
+        let inst = b.instance(job, true).await?;
+        b.step(job.id, Some("copying code".into()));
+        // A guest's job gets an instance of its own, which reaches neither this host nor the
+        // tailnet: that is its sandbox. Runtimes that run the image natively (RunPod, Modal)
+        // couldn't nest the runner's container sandbox anyway.
+        let mut job = job.clone();
+        job.spec.sandbox = false;
+        let job = &job;
+        let n = inst.nodes.len().max(1) as u32;
+        let master = inst.nodes.first().and_then(|x| x.private_ip.clone()).unwrap_or_else(|| "127.0.0.1".into());
+        let data_paths: Vec<String> = files.datasets.iter().map(|(_, p)| p.clone()).collect();
+        for rank in 0..inst.nodes.len() {
+            let remote = b.remote(&inst, rank)?;
+            remote.probe_root("").await?;
+            let mut f = files.clone();
+            if n > 1 {
+                f.env.extend([
+                    ("NNODES".to_string(), n.to_string()),
+                    ("NODE_RANK".to_string(), rank.to_string()),
+                    ("GPUS_PER_NODE".to_string(), job.resources.gpus.to_string()),
+                    ("MASTER_ADDR".to_string(), master.clone()),
+                    ("MASTER_PORT".to_string(), MASTER_PORT.to_string()),
+                ]);
+                f.env.extend(b.provider.node_env());
+            }
+            if rank > 0 {
+                // Datasets were copied to node 0; replicate them.
+                let src = b.provider.shell(&inst.nodes[0])?;
+                let dst = b.provider.shell(&inst.nodes[rank])?;
+                for p in &data_paths {
+                    let data = src.pipe_out(&tar_dir_script(p, None)).await?;
+                    let q = shell_quote(p);
+                    dst.pipe_in(&format!("set -e\nmkdir -p {q}\ntar -x -C {q}"), data).await?;
+                }
+            }
+            remote.stage_job(job, snapshot, &f, "", job.resources.time_s).await?;
+        }
+        Ok(())
+    }
+}
+
 #[async_trait]
 impl Backend for Cloud {
     fn name(&self) -> &str {
@@ -887,44 +954,13 @@ impl Backend for Cloud {
     }
 
     async fn stage(&self, job: &Job, snapshot: &Path, files: &StageFiles) -> Result<()> {
-        let b = &self.0;
-        let inst = b.instance(job, true).await?;
-        // A guest's job gets an instance of its own, which reaches neither this host nor the
-        // tailnet: that is its sandbox. Runtimes that run the image natively (RunPod, Modal)
-        // couldn't nest the runner's container sandbox anyway.
-        let mut job = job.clone();
-        job.spec.sandbox = false;
-        let job = &job;
-        let n = inst.nodes.len().max(1) as u32;
-        let master = inst.nodes.first().and_then(|x| x.private_ip.clone()).unwrap_or_else(|| "127.0.0.1".into());
-        let data_paths: Vec<String> = files.datasets.iter().map(|(_, p)| p.clone()).collect();
-        for rank in 0..inst.nodes.len() {
-            let remote = b.remote(&inst, rank)?;
-            remote.probe_root("").await?;
-            let mut f = files.clone();
-            if n > 1 {
-                f.env.extend([
-                    ("NNODES".to_string(), n.to_string()),
-                    ("NODE_RANK".to_string(), rank.to_string()),
-                    ("GPUS_PER_NODE".to_string(), job.resources.gpus.to_string()),
-                    ("MASTER_ADDR".to_string(), master.clone()),
-                    ("MASTER_PORT".to_string(), MASTER_PORT.to_string()),
-                ]);
-                f.env.extend(b.provider.node_env());
-            }
-            if rank > 0 {
-                // Datasets were copied to node 0; replicate them.
-                let src = b.provider.shell(&inst.nodes[0])?;
-                let dst = b.provider.shell(&inst.nodes[rank])?;
-                for p in &data_paths {
-                    let data = src.pipe_out(&tar_dir_script(p, None)).await?;
-                    let q = shell_quote(p);
-                    dst.pipe_in(&format!("set -e\nmkdir -p {q}\ntar -x -C {q}"), data).await?;
-                }
-            }
-            remote.stage_job(job, snapshot, &f, "", job.resources.time_s).await?;
-        }
-        Ok(())
+        let r = self.stage_steps(job, snapshot, files).await;
+        self.0.step(job.id, None);
+        r
+    }
+
+    fn staging_step(&self, job_id: i64) -> Option<String> {
+        self.0.steps.lock().unwrap_or_else(|e| e.into_inner()).get(&job_id).cloned()
     }
 
     async fn launch(&self, jobs: &[Job], _shape: &Shape) -> Result<Vec<Value>> {

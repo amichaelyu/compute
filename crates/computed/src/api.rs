@@ -271,6 +271,7 @@ const GUEST_RESTRICTIONS: &[&str] = &[
 
 /// Changes within v1 that a running agent should know about, newest first.
 const CHANGES: &[(&str, &str)] = &[
+    ("2026-11-27", "A staging job on a cloud backend carries `stage`, what it is doing now: \"asking lambda for H100 (80 GB SXM5) x1\", \"waiting for lambda to assign the GPUs\" (the instance is booting), \"setting up the machine\", \"copying code\"."),
     ("2026-11-27", "resources.regions pins a cloud job to regions or data centres, any of those listed: RunPod data centres (\"US-CA-2\") and Lambda regions (\"us-west-1\"), matched case-insensitively against what each provider reports. Only RunPod and Lambda take such a job; local hosts, Slurm and Modal refuse it. GET /v1/backends/{name} availability.gpu_stock lists, per GPU type in stock, `regions` where it is. PATCH /v1/jobs/{id} can set resources.regions (null clears it)."),
     ("2026-11-26", "PATCH /v1/jobs/{id} on a running job changes its time limit: {\"resources\": {\"time\": \"6h\"}} (the whole limit, from its start), optionally with max_cost_usd. On a paid backend the attempt's cost at the new limit must fit max_cost_usd (422 over_max_cost) and the key's monthly cap (422 over_key_limit). Local hosts, RunPod and Lambda can; Slurm and Modal can't (409 not_editable), nor jobs whose runner started before this change."),
     ("2026-11-26", "Docker containers get /dev/shm of half the job's memory (8 GB when it sets none) instead of Docker's 64 MB, so PyTorch DataLoader workers have room."),
@@ -753,8 +754,14 @@ fn submit_body(tz: &Tz, j: &Job, per_backend: Option<Value>) -> Value {
     v
 }
 
-/// Fills in who submitted the job (the key's nickname) and who cancelled it.
+/// Fills in who submitted the job (the key's nickname) and who cancelled it, and for a staging
+/// job what it is doing (`stage`).
 fn add_people(s: &AppState, j: &Job, v: &mut Value, names: &mut HashMap<String, String>) -> ApiResult<()> {
+    if j.state == JobState::Staging
+        && let Some(step) = j.backend.as_deref().and_then(|n| s.sched.backend(n)).and_then(|b| b.staging_step(j.id))
+    {
+        v["stage"] = step.into();
+    }
     let name = match names.get(&j.key_fingerprint) {
         Some(n) => n.clone(),
         None => {

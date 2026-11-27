@@ -207,6 +207,10 @@ pub trait Backend: Send + Sync {
     fn pricing(&self) -> Option<serde_json::Value> {
         None
     }
+    /// What a staging job is doing now ("waiting for lambda to assign the GPUs"), if known.
+    fn staging_step(&self, _job_id: i64) -> Option<String> {
+        None
+    }
     /// Re-measures what changes between probes (a local host's free disk and Docker memory).
     async fn refresh(&self) -> Result<()> {
         Ok(())
